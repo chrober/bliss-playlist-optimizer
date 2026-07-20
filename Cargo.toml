@@ -1,0 +1,15 @@
+[package]
+name = "bliss-playlist-optimizer"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Deterministic playlist optimization built on bliss similarity"
+repository = "https://github.com/chrober/bliss-playlist-optimizer"
+publish = false
+
+[dependencies]
+
+
+[dev-dependencies]
+jsonschema = { version = "0.33", default-features = false }
+serde_json = "1"

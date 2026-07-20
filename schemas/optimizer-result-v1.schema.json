@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chrober/bliss-playlist-optimizer/schemas/optimizer-result-v1.schema.json",
+  "title": "Bliss playlist optimizer result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "outcome",
+    "versions",
+    "artifacts",
+    "output_tracks",
+    "legs",
+    "repeat_validation",
+    "warnings",
+    "errors",
+    "search",
+    "timings_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "job_id": { "type": "string", "minLength": 1 },
+    "outcome": {
+      "enum": ["success", "partial_capability", "validation_error", "cancelled", "internal_error"]
+    },
+    "versions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["optimizer", "core_api"],
+      "properties": {
+        "optimizer": { "type": "string" },
+        "core_api": { "type": "string" }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "sha256"],
+        "properties": {
+          "kind": { "enum": ["request", "database", "learned_matrix", "semantic_evidence"] },
+          "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+          "schema_identity": { "type": "string" }
+        }
+      }
+    },
+    "output_tracks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["position", "track_id", "classification"],
+        "properties": {
+          "position": { "type": "integer", "minimum": 0 },
+          "track_id": { "type": "string" },
+          "classification": { "enum": ["original", "bridge"] },
+          "source_position": { "type": ["integer", "null"], "minimum": 0 },
+          "lms_url": { "type": "string" }
+        }
+      }
+    },
+    "legs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from_track_id", "to_track_id", "seed_track_ids", "raw_cost", "normalized_cost", "algorithm"],
+        "properties": {
+          "from_track_id": { "type": "string" },
+          "to_track_id": { "type": "string" },
+          "seed_track_ids": { "type": "array", "items": { "type": "string" } },
+          "raw_cost": { "type": "number", "minimum": 0 },
+          "normalized_cost": { "type": "number", "minimum": 0 },
+          "algorithm": { "type": "string" },
+          "semantic_tier": {
+            "enum": ["recording_both", "recording_one", "artist_local", "artist_collection", "bliss_only"]
+          },
+          "provider_provenance": { "type": "array", "items": { "type": "string" } },
+          "identity_confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    },
+    "repeat_validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid", "violations"],
+      "properties": {
+        "valid": { "type": "boolean" },
+        "violations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "positions"],
+            "properties": {
+              "kind": { "enum": ["artist", "album", "track"] },
+              "positions": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": { "type": "integer", "minimum": 0 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "route_candidates_considered": { "type": "integer", "minimum": 0 },
+    "selection_reason": { "type": "string" },
+    "rejected_counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+    "warnings": { "type": "array", "items": { "$ref": "#/$defs/message" } },
+    "errors": { "type": "array", "items": { "$ref": "#/$defs/message" } },
+    "search": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deterministic_seed", "restart_count", "termination"],
+      "properties": {
+        "deterministic_seed": { "type": "integer", "minimum": 0 },
+        "restart_count": { "type": "integer", "minimum": 0 },
+        "termination": { "enum": ["completed", "infeasible", "cancelled", "time_budget", "internal_error"] }
+      }
+    },
+    "timings_ms": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+  },
+  "$defs": {
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+        "message": { "type": "string" },
+        "details": { "type": "object" }
+      }
+    }
+  }
+}
+

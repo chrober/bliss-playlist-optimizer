@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chrober/bliss-playlist-optimizer/schemas/semantic-evidence-v1.schema.json",
+  "title": "Frozen provider-neutral semantic evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "frozen_at", "providers", "edges"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "frozen_at": { "type": "string", "format": "date-time" },
+    "providers": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/providerState" }
+    },
+    "edges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/edge" }
+    }
+  },
+  "$defs": {
+    "entity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "enum": ["recording", "artist"] },
+        "id": { "type": "string", "minLength": 1 },
+        "mbid": { "type": "string", "format": "uuid" },
+        "name": { "type": "string" },
+        "title": { "type": "string" }
+      }
+    },
+    "providerState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "state"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "dataset_or_algorithm": { "type": "string" },
+        "state": {
+          "enum": ["disabled", "fresh", "cached", "stale", "partial", "unavailable", "failed"]
+        },
+        "request_count": { "type": "integer", "minimum": 0 },
+        "failure_count": { "type": "integer", "minimum": 0 },
+        "error_codes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "source",
+        "candidate",
+        "scope",
+        "identity_confidence"
+      ],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "dataset_or_algorithm": { "type": "string" },
+        "source": { "$ref": "#/$defs/entity" },
+        "candidate": { "$ref": "#/$defs/entity" },
+        "scope": { "enum": ["endpoint_local", "collection_fallback"] },
+        "raw_rank": { "type": "integer", "minimum": 1 },
+        "raw_score": { "type": "number" },
+        "identity_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "cache_state": { "enum": ["fresh", "cached", "stale"] }
+      },
+      "anyOf": [
+        { "required": ["raw_rank"] },
+        { "required": ["raw_score"] }
+      ]
+    }
+  }
+}

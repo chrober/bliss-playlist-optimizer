@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chrober/bliss-playlist-optimizer/schemas/progress-event-v1.schema.json",
+  "title": "Bliss playlist optimizer progress event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "job_id", "sequence", "timestamp", "stage", "message"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "job_id": { "type": "string", "minLength": 1 },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "stage": {
+      "enum": ["validating", "loading", "resolving", "searching", "verifying", "writing_result", "completed", "failed", "cancelled"]
+    },
+    "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+    "message": { "type": "string" },
+    "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+    "counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+  }
+}
+

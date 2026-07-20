@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Generate the private-data-free parity fixture for the Python/Rust migration."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import pathlib
+import sqlite3
+import urllib.parse
+
+FEATURES = (
+    "Tempo", "Zcr", "MeanSpectralCentroid", "StdDevSpectralCentroid",
+    "MeanSpectralRolloff", "StdDevSpectralRolloff", "MeanSpectralFlatness",
+    "StdDevSpectralFlatness", "MeanLoudness", "StdDevLoudness",
+    "Chroma1", "Chroma2", "Chroma3", "Chroma4", "Chroma5", "Chroma6",
+    "Chroma7", "Chroma8", "Chroma9", "Chroma10", "Chroma11", "Chroma12",
+    "Chroma13",
+)
+SOURCE_ORDER = (0, 7, 2, 10, 4, 11, 1, 9, 5, 8, 3, 6)
+TRACK_COUNT = 18
+MUSIC_ROOT = "/music/"
+
+
+def sha256(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def track(index: int) -> dict[str, object]:
+    number = index + 1
+    artist = f"Synthetic Artist {number:02d}"
+    album = f"Synthetic Album {number:02d}"
+    title = f"Synthetic Track {number:02d}"
+    relative = f"{artist}/{album}/01 - {title}.flac"
+    features = [
+        round((index + 1) * (feature_index + 1) / 97.0 + ((index * 7 + feature_index) % 5) / 1000.0, 9)
+        for feature_index in range(len(FEATURES))
+    ]
+    return {
+        "relative": relative,
+        "absolute": MUSIC_ROOT + relative,
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "genre": "Synthetic",
+        "duration": 180 + index,
+        "features": features,
+        "ignore": 0,
+    }
+
+
+def write_database(path: pathlib.Path, tracks: list[dict[str, object]]) -> None:
+    if path.exists():
+        path.unlink()
+    feature_columns = ",\n                ".join(f"{name} REAL NOT NULL" for name in FEATURES)
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            f"""
+            PRAGMA page_size = 4096;
+            CREATE TABLE TracksV2 (
+                File TEXT NOT NULL UNIQUE,
+                Title TEXT,
+                Artist TEXT,
+                AlbumArtist TEXT,
+                Album TEXT,
+                Genre TEXT,
+                Duration INTEGER,
+                {feature_columns},
+                Ignore INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        columns = [
+            "File", "Title", "Artist", "AlbumArtist", "Album", "Genre", "Duration",
+            *FEATURES, "Ignore",
+        ]
+        placeholders = ",".join("?" for _ in columns)
+        for item in tracks:
+            values = [
+                item["relative"], item["title"], item["artist"], item["artist"],
+                item["album"], item["genre"], item["duration"], *item["features"],
+                item["ignore"],
+            ]
+            connection.execute(
+                f"INSERT INTO TracksV2 ({','.join(columns)}) VALUES ({placeholders})",
+                values,
+            )
+        ignored = track(TRACK_COUNT)
+        ignored.update({
+            "relative": "Ignored Artist/Ignored Album/01 - Ignored Track.flac",
+            "absolute": "/music/Ignored Artist/Ignored Album/01 - Ignored Track.flac",
+            "title": "Ignored Track", "artist": "Ignored Artist",
+            "album": "Ignored Album", "ignore": 1,
+        })
+        values = [
+            ignored["relative"], ignored["title"], ignored["artist"], ignored["artist"],
+            ignored["album"], ignored["genre"], ignored["duration"], *ignored["features"],
+            ignored["ignore"],
+        ]
+        connection.execute(
+            f"INSERT INTO TracksV2 ({','.join(columns)}) VALUES ({placeholders})", values,
+        )
+        connection.commit()
+        result = connection.execute("PRAGMA quick_check").fetchone()
+        if result != ("ok",):
+            raise RuntimeError(f"SQLite quick_check failed: {result}")
+    finally:
+        connection.close()
+
+
+def write_playlist(path: pathlib.Path, tracks: list[dict[str, object]]) -> None:
+    lines = ["#EXTM3U"]
+    for index in SOURCE_ORDER:
+        item = tracks[index]
+        url = "file://" + urllib.parse.quote(str(item["absolute"]), safe="/,:~!$&'()*+;=@")
+        lines.extend((
+            f"#EXTURL:{url}",
+            f"#EXTINF:{item['duration']},{item['title']}",
+            str(item["absolute"]),
+        ))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
+def write_matrix(path: pathlib.Path) -> None:
+    size = len(FEATURES)
+    payload = {"m": {"data": [float(row == column) for row in range(size) for column in range(size)], "dim": [size, size], "v": 1}}
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
+def main() -> None:
+    destination = pathlib.Path(__file__).resolve().parent
+    tracks = [track(index) for index in range(TRACK_COUNT)]
+    database = destination / "bliss.db"
+    playlist = destination / "source.m3u"
+    matrix = destination / "learned_matrix.json"
+    write_database(database, tracks)
+    write_playlist(playlist, tracks)
+    write_matrix(matrix)
+    manifest = {
+        "fixture_version": 1,
+        "description": "Private-data-free TracksV2 and Lyrion extended-M3U parity fixture.",
+        "music_root": MUSIC_ROOT,
+        "usable_library_track_count": TRACK_COUNT,
+        "ignored_library_track_count": 1,
+        "source_track_count": len(SOURCE_ORDER),
+        "source_track_indices_zero_based": list(SOURCE_ORDER),
+        "feature_names": list(FEATURES),
+        "sha256": {"bliss.db": sha256(database), "source.m3u": sha256(playlist), "learned_matrix.json": sha256(matrix)},
+        "python_oracle": {
+            "working_directory": "../bliss-similarity-design",
+            "arguments": [
+                "python", "tools/playlist_optimizer.py",
+                "--db", "../bliss-playlist-optimizer/fixtures/synthetic/bliss.db",
+                "--playlist", "../bliss-playlist-optimizer/fixtures/synthetic/source.m3u",
+                "--matrix", "../bliss-playlist-optimizer/fixtures/synthetic/learned_matrix.json",
+                "--output", "../bliss-playlist-optimizer/fixtures/synthetic/oracle-output",
+                "--music-root", MUSIC_ROOT, "--algorithm", "adaptive",
+                "--seed", "20260717", "--restarts", "50",
+                "--no-repeat-artist", "5", "--no-repeat-album", "10"
+            ]
+        }
+    }
+    (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
+if __name__ == "__main__":
+    main()
+

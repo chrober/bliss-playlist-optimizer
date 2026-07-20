@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chrober/bliss-playlist-optimizer/schemas/optimizer-request-v1.schema.json",
+  "title": "Bliss playlist optimizer request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "job_id",
+    "artifacts",
+    "source_tracks",
+    "scoring",
+    "route",
+    "repeat_windows",
+    "extension",
+    "semantic_evidence",
+    "output"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "job_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["database"],
+      "properties": {
+        "database": { "$ref": "#/$defs/artifact" },
+        "learned_matrix": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "source_tracks": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/trackIdentity" }
+    },
+    "scoring": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm"],
+      "properties": {
+        "algorithm": {
+          "enum": ["euclidean", "weighted_euclidean", "learned_matrix", "adaptive"]
+        },
+        "feature_weights": {
+          "type": "array",
+          "minItems": 23,
+          "maxItems": 23,
+          "items": { "type": "number", "minimum": 0 }
+        },
+        "adaptive": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["seed_limit"],
+          "properties": {
+            "seed_limit": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "captured_blissmixer_preferences": {
+          "type": "object",
+          "description": "Redacted, immutable preferences used to derive this scoring configuration."
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ordering_policy", "objective", "search"],
+      "properties": {
+        "ordering_policy": {
+          "enum": ["optimize_order", "preserve_order", "queue_destination"]
+        },
+        "objective": {
+          "enum": ["sum", "mean", "bottleneck_then_sum"]
+        },
+        "start_track_id": { "type": "string" },
+        "destination_track_id": { "type": "string" },
+        "search": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["deterministic_seed", "restart_count"],
+          "properties": {
+            "deterministic_seed": { "type": "integer", "minimum": 0 },
+            "restart_count": { "type": "integer", "minimum": 0 },
+            "candidate_limit": { "type": "integer", "minimum": 1 },
+            "time_budget_ms": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "repeat_windows": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artist", "album", "track"],
+      "properties": {
+        "artist": { "type": "integer", "minimum": 0 },
+        "album": { "type": "integer", "minimum": 0 },
+        "track": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "extension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "enum": ["none", "automatic", "exact_count", "one_per_transition", "target_length"]
+        },
+        "additional_track_count": { "type": "integer", "minimum": 0 },
+        "target_track_count": { "type": "integer", "minimum": 2 },
+        "candidate_limit": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "semantic_evidence": { "$ref": "#/$defs/artifact" },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["include_private_paths", "include_rejected_candidates"],
+      "properties": {
+        "include_private_paths": { "type": "boolean" },
+        "include_rejected_candidates": { "type": "boolean" },
+        "max_rejected_candidates": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+        "schema_identity": { "type": "string" }
+      }
+    },
+    "trackIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "lms_url"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "lms_url": { "type": "string", "minLength": 1 },
+        "database_file": { "type": "string" },
+        "title": { "type": "string" },
+        "artist": { "type": "string" },
+        "album": { "type": "string" },
+        "recording_mbid": { "type": "string", "format": "uuid" },
+        "artist_mbids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "format": "uuid" }
+        }
+      }
+    }
+  }
+}
+

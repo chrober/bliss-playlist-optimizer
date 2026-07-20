@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "job_id": "example-reorder-001",
+  "outcome": "success",
+  "versions": { "optimizer": "0.1.0", "core_api": "0.1" },
+  "artifacts": [
+    { "kind": "request", "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "schema_identity": "optimizer-request-v1" }
+  ],
+  "output_tracks": [
+    { "position": 0, "track_id": "track-01", "classification": "original", "source_position": 0 },
+    { "position": 1, "track_id": "track-02", "classification": "original", "source_position": 1 }
+  ],
+  "legs": [
+    {
+      "from_track_id": "track-01",
+      "to_track_id": "track-02",
+      "seed_track_ids": ["track-01"],
+      "raw_cost": 0.75,
+      "normalized_cost": 0.25,
+      "algorithm": "adaptive",
+      "semantic_tier": "bliss_only",
+      "provider_provenance": []
+    }
+  ],
+  "repeat_validation": { "valid": true, "violations": [] },
+  "route_candidates_considered": 16,
+  "selection_reason": "Lowest verified bottleneck-then-sum objective",
+  "rejected_counts": {},
+  "warnings": [],
+  "errors": [],
+  "search": { "deterministic_seed": 2026, "restart_count": 16, "termination": "completed" },
+  "timings_ms": { "total": 25, "search": 20 }
+}
+

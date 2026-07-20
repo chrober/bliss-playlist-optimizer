@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "job_id": "example-reorder-001",
+  "sequence": 3,
+  "timestamp": "2026-01-01T00:00:03Z",
+  "stage": "searching",
+  "progress": 0.25,
+  "message": "Evaluating deterministic route restarts",
+  "counts": { "restarts_completed": 4, "restarts_total": 16 }
+}
+
