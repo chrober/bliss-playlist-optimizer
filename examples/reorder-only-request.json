@@ -6,8 +6,8 @@
     "learned_matrix": { "path": "fixtures/synthetic/learned_matrix.json" }
   },
   "source_tracks": [
-    { "id": "track-01", "lms_url": "file:///music/Artist%2001/Album%2001/01%20-%20Track%2001.flac", "database_file": "/music/Artist 01/Album 01/01 - Track 01.flac", "title": "Track 01", "artist": "Artist 01", "album": "Album 01" },
-    { "id": "track-02", "lms_url": "file:///music/Artist%2002/Album%2002/01%20-%20Track%2002.flac", "database_file": "/music/Artist 02/Album 02/01 - Track 02.flac", "title": "Track 02", "artist": "Artist 02", "album": "Album 02" }
+    { "id": "track-01", "lms_url": "file:///music/Synthetic%20Artist%2001/Synthetic%20Album%2001/01%20-%20Synthetic%20Track%2001.flac", "database_file": "Synthetic Artist 01/Synthetic Album 01/01 - Synthetic Track 01.flac", "title": "Synthetic Track 01", "artist": "Synthetic Artist 01", "album": "Synthetic Album 01" },
+    { "id": "track-02", "lms_url": "file:///music/Synthetic%20Artist%2002/Synthetic%20Album%2002/01%20-%20Synthetic%20Track%2002.flac", "database_file": "Synthetic Artist 02/Synthetic Album 02/01 - Synthetic Track 02.flac", "title": "Synthetic Track 02", "artist": "Synthetic Artist 02", "album": "Synthetic Album 02" }
   ],
   "scoring": {
     "algorithm": "adaptive",

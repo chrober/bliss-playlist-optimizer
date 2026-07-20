@@ -5,10 +5,23 @@ auditable playlist optimization. It will consume the shared
 `bliss-mixer-core`, Lyrion metadata, repeat-window settings, and optional
 semantic evidence without requiring Python on the server.
 
-This bootstrap checkpoint deliberately exposes only a machine-readable
-`version --json` command. The schemas in `schemas/` are the compatibility
-boundary to be implemented next; they are not yet a promise of a working
-optimizer.
+The first executable contract slice exposes `version --json` and a read-only
+request validator:
+
+```text
+cargo run -- validate --request examples/reorder-only-request.json
+```
+
+`validate` checks both JSON schemas, declared artifact hashes, SQLite
+integrity and `TracksV2` compatibility, the optional learned matrix, semantic
+evidence, and exact usable Bliss identities for every source track. Relative
+artifact paths are resolved against the process working directory; production
+callers should pass absolute paths. Success is written as one JSON object to
+stdout. Validation failures are written as one JSON object to stderr and exit
+with status 1; invalid CLI usage exits with status 2.
+
+The schemas in `schemas/` remain the versioned compatibility boundary. Route
+optimization and playlist writing are intentionally not implemented yet.
 
 The Python one-shot implementation remains the behavioral oracle until native
 parity is measured against synthetic fixtures.
