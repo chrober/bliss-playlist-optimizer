@@ -3,12 +3,13 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use bliss_mixer_core::scoring::{adaptive_distance, mean_feature_vector, select_adaptive_matrix};
 use bliss_mixer_core::FeatureVector;
 use ndarray::Array2;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
+
+use crate::contextual::adaptive_distance_from_seeds;
 
 const WORST_LEG_WEIGHT: f64 = 2.0;
 const ARC_PLACEMENT_WEIGHT: f64 = 0.12;
@@ -429,19 +430,13 @@ fn transition_distance(
         .iter()
         .map(|index| tracks[*index].features)
         .collect();
-    let selection = select_adaptive_matrix(&seeds, Some(learned_matrix), config.learned_percent)
-        .map_err(|error| RouteError::Scoring(error.to_string()))?;
-    let matrix = selection
-        .matrix
-        .as_ref()
-        .ok_or_else(|| RouteError::Scoring("no adaptive matrix was selected".to_owned()))?;
-    let mean = mean_feature_vector(&seeds)
-        .ok_or_else(|| RouteError::Scoring("transition has no seed".to_owned()))?;
-    let distance = f64::from(adaptive_distance(
-        &mean,
+    let distance = adaptive_distance_from_seeds(
+        &seeds,
         &tracks[candidate].features,
-        matrix,
-    ));
+        learned_matrix,
+        config.learned_percent,
+    )
+    .map_err(|error| RouteError::Scoring(error.to_string()))?;
     score_cache.insert(cache_key, distance);
     Ok(distance)
 }

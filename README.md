@@ -42,6 +42,14 @@ tie-breaking, so results are byte-identical across worker counts. By default the
 executable leaves one logical CPU for Lyrion; set `RAYON_NUM_THREADS` to override
 that policy. SQLite access and validation remain sequential.
 
+The public Rust library also contains the first read-only bridge kernel. It
+builds the frozen cross-context Adaptive reference distribution, rescoring both
+sides of an internal insertion with the bridge present in the outgoing context,
+enforces artist/album repetition and unique membership, and ranks independent
+candidates deterministically with Rayon. Candidate enumeration, semantic
+evidence tiers, extension policies, and a bridge CLI artifact are the next
+slice; the current command line still rejects extension requests.
+
 Success is written as one JSON object to stdout. Validation or search failures
 are written as one JSON object to stderr and exit with status 1; invalid CLI
 usage exits with status 2. Playlist extension and playlist-file writing remain

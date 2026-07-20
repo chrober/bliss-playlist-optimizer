@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-mod route;
+use bliss_playlist_optimizer::route;
 
 const PROGRAM: &str = "bliss-playlist-optimizer";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
