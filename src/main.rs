@@ -17,6 +17,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REQUEST_SCHEMA: &str = include_str!("../schemas/optimizer-request-v1.schema.json");
 const SEMANTIC_SCHEMA: &str = include_str!("../schemas/semantic-evidence-v1.schema.json");
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
+const EXACT_COUNT_BEAM_WIDTH: usize = 64;
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -93,6 +94,7 @@ struct RepeatWindows {
 #[derive(Debug, Deserialize)]
 struct ExtensionSettings {
     mode: String,
+    additional_track_count: Option<usize>,
     candidate_limit: Option<usize>,
     max_added_tracks: Option<usize>,
     trigger_percentile: Option<f64>,
@@ -218,14 +220,14 @@ struct BridgeAnalysisArtifact {
     usable_library_track_count: usize,
     eligible_candidate_count: usize,
     frozen_reference_count: usize,
-    trigger_percentile: f64,
+    trigger_percentile: Option<f64>,
     max_leg_percentile: f64,
     max_detour_percentile: f64,
     retained_candidate_limit: usize,
     semantic_mode: String,
     provider_states: Vec<semantic::ProviderState>,
     gaps: Vec<BridgeGapArtifact>,
-    selection_preview: AutomaticSelectionArtifact,
+    selection_preview: SelectionPreviewArtifact,
 }
 
 #[derive(Debug, Serialize)]
@@ -235,7 +237,7 @@ struct BridgeGapArtifact {
     right_track_id: String,
     direct_distance: f64,
     direct_percentile: f64,
-    triggering: bool,
+    triggering: Option<bool>,
     semantic_pool: semantic::SemanticPool,
     semantic_candidate_count: usize,
     semantic_excluded_count: usize,
@@ -269,6 +271,59 @@ struct AutomaticSelectionArtifact {
     unique_membership: bool,
     final_sequence: Vec<PreviewSequenceEntryArtifact>,
     decisions: Vec<PreviewDecisionArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum SelectionPreviewArtifact {
+    Automatic(AutomaticSelectionArtifact),
+    Exact(ExactSelectionArtifact),
+}
+
+#[derive(Debug, Serialize)]
+struct ExactSelectionArtifact {
+    mode: &'static str,
+    processing_order: &'static str,
+    requested_added_tracks: usize,
+    feasible: bool,
+    added_track_count: usize,
+    original_subsequence_preserved: Option<bool>,
+    unique_membership: Option<bool>,
+    final_sequence: Option<Vec<PreviewSequenceEntryArtifact>>,
+    decisions: Vec<ExactPreviewDecisionArtifact>,
+    search: ExactSearchArtifact,
+    infeasibility: Option<ExactInfeasibilityArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExactSearchArtifact {
+    beam_width: usize,
+    candidate_limit: usize,
+    evaluated_states: usize,
+    retained_states: usize,
+    maximum_additions_found: usize,
+    structural_upper_bound: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ExactInfeasibilityArtifact {
+    code: &'static str,
+    requested_added_tracks: usize,
+    maximum_additions_found: usize,
+    structural_upper_bound: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ExactPreviewDecisionArtifact {
+    original_position: usize,
+    route_position: usize,
+    left_track_id: String,
+    right_track_id: String,
+    direct_distance: f64,
+    direct_percentile: f64,
+    semantic_pool: semantic::SemanticPool,
+    reason: preview::DecisionReason,
+    selected_bridge: Option<BridgeCandidateArtifact>,
 }
 
 #[derive(Debug, Serialize)]
@@ -944,18 +999,35 @@ fn analyze_bridge_validated(
         .extension
         .candidate_limit
         .unwrap_or(DEFAULT_RETAINED_CANDIDATES);
-    let max_added_tracks = request.extension.max_added_tracks.ok_or_else(|| {
-        CommandFailure::new(
-            "AUTOMATIC_BRIDGE_BUDGET_REQUIRED",
-            "automatic extension requires extension.max_added_tracks",
-        )
-    })?;
-    let trigger_percentile = request.extension.trigger_percentile.ok_or_else(|| {
-        CommandFailure::new(
-            "AUTOMATIC_TRIGGER_REQUIRED",
-            "automatic extension requires extension.trigger_percentile",
-        )
-    })?;
+    let (max_added_tracks, trigger_percentile, requested_exact_count) =
+        match request.extension.mode.as_str() {
+            "automatic" => (
+                Some(request.extension.max_added_tracks.ok_or_else(|| {
+                    CommandFailure::new(
+                        "AUTOMATIC_BRIDGE_BUDGET_REQUIRED",
+                        "automatic extension requires extension.max_added_tracks",
+                    )
+                })?),
+                Some(request.extension.trigger_percentile.ok_or_else(|| {
+                    CommandFailure::new(
+                        "AUTOMATIC_TRIGGER_REQUIRED",
+                        "automatic extension requires extension.trigger_percentile",
+                    )
+                })?),
+                None,
+            ),
+            "exact_count" => (
+                None,
+                None,
+                Some(request.extension.additional_track_count.ok_or_else(|| {
+                    CommandFailure::new(
+                        "EXACT_COUNT_REQUIRED",
+                        "exact_count extension requires extension.additional_track_count",
+                    )
+                })?),
+            ),
+            _ => unreachable!("bridge mode is checked before analysis"),
+        };
     let matrix_artifact = request.artifacts.learned_matrix.as_ref().ok_or_else(|| {
         CommandFailure::new(
             "MATRIX_REQUIRED",
@@ -1168,7 +1240,7 @@ fn analyze_bridge_validated(
             right_track_id: selected_track_ids[position].clone(),
             direct_distance: gap.direct_distance,
             direct_percentile: gap.direct_percentile,
-            triggering: gap.direct_percentile > trigger_percentile,
+            triggering: trigger_percentile.map(|threshold| gap.direct_percentile > threshold),
             semantic_pool: gap_semantics.pool,
             semantic_candidate_count: gap_candidate_indices.len(),
             semantic_excluded_count: eligible_candidates.len() - gap_candidate_indices.len(),
@@ -1180,19 +1252,6 @@ fn analyze_bridge_validated(
         });
     }
 
-    let selection = preview::select_automatic_bridges(
-        &selected_library_route,
-        &preview_gaps,
-        &preview::AutomaticSelectionConfig {
-            max_added_tracks,
-            trigger_percentile,
-        },
-        &bridge_tracks,
-        &learned_matrix,
-        &bridge_config,
-        &reference,
-    )
-    .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))?;
     let original_ids_by_library = selected_local_route
         .iter()
         .zip(selected_library_route.iter())
@@ -1203,60 +1262,172 @@ fn analyze_bridge_validated(
             )
         })
         .collect::<HashMap<_, _>>();
-    let final_sequence = selection
-        .final_route
-        .iter()
-        .enumerate()
-        .map(|(position, library_index)| {
-            if let Some(track_id) = original_ids_by_library.get(library_index) {
-                PreviewSequenceEntryArtifact {
-                    position,
-                    kind: "original",
-                    track_id: track_id.clone(),
-                }
-            } else {
-                PreviewSequenceEntryArtifact {
-                    position,
-                    kind: "bridge",
-                    track_id: bridge_candidate_id(library[*library_index].row_id),
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    let preview_decisions = selection
-        .decisions
-        .iter()
-        .map(|decision| PreviewDecisionArtifact {
-            original_position: decision.original_position,
-            route_position: decision.route_position,
-            left_track_id: original_ids_by_library[&decision.left].clone(),
-            right_track_id: original_ids_by_library[&decision.right].clone(),
-            direct_distance: decision.direct_distance,
-            direct_percentile: decision.direct_percentile,
-            triggering: decision.direct_percentile > trigger_percentile,
-            semantic_pool: decision.semantic_pool,
-            reason: decision.reason,
-            selected_bridge: decision.selected.as_ref().map(|selected| {
-                bridge_candidate_artifact(&selected.evaluation, &selected.semantics, &library)
-            }),
-        })
-        .collect::<Vec<_>>();
-    let added_track_count = selection.final_route.len() - selected_library_route.len();
-    let unique_membership =
-        selection.final_route.iter().collect::<HashSet<_>>().len() == selection.final_route.len();
-    let selection_preview = AutomaticSelectionArtifact {
-        mode: "automatic",
-        processing_order: "left-to-right-original-gaps",
-        max_added_tracks,
-        added_track_count,
-        original_subsequence_preserved: selection
-            .final_route
+    let sequence_artifact = |route: &[usize]| {
+        route
             .iter()
-            .filter(|index| original_ids_by_library.contains_key(index))
-            .eq(selected_library_route.iter()),
-        unique_membership,
-        final_sequence,
-        decisions: preview_decisions,
+            .enumerate()
+            .map(|(position, library_index)| {
+                if let Some(track_id) = original_ids_by_library.get(library_index) {
+                    PreviewSequenceEntryArtifact {
+                        position,
+                        kind: "original",
+                        track_id: track_id.clone(),
+                    }
+                } else {
+                    PreviewSequenceEntryArtifact {
+                        position,
+                        kind: "bridge",
+                        track_id: bridge_candidate_id(library[*library_index].row_id),
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let selection_preview = match request.extension.mode.as_str() {
+        "automatic" => {
+            let max_added_tracks =
+                max_added_tracks.expect("automatic request has a validated bridge budget");
+            let trigger_percentile =
+                trigger_percentile.expect("automatic request has a validated trigger");
+            let selection = preview::select_automatic_bridges(
+                &selected_library_route,
+                &preview_gaps,
+                &preview::AutomaticSelectionConfig {
+                    max_added_tracks,
+                    trigger_percentile,
+                },
+                &bridge_tracks,
+                &learned_matrix,
+                &bridge_config,
+                &reference,
+            )
+            .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))?;
+            let preview_decisions = selection
+                .decisions
+                .iter()
+                .map(|decision| PreviewDecisionArtifact {
+                    original_position: decision.original_position,
+                    route_position: decision.route_position,
+                    left_track_id: original_ids_by_library[&decision.left].clone(),
+                    right_track_id: original_ids_by_library[&decision.right].clone(),
+                    direct_distance: decision.direct_distance,
+                    direct_percentile: decision.direct_percentile,
+                    triggering: decision.direct_percentile > trigger_percentile,
+                    semantic_pool: decision.semantic_pool,
+                    reason: decision.reason,
+                    selected_bridge: decision.selected.as_ref().map(|selected| {
+                        bridge_candidate_artifact(
+                            &selected.evaluation,
+                            &selected.semantics,
+                            &library,
+                        )
+                    }),
+                })
+                .collect::<Vec<_>>();
+            let added_track_count = selection.final_route.len() - selected_library_route.len();
+            let unique_membership = selection.final_route.iter().collect::<HashSet<_>>().len()
+                == selection.final_route.len();
+            SelectionPreviewArtifact::Automatic(AutomaticSelectionArtifact {
+                mode: "automatic",
+                processing_order: "left-to-right-original-gaps",
+                max_added_tracks,
+                added_track_count,
+                original_subsequence_preserved: selection
+                    .final_route
+                    .iter()
+                    .filter(|index| original_ids_by_library.contains_key(index))
+                    .eq(selected_library_route.iter()),
+                unique_membership,
+                final_sequence: sequence_artifact(&selection.final_route),
+                decisions: preview_decisions,
+            })
+        }
+        "exact_count" => {
+            let requested_added_tracks =
+                requested_exact_count.expect("exact-count request has a validated count");
+            let selection = preview::select_exact_count_bridges(
+                &selected_library_route,
+                &preview_gaps,
+                &preview::ExactSelectionConfig {
+                    requested_added_tracks,
+                    candidate_limit: retained_candidate_limit,
+                    beam_width: EXACT_COUNT_BEAM_WIDTH,
+                },
+                &bridge_tracks,
+                &learned_matrix,
+                &bridge_config,
+                &reference,
+            )
+            .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))?;
+            let feasible = selection.final_route.is_some();
+            let decisions = selection
+                .decisions
+                .iter()
+                .map(|decision| ExactPreviewDecisionArtifact {
+                    original_position: decision.original_position,
+                    route_position: decision.route_position,
+                    left_track_id: original_ids_by_library[&decision.left].clone(),
+                    right_track_id: original_ids_by_library[&decision.right].clone(),
+                    direct_distance: decision.direct_distance,
+                    direct_percentile: decision.direct_percentile,
+                    semantic_pool: decision.semantic_pool,
+                    reason: decision.reason,
+                    selected_bridge: decision.selected.as_ref().map(|selected| {
+                        bridge_candidate_artifact(
+                            &selected.evaluation,
+                            &selected.semantics,
+                            &library,
+                        )
+                    }),
+                })
+                .collect::<Vec<_>>();
+            let final_sequence = selection.final_route.as_deref().map(&sequence_artifact);
+            let added_track_count = selection
+                .final_route
+                .as_ref()
+                .map_or(0, |route| route.len() - selected_library_route.len());
+            let original_subsequence_preserved = selection.final_route.as_ref().map(|route| {
+                route
+                    .iter()
+                    .filter(|index| original_ids_by_library.contains_key(index))
+                    .eq(selected_library_route.iter())
+            });
+            let unique_membership = selection
+                .final_route
+                .as_ref()
+                .map(|route| route.iter().collect::<HashSet<_>>().len() == route.len());
+            let infeasibility = (!feasible).then_some(ExactInfeasibilityArtifact {
+                code: if requested_added_tracks > selection.stats.structural_upper_bound {
+                    "EXACT_COUNT_INFEASIBLE"
+                } else {
+                    "EXACT_COUNT_NOT_FOUND_WITHIN_SEARCH_BOUNDS"
+                },
+                requested_added_tracks,
+                maximum_additions_found: selection.stats.maximum_additions_found,
+                structural_upper_bound: selection.stats.structural_upper_bound,
+            });
+            SelectionPreviewArtifact::Exact(ExactSelectionArtifact {
+                mode: "exact_count",
+                processing_order: "left-to-right-original-gaps-beam-search",
+                requested_added_tracks,
+                feasible,
+                added_track_count,
+                original_subsequence_preserved,
+                unique_membership,
+                final_sequence,
+                decisions,
+                search: ExactSearchArtifact {
+                    beam_width: EXACT_COUNT_BEAM_WIDTH,
+                    candidate_limit: retained_candidate_limit,
+                    evaluated_states: selection.stats.evaluated_states,
+                    retained_states: selection.stats.retained_states,
+                    maximum_additions_found: selection.stats.maximum_additions_found,
+                    structural_upper_bound: selection.stats.structural_upper_bound,
+                },
+                infeasibility,
+            })
+        }
+        _ => unreachable!("bridge mode is checked before analysis"),
     };
 
     Ok(BridgeAnalysisArtifact {
@@ -1343,11 +1514,11 @@ fn analyze_bridge_request(path: &Path) -> Result<BridgeAnalysisArtifact, Command
             "time-budget termination is not deterministic and is not implemented yet",
         ));
     }
-    if request.extension.mode != "automatic" {
+    if !matches!(request.extension.mode.as_str(), "automatic" | "exact_count") {
         return Err(CommandFailure::new(
             "EXTENSION_MODE_UNSUPPORTED",
             format!(
-                "the bridge command currently analyzes automatic extension, not '{}'",
+                "the bridge command currently analyzes automatic or exact_count extension, not '{}'",
                 request.extension.mode
             ),
         ));
@@ -1453,27 +1624,53 @@ mod tests {
         let artifact = score_request(Path::new(
             "fixtures/synthetic/adaptive-scoring-request.json",
         ));
-        let (route_artifact, bridge_artifact, semantic_bridge_artifact, preview_artifact) =
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(4)
-                .build()
-                .unwrap()
-                .install(|| {
-                    (
-                        optimize_route_request(Path::new(
-                            "fixtures/synthetic/adaptive-scoring-request.json",
-                        )),
-                        analyze_bridge_request(Path::new(
-                            "fixtures/synthetic/automatic-bridge-request.json",
-                        )),
-                        analyze_bridge_request(Path::new(
-                            "fixtures/synthetic/semantic-bridge-request.json",
-                        )),
-                        analyze_bridge_request(Path::new(
-                            "fixtures/synthetic/automatic-preview-request.json",
-                        )),
-                    )
-                });
+        let (
+            route_artifact,
+            bridge_artifact,
+            semantic_bridge_artifact,
+            preview_artifact,
+            exact_artifact,
+            infeasible_exact_artifact,
+        ) = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                (
+                    optimize_route_request(Path::new(
+                        "fixtures/synthetic/adaptive-scoring-request.json",
+                    )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/automatic-bridge-request.json",
+                    )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/semantic-bridge-request.json",
+                    )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/automatic-preview-request.json",
+                    )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/exact-count-request.json",
+                    )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/exact-count-infeasible-request.json",
+                    )),
+                )
+            });
+        let (exact_one_worker, infeasible_exact_one_worker) = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                (
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/exact-count-request.json",
+                    )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/exact-count-infeasible-request.json",
+                    )),
+                )
+            });
 
         std::env::set_current_dir(original).unwrap();
         let summary = validation.unwrap();
@@ -1542,7 +1739,10 @@ mod tests {
         assert_eq!(bridge_artifact.eligible_candidate_count, 6);
         assert_eq!(bridge_artifact.frozen_reference_count, 102);
         assert_eq!(bridge_artifact.gaps.len(), 11);
-        assert!(bridge_artifact.gaps.iter().all(|gap| !gap.triggering));
+        assert!(bridge_artifact
+            .gaps
+            .iter()
+            .all(|gap| gap.triggering == Some(false)));
         assert!(bridge_artifact
             .gaps
             .iter()
@@ -1599,17 +1799,16 @@ mod tests {
             serde_json::to_string(&preview_artifact).unwrap(),
             preview_expected
         );
-        assert_eq!(preview_artifact.selection_preview.max_added_tracks, 1);
-        assert_eq!(preview_artifact.selection_preview.added_track_count, 1);
-        assert!(
-            preview_artifact
-                .selection_preview
-                .original_subsequence_preserved
-        );
-        assert!(preview_artifact.selection_preview.unique_membership);
+        let automatic = match &preview_artifact.selection_preview {
+            SelectionPreviewArtifact::Automatic(automatic) => automatic,
+            SelectionPreviewArtifact::Exact(_) => panic!("expected automatic preview"),
+        };
+        assert_eq!(automatic.max_added_tracks, 1);
+        assert_eq!(automatic.added_track_count, 1);
+        assert!(automatic.original_subsequence_preserved);
+        assert!(automatic.unique_membership);
         assert_eq!(
-            preview_artifact
-                .selection_preview
+            automatic
                 .final_sequence
                 .iter()
                 .map(|entry| entry.track_id.as_str())
@@ -1623,11 +1822,76 @@ mod tests {
             ]
         );
         assert_eq!(
-            preview_artifact.selection_preview.decisions[1].reason,
+            automatic.decisions[1].reason,
             preview::DecisionReason::Selected
         );
-        assert!(preview_artifact.selection_preview.decisions[1]
-            .selected_bridge
-            .is_some());
+        assert!(automatic.decisions[1].selected_bridge.is_some());
+
+        let exact_artifact = exact_artifact.unwrap();
+        let exact_expected =
+            include_str!("../fixtures/synthetic/expected-native-exact-count-v1.json").trim();
+        assert_eq!(
+            serde_json::to_string(&exact_artifact).unwrap(),
+            exact_expected
+        );
+        assert_eq!(
+            serde_json::to_string(&exact_artifact).unwrap(),
+            serde_json::to_string(&exact_one_worker.unwrap()).unwrap()
+        );
+        let exact = match &exact_artifact.selection_preview {
+            SelectionPreviewArtifact::Exact(exact) => exact,
+            SelectionPreviewArtifact::Automatic(_) => panic!("expected exact-count preview"),
+        };
+        assert!(exact.feasible);
+        assert_eq!(exact.requested_added_tracks, 2);
+        assert_eq!(exact.added_track_count, 2);
+        assert_eq!(
+            exact
+                .final_sequence
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.kind == "bridge")
+                .count(),
+            2
+        );
+        assert!(exact.infeasibility.is_none());
+
+        let infeasible_exact_artifact = infeasible_exact_artifact.unwrap();
+        let infeasible_expected =
+            include_str!("../fixtures/synthetic/expected-native-exact-count-infeasible-v1.json")
+                .trim();
+        assert_eq!(
+            serde_json::to_string(&infeasible_exact_artifact).unwrap(),
+            infeasible_expected
+        );
+        assert_eq!(
+            serde_json::to_string(&infeasible_exact_artifact).unwrap(),
+            serde_json::to_string(&infeasible_exact_one_worker.unwrap()).unwrap()
+        );
+        let infeasible = match &infeasible_exact_artifact.selection_preview {
+            SelectionPreviewArtifact::Exact(exact) => exact,
+            SelectionPreviewArtifact::Automatic(_) => panic!("expected exact-count preview"),
+        };
+        assert!(!infeasible.feasible);
+        assert_eq!(infeasible.added_track_count, 0);
+        assert!(infeasible.final_sequence.is_none());
+        assert!(infeasible.decisions.is_empty());
+        assert_eq!(
+            infeasible
+                .infeasibility
+                .as_ref()
+                .unwrap()
+                .maximum_additions_found,
+            3
+        );
+        assert_eq!(
+            infeasible
+                .infeasibility
+                .as_ref()
+                .unwrap()
+                .structural_upper_bound,
+            6
+        );
     }
 }

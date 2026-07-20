@@ -78,6 +78,14 @@ fn published_examples_satisfy_their_v1_contracts() {
             "fixtures/synthetic/automatic-preview-request.json",
         ),
         (
+            "schemas/optimizer-request-v1.schema.json",
+            "fixtures/synthetic/exact-count-request.json",
+        ),
+        (
+            "schemas/optimizer-request-v1.schema.json",
+            "fixtures/synthetic/exact-count-infeasible-request.json",
+        ),
+        (
             "schemas/semantic-evidence-v1.schema.json",
             "examples/semantic-evidence-empty.json",
         ),
@@ -112,6 +120,14 @@ fn published_examples_satisfy_their_v1_contracts() {
         (
             "schemas/bridge-analysis-artifact-v1.schema.json",
             "fixtures/synthetic/expected-native-automatic-preview-v1.json",
+        ),
+        (
+            "schemas/bridge-analysis-artifact-v1.schema.json",
+            "fixtures/synthetic/expected-native-exact-count-v1.json",
+        ),
+        (
+            "schemas/bridge-analysis-artifact-v1.schema.json",
+            "fixtures/synthetic/expected-native-exact-count-infeasible-v1.json",
         ),
     ] {
         assert_valid(schema, example);
@@ -177,4 +193,65 @@ fn automatic_request_requires_a_budget_and_trigger() {
         .unwrap()
         .remove("trigger_percentile");
     assert!(!validator.is_valid(&without_trigger));
+}
+
+#[test]
+fn exact_count_request_requires_the_requested_addition_count() {
+    let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut example = read_json(&repository_path(
+        "fixtures/synthetic/exact-count-request.json",
+    ));
+    example["extension"]
+        .as_object_mut()
+        .unwrap()
+        .remove("additional_track_count");
+    assert!(!validator.is_valid(&example));
+}
+
+#[test]
+fn exact_count_contract_never_represents_infeasibility_as_a_partial_route() {
+    let schema = read_json(&repository_path(
+        "schemas/bridge-analysis-artifact-v1.schema.json",
+    ));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let feasible = read_json(&repository_path(
+        "fixtures/synthetic/expected-native-exact-count-v1.json",
+    ));
+    let infeasible = read_json(&repository_path(
+        "fixtures/synthetic/expected-native-exact-count-infeasible-v1.json",
+    ));
+
+    let requested = feasible["selection_preview"]["requested_added_tracks"]
+        .as_u64()
+        .unwrap();
+    let bridge_count = feasible["selection_preview"]["final_sequence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["kind"] == "bridge")
+        .count() as u64;
+    assert_eq!(bridge_count, requested);
+    assert_eq!(
+        feasible["selection_preview"]["added_track_count"]
+            .as_u64()
+            .unwrap(),
+        requested
+    );
+
+    assert_eq!(infeasible["selection_preview"]["added_track_count"], 0);
+    assert!(infeasible["selection_preview"]["final_sequence"].is_null());
+    assert!(infeasible["selection_preview"]["decisions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let mut infeasible_with_partial = infeasible.clone();
+    infeasible_with_partial["selection_preview"]["final_sequence"] =
+        feasible["selection_preview"]["final_sequence"].clone();
+    assert!(!validator.is_valid(&infeasible_with_partial));
+
+    let mut feasible_without_route = feasible;
+    feasible_without_route["selection_preview"]["final_sequence"] = Value::Null;
+    assert!(!validator.is_valid(&feasible_without_route));
 }

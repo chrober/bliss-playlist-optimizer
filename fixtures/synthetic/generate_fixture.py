@@ -325,6 +325,24 @@ def write_automatic_preview_request(
     )
 
 
+def write_exact_count_request(
+    path: pathlib.Path,
+    source_request: pathlib.Path,
+    job_id: str,
+    additional_track_count: int,
+) -> None:
+    request = json.loads(source_request.read_text(encoding="utf-8"))
+    request["job_id"] = job_id
+    request["extension"] = {
+        "mode": "exact_count",
+        "candidate_limit": 3,
+        "additional_track_count": additional_track_count,
+    }
+    path.write_text(
+        json.dumps(request, indent=2) + "\n", encoding="utf-8", newline="\n",
+    )
+
+
 def main() -> None:
     destination = pathlib.Path(__file__).resolve().parent
     tracks = [track(index) for index in range(TRACK_COUNT)]
@@ -336,6 +354,10 @@ def main() -> None:
     semantic_evidence = destination / "semantic-evidence-mixed.json"
     semantic_bridge_request = destination / "semantic-bridge-request.json"
     automatic_preview_request = destination / "automatic-preview-request.json"
+    exact_count_request = destination / "exact-count-request.json"
+    exact_count_infeasible_request = (
+        destination / "exact-count-infeasible-request.json"
+    )
     write_database(database, tracks)
     write_playlist(playlist, tracks)
     write_matrix(matrix)
@@ -344,6 +366,18 @@ def main() -> None:
     write_semantic_evidence(semantic_evidence)
     write_semantic_bridge_request(semantic_bridge_request, bridge_request)
     write_automatic_preview_request(automatic_preview_request, scoring_request)
+    write_exact_count_request(
+        exact_count_request,
+        automatic_preview_request,
+        "synthetic-exact-count-001",
+        2,
+    )
+    write_exact_count_request(
+        exact_count_infeasible_request,
+        bridge_request,
+        "synthetic-exact-count-infeasible-001",
+        7,
+    )
     manifest = {
         "fixture_version": 1,
         "description": "Private-data-free TracksV2 and Lyrion extended-M3U parity fixture.",
@@ -362,6 +396,10 @@ def main() -> None:
             "semantic-evidence-mixed.json": sha256(semantic_evidence),
             "semantic-bridge-request.json": sha256(semantic_bridge_request),
             "automatic-preview-request.json": sha256(automatic_preview_request),
+            "exact-count-request.json": sha256(exact_count_request),
+            "exact-count-infeasible-request.json": sha256(
+                exact_count_infeasible_request
+            ),
         },
         "python_oracle": {
             "working_directory": "../bliss-similarity-design",

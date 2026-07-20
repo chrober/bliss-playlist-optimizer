@@ -38,7 +38,12 @@
     "usable_library_track_count": { "type": "integer", "minimum": 2 },
     "eligible_candidate_count": { "type": "integer", "minimum": 0 },
     "frozen_reference_count": { "type": "integer", "minimum": 1 },
-    "trigger_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
+    "trigger_percentile": {
+      "anyOf": [
+        { "type": "number", "minimum": 0, "maximum": 1 },
+        { "type": "null" }
+      ]
+    },
     "max_leg_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
     "max_detour_percentile": { "type": "number", "minimum": 0 },
     "retained_candidate_limit": { "type": "integer", "minimum": 1 },
@@ -59,7 +64,10 @@
       "items": { "$ref": "#/$defs/gap" }
     },
     "selection_preview": {
-      "$ref": "#/$defs/selection_preview"
+      "oneOf": [
+        { "$ref": "#/$defs/automatic_selection_preview" },
+        { "$ref": "#/$defs/exact_selection_preview" }
+      ]
     }
   },
   "$defs": {
@@ -87,7 +95,12 @@
         "right_track_id": { "type": "string", "minLength": 1 },
         "direct_distance": { "type": "number", "minimum": 0 },
         "direct_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
-        "triggering": { "type": "boolean" },
+        "triggering": {
+          "anyOf": [
+            { "type": "boolean" },
+            { "type": "null" }
+          ]
+        },
         "semantic_pool": {
           "enum": ["endpoint_local", "collection_fallback", "bliss_only"]
         },
@@ -177,7 +190,7 @@
         { "required": ["raw_score"] }
       ]
     },
-    "selection_preview": {
+    "automatic_selection_preview": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -203,6 +216,155 @@
           "items": { "$ref": "#/$defs/preview_decision" }
         }
       }
+    },
+    "exact_selection_preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode", "processing_order", "requested_added_tracks", "feasible",
+        "added_track_count", "original_subsequence_preserved",
+        "unique_membership", "final_sequence", "decisions", "search",
+        "infeasibility"
+      ],
+      "properties": {
+        "mode": { "const": "exact_count" },
+        "processing_order": {
+          "const": "left-to-right-original-gaps-beam-search"
+        },
+        "requested_added_tracks": { "type": "integer", "minimum": 0 },
+        "feasible": { "type": "boolean" },
+        "added_track_count": { "type": "integer", "minimum": 0 },
+        "original_subsequence_preserved": {
+          "anyOf": [{ "const": true }, { "type": "null" }]
+        },
+        "unique_membership": {
+          "anyOf": [{ "const": true }, { "type": "null" }]
+        },
+        "final_sequence": {
+          "anyOf": [
+            {
+              "type": "array",
+              "minItems": 2,
+              "items": { "$ref": "#/$defs/preview_sequence_entry" }
+            },
+            { "type": "null" }
+          ]
+        },
+        "decisions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/exact_preview_decision" }
+        },
+        "search": { "$ref": "#/$defs/exact_search" },
+        "infeasibility": {
+          "anyOf": [
+            { "$ref": "#/$defs/exact_infeasibility" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "feasible": { "const": true } } },
+          "then": {
+            "properties": {
+              "original_subsequence_preserved": { "const": true },
+              "unique_membership": { "const": true },
+              "final_sequence": {
+                "type": "array",
+                "minItems": 2,
+                "items": { "$ref": "#/$defs/preview_sequence_entry" }
+              },
+              "infeasibility": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "added_track_count": { "const": 0 },
+              "original_subsequence_preserved": { "type": "null" },
+              "unique_membership": { "type": "null" },
+              "final_sequence": { "type": "null" },
+              "decisions": { "maxItems": 0 },
+              "infeasibility": { "$ref": "#/$defs/exact_infeasibility" }
+            }
+          }
+        }
+      ]
+    },
+    "exact_search": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "beam_width", "candidate_limit", "evaluated_states",
+        "retained_states", "maximum_additions_found",
+        "structural_upper_bound"
+      ],
+      "properties": {
+        "beam_width": { "type": "integer", "minimum": 1 },
+        "candidate_limit": { "type": "integer", "minimum": 1 },
+        "evaluated_states": { "type": "integer", "minimum": 1 },
+        "retained_states": { "type": "integer", "minimum": 1 },
+        "maximum_additions_found": { "type": "integer", "minimum": 0 },
+        "structural_upper_bound": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "exact_infeasibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code", "requested_added_tracks", "maximum_additions_found",
+        "structural_upper_bound"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "EXACT_COUNT_INFEASIBLE",
+            "EXACT_COUNT_NOT_FOUND_WITHIN_SEARCH_BOUNDS"
+          ]
+        },
+        "requested_added_tracks": { "type": "integer", "minimum": 0 },
+        "maximum_additions_found": { "type": "integer", "minimum": 0 },
+        "structural_upper_bound": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "exact_preview_decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "original_position", "route_position", "left_track_id",
+        "right_track_id", "direct_distance", "direct_percentile",
+        "semantic_pool", "reason", "selected_bridge"
+      ],
+      "properties": {
+        "original_position": { "type": "integer", "minimum": 1 },
+        "route_position": { "type": "integer", "minimum": 1 },
+        "left_track_id": { "type": "string", "minLength": 1 },
+        "right_track_id": { "type": "string", "minLength": 1 },
+        "direct_distance": { "type": "number", "minimum": 0 },
+        "direct_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
+        "semantic_pool": {
+          "enum": ["endpoint_local", "collection_fallback", "bliss_only"]
+        },
+        "reason": { "enum": ["selected", "not_selected"] },
+        "selected_bridge": {
+          "anyOf": [
+            { "$ref": "#/$defs/candidate" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "reason": { "const": "selected" } } },
+          "then": {
+            "properties": {
+              "selected_bridge": { "$ref": "#/$defs/candidate" }
+            }
+          },
+          "else": {
+            "properties": { "selected_bridge": { "type": "null" } }
+          }
+        }
+      ]
     },
     "preview_sequence_entry": {
       "type": "object",

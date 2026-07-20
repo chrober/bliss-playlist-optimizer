@@ -149,6 +149,46 @@ pub fn optimize_adaptive_route(
     })
 }
 
+pub fn evaluate_adaptive_sequence(
+    route: &[usize],
+    tracks: &[RouteTrack],
+    learned_matrix: &Array2<f32>,
+    seed_limit: usize,
+    learned_percent: u16,
+) -> Result<RouteMetrics, RouteError> {
+    if route.len() < 2 {
+        return Err(RouteError::TooFewTracks);
+    }
+    if seed_limit == 0 {
+        return Err(RouteError::InvalidSeedLimit);
+    }
+    if learned_percent > 100 {
+        return Err(RouteError::InvalidLearnedPercent(learned_percent));
+    }
+    if let Some(index) = route.iter().find(|index| **index >= tracks.len()) {
+        return Err(RouteError::Scoring(format!(
+            "invalid track index {index} for {} tracks",
+            tracks.len()
+        )));
+    }
+    let config = SearchConfig {
+        seed_limit,
+        learned_percent,
+        deterministic_seed: 0,
+        restart_count: 0,
+        artist_window: 0,
+        album_window: 0,
+    };
+    route_metrics(
+        route,
+        tracks,
+        learned_matrix,
+        &config,
+        None,
+        &mut ScoreCache::new(),
+    )
+}
+
 fn search_candidate(
     tracks: &[RouteTrack],
     learned_matrix: &Array2<f32>,

@@ -124,6 +124,12 @@
             "properties": { "mode": { "const": "automatic" } }
           },
           "then": { "required": ["max_added_tracks", "trigger_percentile"] }
+        },
+        {
+          "if": {
+            "properties": { "mode": { "const": "exact_count" } }
+          },
+          "then": { "required": ["additional_track_count"] }
         }
       ]
     },

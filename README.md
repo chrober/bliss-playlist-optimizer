@@ -14,6 +14,8 @@ cargo run -- route --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-bridge-request.json
 cargo run -- bridge --request fixtures/synthetic/semantic-bridge-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-preview-request.json
+cargo run -- bridge --request fixtures/synthetic/exact-count-request.json
+cargo run -- bridge --request fixtures/synthetic/exact-count-infeasible-request.json
 ```
 
 `validate` checks both JSON schemas, declared artifact hashes, SQLite integrity
@@ -78,8 +80,27 @@ local "sum plus twice the worst leg" objective over the direct transition. The
 preview reports the proposed final sequence and a selected, below-threshold,
 budget, eligibility, repeat, acoustic, or no-improvement reason for every gap.
 
-This remains analysis-only. Exact-count policies, applying a preview, and
-playlist writing are future slices.
+Exact-count requests use a deterministic bounded beam search over the original
+internal gaps. Search states are kept separately by addition count so a
+lower-count route cannot crowd the requested count out of the beam. Every
+tentative insertion is contextually rescored, unique, repeat-safe, and inside
+the same acoustic gates; completed states are ordered by the full
+bottleneck-then-sum route objective and stable route identity. Independent
+state and candidate evaluations use indexed Rayon iteration and reduce
+deterministically.
+
+A feasible exact preview contains exactly the requested number of bridges. An
+infeasible preview contains no final sequence and no partial decisions; it
+reports both the maximum count found and the structural upper bound. Only a
+request above that upper bound is labeled `EXACT_COUNT_INFEASIBLE`; failure
+inside the bound is honestly labeled
+`EXACT_COUNT_NOT_FOUND_WITHIN_SEARCH_BOUNDS`.
+The current exact-count slice permits at most one bridge in each original
+internal gap. Endpoint slots and multi-track routes inside one preserved-anchor
+gap remain future extensions.
+
+This remains analysis-only. Applying a preview and playlist writing are future
+slices.
 
 Success is written as one JSON object to stdout. Validation or search failures
 are written as one JSON object to stderr and exit with status 1; invalid CLI

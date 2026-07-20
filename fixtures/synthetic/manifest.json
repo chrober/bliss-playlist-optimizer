@@ -52,7 +52,9 @@
     "automatic-bridge-request.json": "3c1ae4b4e57e0a1affe57ccada0c160d7766fa60cf5f61add5f7e7c33a515ef3",
     "semantic-evidence-mixed.json": "7089e68e3ce3270e9f8916abc4ffa39e5d76954d5f9b3726ff2144cc353a8599",
     "semantic-bridge-request.json": "2ad57171728f0212c40dd4d946bb2dee718baa5ab918510ed312eb888a9dcd72",
-    "automatic-preview-request.json": "4686db917b1356005aca1c950decc19098da98662e0cfd8da2d231f0463b4f12"
+    "automatic-preview-request.json": "4686db917b1356005aca1c950decc19098da98662e0cfd8da2d231f0463b4f12",
+    "exact-count-request.json": "be2fcbeb912b50814939b59710c680eaf3cd82d11683e97a43e7dbc3f72b2e9f",
+    "exact-count-infeasible-request.json": "35d1bd966f73aed3b1bbe2139184e4e0f4d11c965d22e76cb19195a2afe33980"
   },
   "python_oracle": {
     "working_directory": "../bliss-similarity-design",

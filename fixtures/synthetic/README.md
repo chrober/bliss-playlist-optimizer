@@ -19,6 +19,8 @@ cargo run -- route --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-bridge-request.json
 cargo run -- bridge --request fixtures/synthetic/semantic-bridge-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-preview-request.json
+cargo run -- bridge --request fixtures/synthetic/exact-count-request.json
+cargo run -- bridge --request fixtures/synthetic/exact-count-infeasible-request.json
 ```
 
 The score result must exactly match `expected-native-scoring-v1.json`; its
@@ -56,6 +58,20 @@ middle gap at percentile 0.40 under a declared 0.30 trigger. With a one-track
 budget, the preview inserts opaque candidate `bliss-row-3` between track 02 and
 track 11, preserves the original subsequence, proves unique membership, and
 reports below-threshold no-ops for the other gaps. It never writes a playlist.
+
+The feasible exact-count result must exactly match
+expected-native-exact-count-v1.json. It requests two additions and returns two
+unique opaque bridges while preserving all four originals as an ordered
+subsequence. The bounded search retains separate beams per addition count and
+the one-worker and four-worker artifacts must be byte-identical.
+
+The infeasible exact-count result must exactly match
+expected-native-exact-count-infeasible-v1.json. It requests seven additions
+from a six-candidate library under the full acoustic and repeat gates; the
+search finds a maximum of three. The artifact therefore exposes no final
+sequence or partial decisions. Its structural upper bound is six, so the
+seven-track request is proven impossible and reports
+`EXACT_COUNT_INFEASIBLE`.
 
 Regeneration writes the adaptive scoring request, all three bridge requests,
 and the mixed semantic evidence bundle; their hashes are recorded in
