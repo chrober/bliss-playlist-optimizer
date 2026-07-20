@@ -99,6 +99,8 @@ version = "0.1.0"
 dependencies = [
  "bliss-mixer-core",
  "jsonschema",
+ "ndarray",
+ "rand",
  "rayon",
  "serde",
  "serde_json",

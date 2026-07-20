@@ -55,6 +55,10 @@ fn published_examples_satisfy_their_v1_contracts() {
             "schemas/scoring-artifact-v1.schema.json",
             "fixtures/synthetic/expected-native-scoring-v1.json",
         ),
+        (
+            "schemas/route-artifact-v1.schema.json",
+            "fixtures/synthetic/expected-native-route-v1.json",
+        ),
     ] {
         assert_valid(schema, example);
     }

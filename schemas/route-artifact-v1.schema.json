@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chrober/bliss-playlist-optimizer/schemas/route-artifact-v1.schema.json",
+  "title": "Adaptive route artifact v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_kind", "program", "version", "core_api",
+    "job_id", "request_sha256", "database_sha256", "learned_matrix_sha256",
+    "semantic_evidence_sha256", "algorithm_requested", "learned_percent",
+    "seed_limit", "deterministic_seed", "restart_count", "parallel_execution",
+    "search_tasks", "selected_strategy", "selected_track_ids", "primary", "arc",
+    "repeat_validation"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "artifact_kind": { "const": "adaptive-route-v1" },
+    "program": { "const": "bliss-playlist-optimizer" },
+    "version": { "type": "string" },
+    "core_api": { "type": "string" },
+    "job_id": { "type": "string", "minLength": 1 },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "database_sha256": { "$ref": "#/$defs/sha256" },
+    "learned_matrix_sha256": { "$ref": "#/$defs/sha256" },
+    "semantic_evidence_sha256": { "$ref": "#/$defs/sha256" },
+    "algorithm_requested": { "const": "adaptive" },
+    "learned_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "seed_limit": { "type": "integer", "minimum": 1 },
+    "deterministic_seed": { "type": "integer", "minimum": 0 },
+    "restart_count": { "type": "integer", "minimum": 0 },
+    "parallel_execution": { "const": "rayon-restarts-indexed" },
+    "search_tasks": { "type": "integer", "minimum": 5 },
+    "selected_strategy": { "enum": ["adaptive", "adaptive-arc"] },
+    "selected_track_ids": { "$ref": "#/$defs/track_ids" },
+    "primary": { "$ref": "#/$defs/candidate" },
+    "arc": { "$ref": "#/$defs/candidate" },
+    "repeat_validation": { "$ref": "#/$defs/repeat_validation" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "track_ids": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy", "track_ids", "transition_sum", "worst_transition", "objective", "arc_error"
+      ],
+      "properties": {
+        "strategy": { "enum": ["adaptive", "adaptive-arc"] },
+        "track_ids": { "$ref": "#/$defs/track_ids" },
+        "transition_sum": { "type": "number", "minimum": 0 },
+        "worst_transition": { "type": "number", "minimum": 0 },
+        "objective": { "type": "number", "minimum": 0 },
+        "arc_error": { "type": "number", "minimum": 0 }
+      }
+    },
+    "repeat_validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid", "track_window_satisfied_by_unique_membership", "violations"],
+      "properties": {
+        "valid": { "const": true },
+        "track_window_satisfied_by_unique_membership": { "const": true },
+        "violations": {
+          "type": "array",
+          "maxItems": 0,
+          "items": { "$ref": "#/$defs/repeat_violation" }
+        }
+      }
+    },
+    "repeat_violation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "positions"],
+      "properties": {
+        "kind": { "enum": ["artist", "album"] },
+        "positions": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  }
+}
