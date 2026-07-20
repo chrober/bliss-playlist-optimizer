@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use bliss_playlist_optimizer::route;
+use bliss_playlist_optimizer::{bridge, route};
 
 const PROGRAM: &str = "bliss-playlist-optimizer";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REQUEST_SCHEMA: &str = include_str!("../schemas/optimizer-request-v1.schema.json");
 const SEMANTIC_SCHEMA: &str = include_str!("../schemas/semantic-evidence-v1.schema.json");
+const BRIDGE_TRIGGER_PERCENTILE: f64 = 0.70;
+const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -46,6 +48,7 @@ struct Artifact {
 struct SourceTrack {
     id: String,
     database_file: Option<String>,
+    title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
 }
@@ -88,6 +91,7 @@ struct RepeatWindows {
 #[derive(Debug, Deserialize)]
 struct ExtensionSettings {
     mode: String,
+    candidate_limit: Option<usize>,
 }
 #[derive(Debug, Serialize)]
 struct ValidationSummary {
@@ -185,6 +189,72 @@ struct RepeatViolationArtifact {
     kind: &'static str,
     positions: [usize; 2],
 }
+
+#[derive(Debug, Serialize)]
+struct BridgeAnalysisArtifact {
+    schema_version: u8,
+    artifact_kind: &'static str,
+    program: &'static str,
+    version: &'static str,
+    core_api: &'static str,
+    job_id: String,
+    request_sha256: String,
+    database_sha256: String,
+    learned_matrix_sha256: String,
+    semantic_evidence_sha256: String,
+    algorithm_requested: String,
+    learned_percent: u16,
+    seed_limit: usize,
+    deterministic_seed: u64,
+    restart_count: usize,
+    parallel_execution: &'static str,
+    selected_strategy: &'static str,
+    selected_track_ids: Vec<String>,
+    selected_route_objective: f64,
+    usable_library_track_count: usize,
+    eligible_candidate_count: usize,
+    frozen_reference_count: usize,
+    trigger_percentile: f64,
+    max_leg_percentile: f64,
+    max_detour_percentile: f64,
+    retained_candidate_limit: usize,
+    semantic_mode: &'static str,
+    gaps: Vec<BridgeGapArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct BridgeGapArtifact {
+    position: usize,
+    left_track_id: String,
+    right_track_id: String,
+    direct_distance: f64,
+    direct_percentile: f64,
+    triggering: bool,
+    evaluated_candidate_count: usize,
+    accepted_candidate_count: usize,
+    repeat_rejected_count: usize,
+    acoustic_rejected_count: usize,
+    accepted_candidates: Vec<BridgeCandidateArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct BridgeCandidateArtifact {
+    candidate_id: String,
+    left_distance: f64,
+    right_distance: f64,
+    left_percentile: f64,
+    right_percentile: f64,
+    max_percentile: f64,
+    detour_percentile: f64,
+}
+
+struct LibraryTrack {
+    row_id: u64,
+    file: String,
+    artist_key: String,
+    title_key: String,
+    route_track: route::RouteTrack,
+}
 #[derive(Debug, Serialize)]
 struct CommandFailure {
     schema_version: u8,
@@ -205,7 +275,7 @@ impl CommandFailure {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>\n  bliss-playlist-optimizer route --request <request.json>"
+    "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>\n  bliss-playlist-optimizer route --request <request.json>\n  bliss-playlist-optimizer bridge --request <request.json>"
 }
 
 fn default_parallel_workers(available: usize) -> usize {
@@ -521,6 +591,69 @@ fn score_request(path: &Path) -> Result<ScoringArtifact, CommandFailure> {
     })
 }
 
+fn load_usable_library(database: &BlissDatabase) -> Result<Vec<LibraryTrack>, CommandFailure> {
+    let metrics = database
+        .all_raw_metrics()
+        .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?;
+    let mut library = Vec::with_capacity(metrics.len());
+    for (row_id, features) in metrics {
+        let metadata = database
+            .metadata(row_id)
+            .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?
+            .ok_or_else(|| {
+                CommandFailure::new(
+                    "TRACK_METADATA_MISSING",
+                    format!("usable Bliss row {row_id} has no metadata"),
+                )
+            })?;
+        let artist = metadata.artist.unwrap_or_default();
+        let album = metadata.album.unwrap_or_default();
+        let title = metadata.title.unwrap_or_default();
+        library.push(LibraryTrack {
+            row_id,
+            file: metadata.file,
+            artist_key: repeat_key(&artist),
+            title_key: repeat_key(&title),
+            route_track: route::RouteTrack {
+                features,
+                artist_key: repeat_key(&artist),
+                album_key: repeat_key(&album),
+            },
+        });
+    }
+    Ok(library)
+}
+
+fn require_empty_semantic_graph(artifact: &Artifact) -> Result<(), CommandFailure> {
+    let bytes = fs::read(&artifact.path).map_err(|error| {
+        CommandFailure::new(
+            "SEMANTIC_EVIDENCE_UNREADABLE",
+            format!("failed to read semantic evidence: {error}"),
+        )
+    })?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        CommandFailure::new(
+            "SEMANTIC_EVIDENCE_INVALID",
+            format!("failed to decode semantic evidence: {error}"),
+        )
+    })?;
+    if value
+        .get("edges")
+        .and_then(Value::as_array)
+        .is_some_and(|edges| !edges.is_empty())
+    {
+        return Err(CommandFailure::new(
+            "SEMANTIC_EVIDENCE_UNSUPPORTED",
+            "this bridge-analysis slice supports Bliss-only ranking; non-empty semantic edges are not ignored",
+        ));
+    }
+    Ok(())
+}
+
+fn bridge_candidate_id(row_id: u64) -> String {
+    format!("bliss-row-{row_id}")
+}
+
 fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> {
     let validation = validate_request(path)?;
     let request = decode_request(path)?;
@@ -698,6 +831,288 @@ fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> 
     })
 }
 
+fn analyze_bridge_validated(
+    validation: ValidationSummary,
+    request: Request,
+) -> Result<BridgeAnalysisArtifact, CommandFailure> {
+    let adaptive = request.scoring.adaptive.as_ref().ok_or_else(|| {
+        CommandFailure::new(
+            "ADAPTIVE_SETTINGS_REQUIRED",
+            "adaptive scoring requires scoring.adaptive settings",
+        )
+    })?;
+    let seed_limit = adaptive.seed_limit;
+    let learned_percent = adaptive.learned_percent;
+    let deterministic_seed = request.route.search.deterministic_seed;
+    let restart_count = request.route.search.restart_count;
+    let retained_candidate_limit = request
+        .extension
+        .candidate_limit
+        .unwrap_or(DEFAULT_RETAINED_CANDIDATES);
+    let matrix_artifact = request.artifacts.learned_matrix.as_ref().ok_or_else(|| {
+        CommandFailure::new(
+            "MATRIX_REQUIRED",
+            "adaptive scoring requires artifacts.learned_matrix",
+        )
+    })?;
+    let learned_matrix = bliss_mixer_core::matrix::load_learned_matrix(&matrix_artifact.path)
+        .map_err(|error| CommandFailure::new("MATRIX_INVALID", error.to_string()))?;
+    let database = BlissDatabase::open_read_only(&request.artifacts.database.path)
+        .map_err(|error| CommandFailure::new("DATABASE_INVALID", error.to_string()))?;
+    let library = load_usable_library(&database)?;
+    let mut file_to_index = HashMap::with_capacity(library.len());
+    for (index, track) in library.iter().enumerate() {
+        if file_to_index.insert(track.file.clone(), index).is_some() {
+            return Err(CommandFailure::new(
+                "DATABASE_INVALID",
+                format!("duplicate usable Bliss file identity '{}'", track.file),
+            ));
+        }
+    }
+
+    let mut source_files = HashSet::new();
+    let mut source_identities = HashSet::new();
+    let mut source_library_indices = Vec::with_capacity(request.source_tracks.len());
+    let mut source_route_tracks = Vec::with_capacity(request.source_tracks.len());
+    for source in &request.source_tracks {
+        let database_file = source.database_file.as_deref().ok_or_else(|| {
+            CommandFailure::new(
+                "TRACK_IDENTITY_INCOMPLETE",
+                format!("source track '{}' has no database_file identity", source.id),
+            )
+        })?;
+        let library_index = file_to_index.get(database_file).copied().ok_or_else(|| {
+            CommandFailure::new(
+                "TRACK_NOT_ANALYZED",
+                format!(
+                    "source track '{}' is absent or ignored in the Bliss database",
+                    source.id
+                ),
+            )
+        })?;
+        let library_track = &library[library_index];
+        let artist_key = source
+            .artist
+            .as_deref()
+            .map(repeat_key)
+            .unwrap_or_else(|| library_track.artist_key.clone());
+        let album_key = source
+            .album
+            .as_deref()
+            .map(repeat_key)
+            .unwrap_or_else(|| library_track.route_track.album_key.clone());
+        let title_key = source
+            .title
+            .as_deref()
+            .map(repeat_key)
+            .unwrap_or_else(|| library_track.title_key.clone());
+        source_files.insert(library_track.file.clone());
+        source_identities.insert((artist_key.clone(), title_key));
+        source_library_indices.push(library_index);
+        source_route_tracks.push(route::RouteTrack {
+            features: library_track.route_track.features,
+            artist_key,
+            album_key,
+        });
+    }
+
+    let route_config = route::SearchConfig {
+        seed_limit,
+        learned_percent,
+        deterministic_seed,
+        restart_count,
+        artist_window: request.repeat_windows.artist,
+        album_window: request.repeat_windows.album,
+    };
+    let route_result =
+        route::optimize_adaptive_route(&source_route_tracks, &learned_matrix, &route_config)
+            .map_err(|error| CommandFailure::new("ROUTE_SEARCH_FAILED", error.to_string()))?;
+    let selected_local_route = route_result.selected.route.clone();
+    let selected_library_route = selected_local_route
+        .iter()
+        .map(|index| source_library_indices[*index])
+        .collect::<Vec<_>>();
+    let selected_track_ids = route_track_ids(&selected_local_route, &request.source_tracks);
+
+    let eligible_candidates = library
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| {
+            !source_files.contains(&track.file)
+                && !source_identities.contains(&(track.artist_key.clone(), track.title_key.clone()))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let bridge_tracks = library
+        .iter()
+        .map(|track| track.route_track.clone())
+        .collect::<Vec<_>>();
+    let bridge_config = bridge::BridgeConfig {
+        seed_limit,
+        learned_percent,
+        artist_window: request.repeat_windows.artist,
+        album_window: request.repeat_windows.album,
+        max_leg_percentile: bridge::DEFAULT_MAX_LEG_PERCENTILE,
+        max_detour_percentile: bridge::DEFAULT_MAX_DETOUR_PERCENTILE,
+    };
+    let reference = bridge::build_frozen_reference(
+        &selected_library_route,
+        &selected_library_route,
+        &bridge_tracks,
+        &learned_matrix,
+        &bridge_config,
+    )
+    .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
+
+    let mut gaps = Vec::with_capacity(selected_library_route.len() - 1);
+    for position in 1..selected_library_route.len() {
+        let gap = bridge::evaluate_gap(
+            &selected_library_route,
+            position,
+            &bridge_tracks,
+            &learned_matrix,
+            &bridge_config,
+            &reference,
+        )
+        .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
+        let evaluations = bridge::rank_candidates(
+            &selected_library_route,
+            position,
+            &eligible_candidates,
+            &bridge_tracks,
+            &learned_matrix,
+            &bridge_config,
+            &reference,
+        )
+        .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
+        let accepted_candidate_count = evaluations
+            .iter()
+            .filter(|candidate| candidate.accepted)
+            .count();
+        let repeat_rejected_count = evaluations
+            .iter()
+            .filter(|candidate| !candidate.repeat_safe)
+            .count();
+        let acoustic_rejected_count =
+            evaluations.len() - accepted_candidate_count - repeat_rejected_count;
+        let accepted_candidates = evaluations
+            .iter()
+            .filter(|candidate| candidate.accepted)
+            .take(retained_candidate_limit)
+            .map(|candidate| BridgeCandidateArtifact {
+                candidate_id: bridge_candidate_id(library[candidate.candidate].row_id),
+                left_distance: candidate.left_distance,
+                right_distance: candidate.right_distance,
+                left_percentile: candidate.left_percentile,
+                right_percentile: candidate.right_percentile,
+                max_percentile: candidate.max_percentile,
+                detour_percentile: candidate.detour_percentile,
+            })
+            .collect();
+        gaps.push(BridgeGapArtifact {
+            position,
+            left_track_id: selected_track_ids[position - 1].clone(),
+            right_track_id: selected_track_ids[position].clone(),
+            direct_distance: gap.direct_distance,
+            direct_percentile: gap.direct_percentile,
+            triggering: gap.direct_percentile > BRIDGE_TRIGGER_PERCENTILE,
+            evaluated_candidate_count: evaluations.len(),
+            accepted_candidate_count,
+            repeat_rejected_count,
+            acoustic_rejected_count,
+            accepted_candidates,
+        });
+    }
+
+    Ok(BridgeAnalysisArtifact {
+        schema_version: 1,
+        artifact_kind: "contextual-bridge-analysis-v1",
+        program: PROGRAM,
+        version: VERSION,
+        core_api: "0.1",
+        job_id: request.job_id,
+        request_sha256: validation.request_sha256,
+        database_sha256: validation.database_sha256,
+        learned_matrix_sha256: validation
+            .learned_matrix_sha256
+            .expect("adaptive validation requires a learned matrix"),
+        semantic_evidence_sha256: validation.semantic_evidence_sha256,
+        algorithm_requested: request.scoring.algorithm,
+        learned_percent,
+        seed_limit,
+        deterministic_seed,
+        restart_count,
+        parallel_execution: "rayon-route-restarts-and-candidates-indexed",
+        selected_strategy: route_result.selected.strategy,
+        selected_track_ids,
+        selected_route_objective: route_result.selected.metrics.objective,
+        usable_library_track_count: library.len(),
+        eligible_candidate_count: eligible_candidates.len(),
+        frozen_reference_count: reference.len(),
+        trigger_percentile: BRIDGE_TRIGGER_PERCENTILE,
+        max_leg_percentile: bridge::DEFAULT_MAX_LEG_PERCENTILE,
+        max_detour_percentile: bridge::DEFAULT_MAX_DETOUR_PERCENTILE,
+        retained_candidate_limit,
+        semantic_mode: "bliss-only-empty-graph",
+        gaps,
+    })
+}
+
+fn analyze_bridge_request(path: &Path) -> Result<BridgeAnalysisArtifact, CommandFailure> {
+    let validation = validate_request(path)?;
+    let request = decode_request(path)?;
+    if request.scoring.algorithm != "adaptive" {
+        return Err(CommandFailure::new(
+            "SCORING_ALGORITHM_UNSUPPORTED",
+            format!(
+                "the bridge command currently supports adaptive scoring, not '{}'",
+                request.scoring.algorithm
+            ),
+        ));
+    }
+    if request.route.ordering_policy != "optimize_order" {
+        return Err(CommandFailure::new(
+            "ROUTE_POLICY_UNSUPPORTED",
+            format!(
+                "the bridge command currently supports optimize_order, not '{}'",
+                request.route.ordering_policy
+            ),
+        ));
+    }
+    if request.route.objective != "bottleneck_then_sum" {
+        return Err(CommandFailure::new(
+            "ROUTE_OBJECTIVE_UNSUPPORTED",
+            format!(
+                "the bridge command currently supports bottleneck_then_sum, not '{}'",
+                request.route.objective
+            ),
+        ));
+    }
+    if request.route.start_track_id.is_some() || request.route.destination_track_id.is_some() {
+        return Err(CommandFailure::new(
+            "ROUTE_LOCK_UNSUPPORTED",
+            "start and destination locks are not implemented in bridge analysis",
+        ));
+    }
+    if request.route.search.time_budget_ms.is_some() {
+        return Err(CommandFailure::new(
+            "TIME_BUDGET_UNSUPPORTED",
+            "time-budget termination is not deterministic and is not implemented yet",
+        ));
+    }
+    if request.extension.mode != "automatic" {
+        return Err(CommandFailure::new(
+            "EXTENSION_MODE_UNSUPPORTED",
+            format!(
+                "the bridge command currently analyzes automatic extension, not '{}'",
+                request.extension.mode
+            ),
+        ));
+    }
+    require_empty_semantic_graph(&request.semantic_evidence)?;
+    analyze_bridge_validated(validation, request)
+}
+
 fn repeat_key(value: &str) -> String {
     value.trim().to_lowercase()
 }
@@ -759,6 +1174,9 @@ fn main() {
         [command, request_option, path] if command == "route" && request_option == "--request" => {
             print_result(optimize_route_request(Path::new(path)));
         }
+        [command, request_option, path] if command == "bridge" && request_option == "--request" => {
+            print_result(analyze_bridge_request(Path::new(path)));
+        }
         _ => {
             eprintln!("{}", usage());
             std::process::exit(2);
@@ -776,6 +1194,7 @@ mod tests {
         assert!(usage().contains("validate"));
         assert!(usage().contains("score"));
         assert!(usage().contains("route"));
+        assert!(usage().contains("bridge"));
         assert_eq!(default_parallel_workers(1), 1);
         assert_eq!(default_parallel_workers(2), 1);
         assert_eq!(default_parallel_workers(4), 3);
@@ -791,14 +1210,19 @@ mod tests {
         let artifact = score_request(Path::new(
             "fixtures/synthetic/adaptive-scoring-request.json",
         ));
-        let route_artifact = rayon::ThreadPoolBuilder::new()
+        let (route_artifact, bridge_artifact) = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
             .unwrap()
             .install(|| {
-                optimize_route_request(Path::new(
-                    "fixtures/synthetic/adaptive-scoring-request.json",
-                ))
+                (
+                    optimize_route_request(Path::new(
+                        "fixtures/synthetic/adaptive-scoring-request.json",
+                    )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/automatic-bridge-request.json",
+                    )),
+                )
             });
 
         std::env::set_current_dir(original).unwrap();
@@ -856,5 +1280,23 @@ mod tests {
                 "route {key}: native={actual}, python={expected}"
             );
         }
+
+        let bridge_artifact = bridge_artifact.unwrap();
+        let bridge_expected =
+            include_str!("../fixtures/synthetic/expected-native-bridge-analysis-v1.json").trim();
+        assert_eq!(
+            serde_json::to_string(&bridge_artifact).unwrap(),
+            bridge_expected
+        );
+        assert_eq!(bridge_artifact.usable_library_track_count, 18);
+        assert_eq!(bridge_artifact.eligible_candidate_count, 6);
+        assert_eq!(bridge_artifact.frozen_reference_count, 102);
+        assert_eq!(bridge_artifact.gaps.len(), 11);
+        assert!(bridge_artifact.gaps.iter().all(|gap| !gap.triggering));
+        assert!(bridge_artifact
+            .gaps
+            .iter()
+            .flat_map(|gap| &gap.accepted_candidates)
+            .all(|candidate| candidate.candidate_id.starts_with("bliss-row-")));
     }
 }

@@ -11,6 +11,7 @@ The current read-only contract slice exposes:
 cargo run -- validate --request examples/reorder-only-request.json
 cargo run -- score --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- route --request fixtures/synthetic/adaptive-scoring-request.json
+cargo run -- bridge --request fixtures/synthetic/automatic-bridge-request.json
 ```
 
 `validate` checks both JSON schemas, declared artifact hashes, SQLite integrity
@@ -42,13 +43,19 @@ tie-breaking, so results are byte-identical across worker counts. By default the
 executable leaves one logical CPU for Lyrion; set `RAYON_NUM_THREADS` to override
 that policy. SQLite access and validation remain sequential.
 
-The public Rust library also contains the first read-only bridge kernel. It
-builds the frozen cross-context Adaptive reference distribution, rescoring both
-sides of an internal insertion with the bridge present in the outgoing context,
-enforces artist/album repetition and unique membership, and ranks independent
-candidates deterministically with Rayon. Candidate enumeration, semantic
-evidence tiers, extension policies, and a bridge CLI artifact are the next
-slice; the current command line still rejects extension requests.
+The bridge command is a read-only analysis slice for automatic extension. It
+enumerates usable TracksV2 rows in stable row-id order, excludes curated and
+duplicate recording identities, optimizes the original route, builds the frozen
+cross-context Adaptive reference distribution, and rescores both sides of each
+candidate insertion with the bridge present in the outgoing context. It emits
+opaque row IDs bound to the database hash, aggregate rejection counts, and a
+bounded list of accepted candidates per gap; it exposes no library paths.
+Independent candidates are ranked deterministically with Rayon.
+
+This slice accepts an empty semantic graph and identifies its result as
+Bliss-only. It rejects non-empty semantic edges rather than silently ignoring
+them. Semantic evidence tiers, automatic insertion decisions, exact-count
+policies, and playlist writing remain future slices.
 
 Success is written as one JSON object to stdout. Validation or search failures
 are written as one JSON object to stderr and exit with status 1; invalid CLI

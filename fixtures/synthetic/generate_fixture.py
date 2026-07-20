@@ -183,6 +183,17 @@ def write_scoring_request(path: pathlib.Path, tracks: list[dict[str, object]]) -
     path.write_text(
         json.dumps(request, indent=2) + "\n", encoding="utf-8", newline="\n",
     )
+
+
+def write_bridge_request(path: pathlib.Path, scoring_request: pathlib.Path) -> None:
+    request = json.loads(scoring_request.read_text(encoding="utf-8"))
+    request["job_id"] = "synthetic-automatic-bridge-001"
+    request["extension"] = {"mode": "automatic", "candidate_limit": 3}
+    path.write_text(
+        json.dumps(request, indent=2) + "\n", encoding="utf-8", newline="\n",
+    )
+
+
 def main() -> None:
     destination = pathlib.Path(__file__).resolve().parent
     tracks = [track(index) for index in range(TRACK_COUNT)]
@@ -190,10 +201,12 @@ def main() -> None:
     playlist = destination / "source.m3u"
     matrix = destination / "learned_matrix.json"
     scoring_request = destination / "adaptive-scoring-request.json"
+    bridge_request = destination / "automatic-bridge-request.json"
     write_database(database, tracks)
     write_playlist(playlist, tracks)
     write_matrix(matrix)
     write_scoring_request(scoring_request, tracks)
+    write_bridge_request(bridge_request, scoring_request)
     manifest = {
         "fixture_version": 1,
         "description": "Private-data-free TracksV2 and Lyrion extended-M3U parity fixture.",
@@ -208,6 +221,7 @@ def main() -> None:
             "source.m3u": sha256(playlist),
             "learned_matrix.json": sha256(matrix),
             "adaptive-scoring-request.json": sha256(scoring_request),
+            "automatic-bridge-request.json": sha256(bridge_request),
         },
         "python_oracle": {
             "working_directory": "../bliss-similarity-design",
@@ -228,4 +242,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

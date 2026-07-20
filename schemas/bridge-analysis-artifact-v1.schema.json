@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chrober/bliss-playlist-optimizer/schemas/bridge-analysis-artifact-v1.schema.json",
+  "title": "Contextual bridge analysis artifact v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "artifact_kind", "program", "version", "core_api",
+    "job_id", "request_sha256", "database_sha256", "learned_matrix_sha256",
+    "semantic_evidence_sha256", "algorithm_requested", "learned_percent",
+    "seed_limit", "deterministic_seed", "restart_count", "parallel_execution",
+    "selected_strategy", "selected_track_ids", "selected_route_objective",
+    "usable_library_track_count", "eligible_candidate_count",
+    "frozen_reference_count", "trigger_percentile", "max_leg_percentile",
+    "max_detour_percentile", "retained_candidate_limit", "semantic_mode", "gaps"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "artifact_kind": { "const": "contextual-bridge-analysis-v1" },
+    "program": { "const": "bliss-playlist-optimizer" },
+    "version": { "type": "string" },
+    "core_api": { "type": "string" },
+    "job_id": { "type": "string", "minLength": 1 },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "database_sha256": { "$ref": "#/$defs/sha256" },
+    "learned_matrix_sha256": { "$ref": "#/$defs/sha256" },
+    "semantic_evidence_sha256": { "$ref": "#/$defs/sha256" },
+    "algorithm_requested": { "const": "adaptive" },
+    "learned_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "seed_limit": { "type": "integer", "minimum": 1 },
+    "deterministic_seed": { "type": "integer", "minimum": 0 },
+    "restart_count": { "type": "integer", "minimum": 0 },
+    "parallel_execution": { "const": "rayon-route-restarts-and-candidates-indexed" },
+    "selected_strategy": { "enum": ["adaptive", "adaptive-arc"] },
+    "selected_track_ids": { "$ref": "#/$defs/track_ids" },
+    "selected_route_objective": { "type": "number", "minimum": 0 },
+    "usable_library_track_count": { "type": "integer", "minimum": 2 },
+    "eligible_candidate_count": { "type": "integer", "minimum": 0 },
+    "frozen_reference_count": { "type": "integer", "minimum": 1 },
+    "trigger_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
+    "max_leg_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
+    "max_detour_percentile": { "type": "number", "minimum": 0 },
+    "retained_candidate_limit": { "type": "integer", "minimum": 1 },
+    "semantic_mode": { "const": "bliss-only-empty-graph" },
+    "gaps": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/gap" }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "track_ids": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "gap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "position", "left_track_id", "right_track_id", "direct_distance",
+        "direct_percentile", "triggering", "evaluated_candidate_count",
+        "accepted_candidate_count", "repeat_rejected_count",
+        "acoustic_rejected_count", "accepted_candidates"
+      ],
+      "properties": {
+        "position": { "type": "integer", "minimum": 1 },
+        "left_track_id": { "type": "string", "minLength": 1 },
+        "right_track_id": { "type": "string", "minLength": 1 },
+        "direct_distance": { "type": "number", "minimum": 0 },
+        "direct_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
+        "triggering": { "type": "boolean" },
+        "evaluated_candidate_count": { "type": "integer", "minimum": 0 },
+        "accepted_candidate_count": { "type": "integer", "minimum": 0 },
+        "repeat_rejected_count": { "type": "integer", "minimum": 0 },
+        "acoustic_rejected_count": { "type": "integer", "minimum": 0 },
+        "accepted_candidates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/candidate" }
+        }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id", "left_distance", "right_distance", "left_percentile",
+        "right_percentile", "max_percentile", "detour_percentile"
+      ],
+      "properties": {
+        "candidate_id": { "type": "string", "pattern": "^bliss-row-[1-9][0-9]*$" },
+        "left_distance": { "type": "number", "minimum": 0 },
+        "right_distance": { "type": "number", "minimum": 0 },
+        "left_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
+        "right_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
+        "max_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
+        "detour_percentile": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

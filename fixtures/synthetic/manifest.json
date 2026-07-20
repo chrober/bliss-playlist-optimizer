@@ -48,7 +48,8 @@
     "bliss.db": "f5c3ebb9822310455621e696b15a16efb8176b746e6d7fd1882ea04ad5a59d3e",
     "source.m3u": "66bf87d9afcab85e76cc8bd8e4c477207f9df367b11d59ccdef51826625dc16d",
     "learned_matrix.json": "4023a86c9588df60ec2bc63e886248f7699f46980ae2e78cf6b1dd835933fbc7",
-    "adaptive-scoring-request.json": "d52443eeb93d9a6ed2cad9d7deebf0d68b8d48b1081e36cdf4539c93d904c60a"
+    "adaptive-scoring-request.json": "d52443eeb93d9a6ed2cad9d7deebf0d68b8d48b1081e36cdf4539c93d904c60a",
+    "automatic-bridge-request.json": "af9684831589c1723fdd2df655bf7a41436f7fac789e35a4d3154cac2c97175e"
   },
   "python_oracle": {
     "working_directory": "../bliss-similarity-design",

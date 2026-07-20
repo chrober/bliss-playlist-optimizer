@@ -8,6 +8,9 @@ use rayon::prelude::*;
 use crate::contextual::{adaptive_distance_from_seeds, ContextualError};
 use crate::route::RouteTrack;
 
+pub const DEFAULT_MAX_LEG_PERCENTILE: f64 = 0.70;
+pub const DEFAULT_MAX_DETOUR_PERCENTILE: f64 = 1.30;
+
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
     pub seed_limit: usize,
@@ -322,8 +325,8 @@ mod tests {
             learned_percent: 20,
             artist_window: 1,
             album_window: 1,
-            max_leg_percentile: 0.70,
-            max_detour_percentile: 1.30,
+            max_leg_percentile: DEFAULT_MAX_LEG_PERCENTILE,
+            max_detour_percentile: DEFAULT_MAX_DETOUR_PERCENTILE,
         }
     }
 
