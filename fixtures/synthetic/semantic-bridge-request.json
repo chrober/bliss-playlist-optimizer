@@ -134,7 +134,9 @@
   },
   "extension": {
     "mode": "automatic",
-    "candidate_limit": 3
+    "candidate_limit": 3,
+    "max_added_tracks": 3,
+    "trigger_percentile": 0.7
   },
   "semantic_evidence": {
     "path": "fixtures/synthetic/semantic-evidence-mixed.json",

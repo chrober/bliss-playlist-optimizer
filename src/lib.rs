@@ -2,5 +2,6 @@
 
 pub mod bridge;
 pub mod contextual;
+pub mod preview;
 pub mod route;
 pub mod semantic;

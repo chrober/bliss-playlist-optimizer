@@ -18,6 +18,7 @@ cargo run -- score --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- route --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-bridge-request.json
 cargo run -- bridge --request fixtures/synthetic/semantic-bridge-request.json
+cargo run -- bridge --request fixtures/synthetic/automatic-preview-request.json
 ```
 
 The score result must exactly match `expected-native-scoring-v1.json`; its
@@ -49,5 +50,13 @@ endpoint-local artist support, collection-artist fallback only where the local
 pool is empty, and deterministic Bliss acoustic/repeat gates beneath every
 semantic tier. No provider call is made by the native optimizer.
 
-Regeneration writes the adaptive scoring request, both bridge requests, and the
-mixed semantic evidence bundle; their hashes are recorded in manifest.json.
+The automatic preview result must exactly match
+expected-native-automatic-preview-v1.json. Its four original anchors create a
+middle gap at percentile 0.40 under a declared 0.30 trigger. With a one-track
+budget, the preview inserts opaque candidate `bliss-row-3` between track 02 and
+track 11, preserves the original subsequence, proves unique membership, and
+reports below-threshold no-ops for the other gaps. It never writes a playlist.
+
+Regeneration writes the adaptive scoring request, all three bridge requests,
+and the mixed semantic evidence bundle; their hashes are recorded in
+manifest.json.

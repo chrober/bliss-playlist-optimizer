@@ -114,8 +114,18 @@
         },
         "additional_track_count": { "type": "integer", "minimum": 0 },
         "target_track_count": { "type": "integer", "minimum": 2 },
-        "candidate_limit": { "type": "integer", "minimum": 1 }
-      }
+        "candidate_limit": { "type": "integer", "minimum": 1 },
+        "max_added_tracks": { "type": "integer", "minimum": 0 },
+        "trigger_percentile": { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "mode": { "const": "automatic" } }
+          },
+          "then": { "required": ["max_added_tracks", "trigger_percentile"] }
+        }
+      ]
     },
     "semantic_evidence": { "$ref": "#/$defs/artifact" },
     "output": {
@@ -161,4 +171,3 @@
     }
   }
 }
-

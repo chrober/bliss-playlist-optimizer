@@ -49,9 +49,10 @@
     "source.m3u": "66bf87d9afcab85e76cc8bd8e4c477207f9df367b11d59ccdef51826625dc16d",
     "learned_matrix.json": "4023a86c9588df60ec2bc63e886248f7699f46980ae2e78cf6b1dd835933fbc7",
     "adaptive-scoring-request.json": "d52443eeb93d9a6ed2cad9d7deebf0d68b8d48b1081e36cdf4539c93d904c60a",
-    "automatic-bridge-request.json": "af9684831589c1723fdd2df655bf7a41436f7fac789e35a4d3154cac2c97175e",
+    "automatic-bridge-request.json": "3c1ae4b4e57e0a1affe57ccada0c160d7766fa60cf5f61add5f7e7c33a515ef3",
     "semantic-evidence-mixed.json": "7089e68e3ce3270e9f8916abc4ffa39e5d76954d5f9b3726ff2144cc353a8599",
-    "semantic-bridge-request.json": "6c5bacde6d6af934c459832106dabaf88edbb3d4ee1ca96e9a89b45e4c6cbc07"
+    "semantic-bridge-request.json": "2ad57171728f0212c40dd4d946bb2dee718baa5ab918510ed312eb888a9dcd72",
+    "automatic-preview-request.json": "4686db917b1356005aca1c950decc19098da98662e0cfd8da2d231f0463b4f12"
   },
   "python_oracle": {
     "working_directory": "../bliss-similarity-design",

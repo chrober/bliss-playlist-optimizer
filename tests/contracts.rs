@@ -74,6 +74,10 @@ fn published_examples_satisfy_their_v1_contracts() {
             "fixtures/synthetic/semantic-bridge-request.json",
         ),
         (
+            "schemas/optimizer-request-v1.schema.json",
+            "fixtures/synthetic/automatic-preview-request.json",
+        ),
+        (
             "schemas/semantic-evidence-v1.schema.json",
             "examples/semantic-evidence-empty.json",
         ),
@@ -105,6 +109,10 @@ fn published_examples_satisfy_their_v1_contracts() {
             "schemas/bridge-analysis-artifact-v1.schema.json",
             "fixtures/synthetic/expected-native-semantic-bridge-analysis-v1.json",
         ),
+        (
+            "schemas/bridge-analysis-artifact-v1.schema.json",
+            "fixtures/synthetic/expected-native-automatic-preview-v1.json",
+        ),
     ] {
         assert_valid(schema, example);
     }
@@ -125,4 +133,48 @@ fn semantic_contract_rejects_cross_kind_and_recording_collection_edges() {
     let mut recording_collection = example;
     recording_collection["edges"][0]["scope"] = Value::String("collection_fallback".to_owned());
     assert!(!validator.is_valid(&recording_collection));
+}
+
+#[test]
+fn automatic_preview_contract_binds_reasons_to_selected_bridge_payloads() {
+    let schema = read_json(&repository_path(
+        "schemas/bridge-analysis-artifact-v1.schema.json",
+    ));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let example = read_json(&repository_path(
+        "fixtures/synthetic/expected-native-automatic-preview-v1.json",
+    ));
+
+    let mut selected_without_bridge = example.clone();
+    selected_without_bridge["selection_preview"]["decisions"][1]["selected_bridge"] = Value::Null;
+    assert!(!validator.is_valid(&selected_without_bridge));
+
+    let mut skipped_with_bridge = example;
+    let bridge =
+        skipped_with_bridge["selection_preview"]["decisions"][1]["selected_bridge"].clone();
+    skipped_with_bridge["selection_preview"]["decisions"][0]["selected_bridge"] = bridge;
+    assert!(!validator.is_valid(&skipped_with_bridge));
+}
+
+#[test]
+fn automatic_request_requires_a_budget_and_trigger() {
+    let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let example = read_json(&repository_path(
+        "fixtures/synthetic/automatic-preview-request.json",
+    ));
+
+    let mut without_budget = example.clone();
+    without_budget["extension"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_added_tracks");
+    assert!(!validator.is_valid(&without_budget));
+
+    let mut without_trigger = example;
+    without_trigger["extension"]
+        .as_object_mut()
+        .unwrap()
+        .remove("trigger_percentile");
+    assert!(!validator.is_valid(&without_trigger));
 }

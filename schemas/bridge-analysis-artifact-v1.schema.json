@@ -13,7 +13,7 @@
     "usable_library_track_count", "eligible_candidate_count",
     "frozen_reference_count", "trigger_percentile", "max_leg_percentile",
     "max_detour_percentile", "retained_candidate_limit", "semantic_mode",
-    "provider_states", "gaps"
+    "provider_states", "gaps", "selection_preview"
   ],
   "properties": {
     "schema_version": { "const": 1 },
@@ -57,6 +57,9 @@
       "type": "array",
       "minItems": 1,
       "items": { "$ref": "#/$defs/gap" }
+    },
+    "selection_preview": {
+      "$ref": "#/$defs/selection_preview"
     }
   },
   "$defs": {
@@ -172,6 +175,90 @@
       "anyOf": [
         { "required": ["raw_rank"] },
         { "required": ["raw_score"] }
+      ]
+    },
+    "selection_preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode", "processing_order", "max_added_tracks", "added_track_count",
+        "original_subsequence_preserved", "unique_membership",
+        "final_sequence", "decisions"
+      ],
+      "properties": {
+        "mode": { "const": "automatic" },
+        "processing_order": { "const": "left-to-right-original-gaps" },
+        "max_added_tracks": { "type": "integer", "minimum": 0 },
+        "added_track_count": { "type": "integer", "minimum": 0 },
+        "original_subsequence_preserved": { "const": true },
+        "unique_membership": { "const": true },
+        "final_sequence": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "$ref": "#/$defs/preview_sequence_entry" }
+        },
+        "decisions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/preview_decision" }
+        }
+      }
+    },
+    "preview_sequence_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position", "kind", "track_id"],
+      "properties": {
+        "position": { "type": "integer", "minimum": 0 },
+        "kind": { "enum": ["original", "bridge"] },
+        "track_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "preview_decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "original_position", "route_position", "left_track_id",
+        "right_track_id", "direct_distance", "direct_percentile", "triggering",
+        "semantic_pool", "reason", "selected_bridge"
+      ],
+      "properties": {
+        "original_position": { "type": "integer", "minimum": 1 },
+        "route_position": { "type": "integer", "minimum": 1 },
+        "left_track_id": { "type": "string", "minLength": 1 },
+        "right_track_id": { "type": "string", "minLength": 1 },
+        "direct_distance": { "type": "number", "minimum": 0 },
+        "direct_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
+        "triggering": { "type": "boolean" },
+        "semantic_pool": {
+          "enum": ["endpoint_local", "collection_fallback", "bliss_only"]
+        },
+        "reason": {
+          "enum": [
+            "selected", "below_threshold", "budget_exhausted",
+            "no_eligible_candidate", "repeat_conflict", "acoustic_rejected",
+            "no_improvement"
+          ]
+        },
+        "selected_bridge": {
+          "anyOf": [
+            { "$ref": "#/$defs/candidate" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "reason": { "const": "selected" } } },
+          "then": {
+            "properties": {
+              "selected_bridge": { "$ref": "#/$defs/candidate" }
+            }
+          },
+          "else": {
+            "properties": { "selected_bridge": { "type": "null" } }
+          }
+        }
       ]
     }
   }

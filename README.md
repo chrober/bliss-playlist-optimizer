@@ -13,6 +13,7 @@ cargo run -- score --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- route --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-bridge-request.json
 cargo run -- bridge --request fixtures/synthetic/semantic-bridge-request.json
+cargo run -- bridge --request fixtures/synthetic/automatic-preview-request.json
 ```
 
 `validate` checks both JSON schemas, declared artifact hashes, SQLite integrity
@@ -67,8 +68,18 @@ the best provider-local ordinal rank when present, then acoustic worst-leg and
 detour percentiles and stable row identity. Semantic candidate resolution and
 acoustic candidate evaluation both use deterministic parallel iteration.
 
-This remains analysis-only. Automatic insertion decisions, exact-count
-policies, and playlist writing are future slices.
+The same artifact now includes a read-only automatic selection preview. The
+request declares both the severe-gap percentile and maximum added-track budget.
+Original gaps are processed left-to-right so every Adaptive score includes all
+earlier proposed bridges and later proposals cannot alter earlier contexts. A
+bridge is selected only above the threshold, after all semantic, membership,
+repeat, and acoustic gates pass, and when its two contextual legs improve the
+local "sum plus twice the worst leg" objective over the direct transition. The
+preview reports the proposed final sequence and a selected, below-threshold,
+budget, eligibility, repeat, acoustic, or no-improvement reason for every gap.
+
+This remains analysis-only. Exact-count policies, applying a preview, and
+playlist writing are future slices.
 
 Success is written as one JSON object to stdout. Validation or search failures
 are written as one JSON object to stderr and exit with status 1; invalid CLI

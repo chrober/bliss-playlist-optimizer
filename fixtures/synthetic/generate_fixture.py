@@ -188,7 +188,12 @@ def write_scoring_request(path: pathlib.Path, tracks: list[dict[str, object]]) -
 def write_bridge_request(path: pathlib.Path, scoring_request: pathlib.Path) -> None:
     request = json.loads(scoring_request.read_text(encoding="utf-8"))
     request["job_id"] = "synthetic-automatic-bridge-001"
-    request["extension"] = {"mode": "automatic", "candidate_limit": 3}
+    request["extension"] = {
+        "mode": "automatic",
+        "candidate_limit": 3,
+        "max_added_tracks": 3,
+        "trigger_percentile": 0.7,
+    }
     path.write_text(
         json.dumps(request, indent=2) + "\n", encoding="utf-8", newline="\n",
     )
@@ -298,6 +303,28 @@ def write_semantic_bridge_request(
     )
 
 
+def write_automatic_preview_request(
+    path: pathlib.Path,
+    scoring_request: pathlib.Path,
+) -> None:
+    request = json.loads(scoring_request.read_text(encoding="utf-8"))
+    source_by_id = {track["id"]: track for track in request["source_tracks"]}
+    request["job_id"] = "synthetic-automatic-preview-001"
+    request["source_tracks"] = [
+        source_by_id[track_id]
+        for track_id in ("track-01", "track-11", "track-02", "track-12")
+    ]
+    request["extension"] = {
+        "mode": "automatic",
+        "candidate_limit": 3,
+        "max_added_tracks": 1,
+        "trigger_percentile": 0.3,
+    }
+    path.write_text(
+        json.dumps(request, indent=2) + "\n", encoding="utf-8", newline="\n",
+    )
+
+
 def main() -> None:
     destination = pathlib.Path(__file__).resolve().parent
     tracks = [track(index) for index in range(TRACK_COUNT)]
@@ -308,6 +335,7 @@ def main() -> None:
     bridge_request = destination / "automatic-bridge-request.json"
     semantic_evidence = destination / "semantic-evidence-mixed.json"
     semantic_bridge_request = destination / "semantic-bridge-request.json"
+    automatic_preview_request = destination / "automatic-preview-request.json"
     write_database(database, tracks)
     write_playlist(playlist, tracks)
     write_matrix(matrix)
@@ -315,6 +343,7 @@ def main() -> None:
     write_bridge_request(bridge_request, scoring_request)
     write_semantic_evidence(semantic_evidence)
     write_semantic_bridge_request(semantic_bridge_request, bridge_request)
+    write_automatic_preview_request(automatic_preview_request, scoring_request)
     manifest = {
         "fixture_version": 1,
         "description": "Private-data-free TracksV2 and Lyrion extended-M3U parity fixture.",
@@ -332,6 +361,7 @@ def main() -> None:
             "automatic-bridge-request.json": sha256(bridge_request),
             "semantic-evidence-mixed.json": sha256(semantic_evidence),
             "semantic-bridge-request.json": sha256(semantic_bridge_request),
+            "automatic-preview-request.json": sha256(automatic_preview_request),
         },
         "python_oracle": {
             "working_directory": "../bliss-similarity-design",

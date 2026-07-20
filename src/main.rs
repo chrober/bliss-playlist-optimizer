@@ -10,13 +10,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use bliss_playlist_optimizer::{bridge, route, semantic};
+use bliss_playlist_optimizer::{bridge, preview, route, semantic};
 
 const PROGRAM: &str = "bliss-playlist-optimizer";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REQUEST_SCHEMA: &str = include_str!("../schemas/optimizer-request-v1.schema.json");
 const SEMANTIC_SCHEMA: &str = include_str!("../schemas/semantic-evidence-v1.schema.json");
-const BRIDGE_TRIGGER_PERCENTILE: f64 = 0.70;
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +94,8 @@ struct RepeatWindows {
 struct ExtensionSettings {
     mode: String,
     candidate_limit: Option<usize>,
+    max_added_tracks: Option<usize>,
+    trigger_percentile: Option<f64>,
 }
 #[derive(Debug, Serialize)]
 struct ValidationSummary {
@@ -224,6 +225,7 @@ struct BridgeAnalysisArtifact {
     semantic_mode: String,
     provider_states: Vec<semantic::ProviderState>,
     gaps: Vec<BridgeGapArtifact>,
+    selection_preview: AutomaticSelectionArtifact,
 }
 
 #[derive(Debug, Serialize)]
@@ -255,6 +257,39 @@ struct BridgeCandidateArtifact {
     right_percentile: f64,
     max_percentile: f64,
     detour_percentile: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct AutomaticSelectionArtifact {
+    mode: &'static str,
+    processing_order: &'static str,
+    max_added_tracks: usize,
+    added_track_count: usize,
+    original_subsequence_preserved: bool,
+    unique_membership: bool,
+    final_sequence: Vec<PreviewSequenceEntryArtifact>,
+    decisions: Vec<PreviewDecisionArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct PreviewSequenceEntryArtifact {
+    position: usize,
+    kind: &'static str,
+    track_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PreviewDecisionArtifact {
+    original_position: usize,
+    route_position: usize,
+    left_track_id: String,
+    right_track_id: String,
+    direct_distance: f64,
+    direct_percentile: f64,
+    triggering: bool,
+    semantic_pool: semantic::SemanticPool,
+    reason: preview::DecisionReason,
+    selected_bridge: Option<BridgeCandidateArtifact>,
 }
 
 struct LibraryTrack {
@@ -695,6 +730,24 @@ fn candidate_semantic_identity(
     }
 }
 
+fn bridge_candidate_artifact(
+    evaluation: &bridge::BridgeCandidateEvaluation,
+    semantics: &semantic::CandidateSemantics,
+    library: &[LibraryTrack],
+) -> BridgeCandidateArtifact {
+    BridgeCandidateArtifact {
+        candidate_id: bridge_candidate_id(library[evaluation.candidate].row_id),
+        semantic_tier: semantics.tier,
+        semantic_evidence: semantics.evidence.clone(),
+        left_distance: evaluation.left_distance,
+        right_distance: evaluation.right_distance,
+        left_percentile: evaluation.left_percentile,
+        right_percentile: evaluation.right_percentile,
+        max_percentile: evaluation.max_percentile,
+        detour_percentile: evaluation.detour_percentile,
+    }
+}
+
 fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> {
     let validation = validate_request(path)?;
     let request = decode_request(path)?;
@@ -891,6 +944,18 @@ fn analyze_bridge_validated(
         .extension
         .candidate_limit
         .unwrap_or(DEFAULT_RETAINED_CANDIDATES);
+    let max_added_tracks = request.extension.max_added_tracks.ok_or_else(|| {
+        CommandFailure::new(
+            "AUTOMATIC_BRIDGE_BUDGET_REQUIRED",
+            "automatic extension requires extension.max_added_tracks",
+        )
+    })?;
+    let trigger_percentile = request.extension.trigger_percentile.ok_or_else(|| {
+        CommandFailure::new(
+            "AUTOMATIC_TRIGGER_REQUIRED",
+            "automatic extension requires extension.trigger_percentile",
+        )
+    })?;
     let matrix_artifact = request.artifacts.learned_matrix.as_ref().ok_or_else(|| {
         CommandFailure::new(
             "MATRIX_REQUIRED",
@@ -1013,6 +1078,7 @@ fn analyze_bridge_validated(
     .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
 
     let mut gaps = Vec::with_capacity(selected_library_route.len() - 1);
+    let mut preview_gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut semantic_assisted = false;
     for position in 1..selected_library_route.len() {
         let gap = bridge::evaluate_gap(
@@ -1034,6 +1100,14 @@ fn analyze_bridge_validated(
             &semantic_candidates,
         );
         semantic_assisted |= gap_semantics.pool != semantic::SemanticPool::BlissOnly;
+        preview_gaps.push(preview::AutomaticGap {
+            original_position: position,
+            left: selected_library_route[position - 1],
+            right: selected_library_route[position],
+            direct_distance: gap.direct_distance,
+            direct_percentile: gap.direct_percentile,
+            semantics: gap_semantics.clone(),
+        });
         let semantics_by_candidate = gap_semantics
             .candidates
             .iter()
@@ -1081,18 +1155,11 @@ fn analyze_bridge_validated(
             .filter(|candidate| candidate.accepted)
             .take(retained_candidate_limit)
             .map(|candidate| {
-                let semantics = semantics_by_candidate[&candidate.candidate];
-                BridgeCandidateArtifact {
-                    candidate_id: bridge_candidate_id(library[candidate.candidate].row_id),
-                    semantic_tier: semantics.tier,
-                    semantic_evidence: semantics.evidence.clone(),
-                    left_distance: candidate.left_distance,
-                    right_distance: candidate.right_distance,
-                    left_percentile: candidate.left_percentile,
-                    right_percentile: candidate.right_percentile,
-                    max_percentile: candidate.max_percentile,
-                    detour_percentile: candidate.detour_percentile,
-                }
+                bridge_candidate_artifact(
+                    candidate,
+                    semantics_by_candidate[&candidate.candidate],
+                    &library,
+                )
             })
             .collect();
         gaps.push(BridgeGapArtifact {
@@ -1101,7 +1168,7 @@ fn analyze_bridge_validated(
             right_track_id: selected_track_ids[position].clone(),
             direct_distance: gap.direct_distance,
             direct_percentile: gap.direct_percentile,
-            triggering: gap.direct_percentile > BRIDGE_TRIGGER_PERCENTILE,
+            triggering: gap.direct_percentile > trigger_percentile,
             semantic_pool: gap_semantics.pool,
             semantic_candidate_count: gap_candidate_indices.len(),
             semantic_excluded_count: eligible_candidates.len() - gap_candidate_indices.len(),
@@ -1112,6 +1179,85 @@ fn analyze_bridge_validated(
             accepted_candidates,
         });
     }
+
+    let selection = preview::select_automatic_bridges(
+        &selected_library_route,
+        &preview_gaps,
+        &preview::AutomaticSelectionConfig {
+            max_added_tracks,
+            trigger_percentile,
+        },
+        &bridge_tracks,
+        &learned_matrix,
+        &bridge_config,
+        &reference,
+    )
+    .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))?;
+    let original_ids_by_library = selected_local_route
+        .iter()
+        .zip(selected_library_route.iter())
+        .map(|(source_index, library_index)| {
+            (
+                *library_index,
+                request.source_tracks[*source_index].id.clone(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let final_sequence = selection
+        .final_route
+        .iter()
+        .enumerate()
+        .map(|(position, library_index)| {
+            if let Some(track_id) = original_ids_by_library.get(library_index) {
+                PreviewSequenceEntryArtifact {
+                    position,
+                    kind: "original",
+                    track_id: track_id.clone(),
+                }
+            } else {
+                PreviewSequenceEntryArtifact {
+                    position,
+                    kind: "bridge",
+                    track_id: bridge_candidate_id(library[*library_index].row_id),
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let preview_decisions = selection
+        .decisions
+        .iter()
+        .map(|decision| PreviewDecisionArtifact {
+            original_position: decision.original_position,
+            route_position: decision.route_position,
+            left_track_id: original_ids_by_library[&decision.left].clone(),
+            right_track_id: original_ids_by_library[&decision.right].clone(),
+            direct_distance: decision.direct_distance,
+            direct_percentile: decision.direct_percentile,
+            triggering: decision.direct_percentile > trigger_percentile,
+            semantic_pool: decision.semantic_pool,
+            reason: decision.reason,
+            selected_bridge: decision.selected.as_ref().map(|selected| {
+                bridge_candidate_artifact(&selected.evaluation, &selected.semantics, &library)
+            }),
+        })
+        .collect::<Vec<_>>();
+    let added_track_count = selection.final_route.len() - selected_library_route.len();
+    let unique_membership =
+        selection.final_route.iter().collect::<HashSet<_>>().len() == selection.final_route.len();
+    let selection_preview = AutomaticSelectionArtifact {
+        mode: "automatic",
+        processing_order: "left-to-right-original-gaps",
+        max_added_tracks,
+        added_track_count,
+        original_subsequence_preserved: selection
+            .final_route
+            .iter()
+            .filter(|index| original_ids_by_library.contains_key(index))
+            .eq(selected_library_route.iter()),
+        unique_membership,
+        final_sequence,
+        decisions: preview_decisions,
+    };
 
     Ok(BridgeAnalysisArtifact {
         schema_version: 1,
@@ -1138,7 +1284,7 @@ fn analyze_bridge_validated(
         usable_library_track_count: library.len(),
         eligible_candidate_count: eligible_candidates.len(),
         frozen_reference_count: reference.len(),
-        trigger_percentile: BRIDGE_TRIGGER_PERCENTILE,
+        trigger_percentile,
         max_leg_percentile: bridge::DEFAULT_MAX_LEG_PERCENTILE,
         max_detour_percentile: bridge::DEFAULT_MAX_DETOUR_PERCENTILE,
         retained_candidate_limit,
@@ -1151,6 +1297,7 @@ fn analyze_bridge_validated(
         },
         provider_states: semantic_bundle.providers,
         gaps,
+        selection_preview,
     })
 }
 
@@ -1306,7 +1453,7 @@ mod tests {
         let artifact = score_request(Path::new(
             "fixtures/synthetic/adaptive-scoring-request.json",
         ));
-        let (route_artifact, bridge_artifact, semantic_bridge_artifact) =
+        let (route_artifact, bridge_artifact, semantic_bridge_artifact, preview_artifact) =
             rayon::ThreadPoolBuilder::new()
                 .num_threads(4)
                 .build()
@@ -1321,6 +1468,9 @@ mod tests {
                         )),
                         analyze_bridge_request(Path::new(
                             "fixtures/synthetic/semantic-bridge-request.json",
+                        )),
+                        analyze_bridge_request(Path::new(
+                            "fixtures/synthetic/automatic-preview-request.json",
                         )),
                     )
                 });
@@ -1441,5 +1591,43 @@ mod tests {
             semantic_bridge_artifact.gaps[10].accepted_candidates[0].semantic_tier,
             semantic::SemanticTier::ArtistCollection
         );
+
+        let preview_artifact = preview_artifact.unwrap();
+        let preview_expected =
+            include_str!("../fixtures/synthetic/expected-native-automatic-preview-v1.json").trim();
+        assert_eq!(
+            serde_json::to_string(&preview_artifact).unwrap(),
+            preview_expected
+        );
+        assert_eq!(preview_artifact.selection_preview.max_added_tracks, 1);
+        assert_eq!(preview_artifact.selection_preview.added_track_count, 1);
+        assert!(
+            preview_artifact
+                .selection_preview
+                .original_subsequence_preserved
+        );
+        assert!(preview_artifact.selection_preview.unique_membership);
+        assert_eq!(
+            preview_artifact
+                .selection_preview
+                .final_sequence
+                .iter()
+                .map(|entry| entry.track_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "track-01",
+                "track-02",
+                "bliss-row-3",
+                "track-11",
+                "track-12",
+            ]
+        );
+        assert_eq!(
+            preview_artifact.selection_preview.decisions[1].reason,
+            preview::DecisionReason::Selected
+        );
+        assert!(preview_artifact.selection_preview.decisions[1]
+            .selected_bridge
+            .is_some());
     }
 }
