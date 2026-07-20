@@ -15,6 +15,10 @@ parity is measured against synthetic fixtures.
 
 ## Development
 
+Rust is pinned by rust-toolchain.toml. Open the repository in a Dev Container
+for a self-contained Linux environment with Rust, SQLite tools, and Python, or
+use any local rustup installation; both paths run the same toolchain version.
+
 ```text
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings

@@ -1,0 +1,21 @@
+{
+  "name": "bliss-playlist-optimizer",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "vscode",
+  "containerEnv": {
+    "CARGO_TERM_COLOR": "always"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb"
+      ]
+    }
+  },
+  "postCreateCommand": "rustup show && cargo fetch"
+}
+
