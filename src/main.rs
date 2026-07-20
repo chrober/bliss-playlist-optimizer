@@ -125,6 +125,22 @@ fn usage() -> &'static str {
     "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>"
 }
 
+fn default_parallel_workers(available: usize) -> usize {
+    available.saturating_sub(1).max(1)
+}
+
+fn configure_parallelism() {
+    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        return;
+    }
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(default_parallel_workers(available))
+        .build_global()
+        .expect("Rayon pool must be configured before scoring starts");
+}
 fn read_artifact(
     artifact: &Artifact,
     kind: &'static str,
@@ -425,6 +441,7 @@ fn print_result<T: Serialize>(result: Result<T, CommandFailure>) {
 }
 
 fn main() {
+    configure_parallelism();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [command] if command == "version" => println!("{PROGRAM} {VERSION}"),
@@ -457,6 +474,9 @@ mod tests {
         assert!(usage().contains("version"));
         assert!(usage().contains("validate"));
         assert!(usage().contains("score"));
+        assert_eq!(default_parallel_workers(1), 1);
+        assert_eq!(default_parallel_workers(2), 1);
+        assert_eq!(default_parallel_workers(4), 3);
     }
 
     #[test]

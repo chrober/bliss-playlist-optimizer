@@ -29,7 +29,9 @@ request's existing order. Adaptive weights depend on the preceding seed
 window, so this is deliberately a sequence of dynamic transition legs rather
 than a misleading static pairwise matrix. Independent legs are evaluated with
 Rayon and collected by source position; output is byte-identical across thread
-counts. SQLite access and validation remain sequential.
+counts. By default the process leaves one logical CPU for Lyrion; set
+`RAYON_NUM_THREADS` to override that policy. SQLite access and validation
+remain sequential.
 
 The Python one-shot implementation remains the behavioral oracle until native
 parity is measured against synthetic fixtures.
