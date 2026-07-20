@@ -50,16 +50,23 @@
         "adaptive": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["seed_limit"],
+          "required": ["seed_limit", "learned_percent"],
           "properties": {
-            "seed_limit": { "type": "integer", "minimum": 1 }
+            "seed_limit": { "type": "integer", "minimum": 1 },
+            "learned_percent": { "type": "integer", "minimum": 0, "maximum": 100 }
           }
         },
         "captured_blissmixer_preferences": {
           "type": "object",
           "description": "Redacted, immutable preferences used to derive this scoring configuration."
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "algorithm": { "const": "adaptive" } } },
+          "then": { "required": ["adaptive"] }
+        }
+      ]
     },
     "route": {
       "type": "object",

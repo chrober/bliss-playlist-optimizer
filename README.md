@@ -10,6 +10,7 @@ request validator:
 
 ```text
 cargo run -- validate --request examples/reorder-only-request.json
+cargo run -- score --request fixtures/synthetic/adaptive-scoring-request.json
 ```
 
 `validate` checks both JSON schemas, declared artifact hashes, SQLite
@@ -22,6 +23,13 @@ with status 1; invalid CLI usage exits with status 2.
 
 The schemas in `schemas/` remain the versioned compatibility boundary. Route
 optimization and playlist writing are intentionally not implemented yet.
+
+`score` emits a versioned, read-only contextual scoring artifact for the
+request's existing order. Adaptive weights depend on the preceding seed
+window, so this is deliberately a sequence of dynamic transition legs rather
+than a misleading static pairwise matrix. Independent legs are evaluated with
+Rayon and collected by source position; output is byte-identical across thread
+counts. SQLite access and validation remain sequential.
 
 The Python one-shot implementation remains the behavioral oracle until native
 parity is measured against synthetic fixtures.

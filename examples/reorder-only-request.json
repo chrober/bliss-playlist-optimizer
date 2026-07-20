@@ -11,8 +11,8 @@
   ],
   "scoring": {
     "algorithm": "adaptive",
-    "adaptive": { "seed_limit": 5 },
-    "captured_blissmixer_preferences": { "algorithm": "adaptive" }
+    "adaptive": { "seed_limit": 5, "learned_percent": 20 },
+    "captured_blissmixer_preferences": { "algorithm": "adaptive", "learnedblend": 20 }
   },
   "route": {
     "ordering_policy": "optimize_order",

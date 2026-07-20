@@ -1,5 +1,10 @@
 {
   "oracle_contract": 1,
+  "source_order_scoring": {
+    "objective": 27.234015552518866,
+    "transition_sum": 17.743305682757974,
+    "worst_transition": 4.745354934880446
+  },
   "selected": "adaptive-arc",
   "selected_order": [
     "Synthetic Artist 01/Synthetic Album 01/01 - Synthetic Track 01.flac",

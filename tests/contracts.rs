@@ -36,6 +36,10 @@ fn published_examples_satisfy_their_v1_contracts() {
             "examples/reorder-only-request.json",
         ),
         (
+            "schemas/optimizer-request-v1.schema.json",
+            "fixtures/synthetic/adaptive-scoring-request.json",
+        ),
+        (
             "schemas/semantic-evidence-v1.schema.json",
             "examples/semantic-evidence-empty.json",
         ),
@@ -46,6 +50,10 @@ fn published_examples_satisfy_their_v1_contracts() {
         (
             "schemas/optimizer-result-v1.schema.json",
             "examples/success-result.json",
+        ),
+        (
+            "schemas/scoring-artifact-v1.schema.json",
+            "fixtures/synthetic/expected-native-scoring-v1.json",
         ),
     ] {
         assert_valid(schema, example);

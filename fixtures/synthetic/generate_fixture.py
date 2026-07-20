@@ -128,15 +128,72 @@ def write_matrix(path: pathlib.Path) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8", newline="\n")
 
 
+
+def write_scoring_request(path: pathlib.Path, tracks: list[dict[str, object]]) -> None:
+    source_tracks = []
+    for index in SOURCE_ORDER:
+        item = tracks[index]
+        source_tracks.append({
+            "id": f"track-{index + 1:02d}",
+            "lms_url": "file://" + urllib.parse.quote(
+                str(item["absolute"]), safe="/,:~!$&'()*+;=@",
+            ),
+            "database_file": item["relative"],
+            "title": item["title"],
+            "artist": item["artist"],
+            "album": item["album"],
+        })
+    request = {
+        "schema_version": 1,
+        "job_id": "synthetic-adaptive-scoring-001",
+        "artifacts": {
+            "database": {
+                "path": "fixtures/synthetic/bliss.db",
+                "schema_identity": "TracksV2",
+            },
+            "learned_matrix": {
+                "path": "fixtures/synthetic/learned_matrix.json",
+            },
+        },
+        "source_tracks": source_tracks,
+        "scoring": {
+            "algorithm": "adaptive",
+            "adaptive": {"seed_limit": 3, "learned_percent": 20},
+            "captured_blissmixer_preferences": {
+                "algorithm": "adaptive",
+                "learnedblend": 20,
+            },
+        },
+        "route": {
+            "ordering_policy": "optimize_order",
+            "objective": "bottleneck_then_sum",
+            "search": {"deterministic_seed": 20260717, "restart_count": 50},
+        },
+        "repeat_windows": {"artist": 5, "album": 10, "track": 100},
+        "extension": {"mode": "none"},
+        "semantic_evidence": {
+            "path": "examples/semantic-evidence-empty.json",
+            "schema_identity": "semantic-evidence-v1",
+        },
+        "output": {
+            "include_private_paths": False,
+            "include_rejected_candidates": False,
+        },
+    }
+    path.write_text(
+        json.dumps(request, indent=2) + "\n", encoding="utf-8", newline="\n",
+    )
 def main() -> None:
     destination = pathlib.Path(__file__).resolve().parent
     tracks = [track(index) for index in range(TRACK_COUNT)]
     database = destination / "bliss.db"
     playlist = destination / "source.m3u"
     matrix = destination / "learned_matrix.json"
+    scoring_request = destination / "adaptive-scoring-request.json"
     write_database(database, tracks)
     write_playlist(playlist, tracks)
     write_matrix(matrix)
+    write_scoring_request(scoring_request, tracks)
     manifest = {
         "fixture_version": 1,
         "description": "Private-data-free TracksV2 and Lyrion extended-M3U parity fixture.",
@@ -146,7 +203,12 @@ def main() -> None:
         "source_track_count": len(SOURCE_ORDER),
         "source_track_indices_zero_based": list(SOURCE_ORDER),
         "feature_names": list(FEATURES),
-        "sha256": {"bliss.db": sha256(database), "source.m3u": sha256(playlist), "learned_matrix.json": sha256(matrix)},
+        "sha256": {
+            "bliss.db": sha256(database),
+            "source.m3u": sha256(playlist),
+            "learned_matrix.json": sha256(matrix),
+            "adaptive-scoring-request.json": sha256(scoring_request),
+        },
         "python_oracle": {
             "working_directory": "../bliss-similarity-design",
             "arguments": [

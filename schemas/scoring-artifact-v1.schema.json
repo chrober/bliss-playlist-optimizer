@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chrober/bliss-playlist-optimizer/schemas/scoring-artifact-v1.schema.json",
+  "title": "Contextual adaptive scoring artifact v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "program",
+    "version",
+    "core_api",
+    "job_id",
+    "request_sha256",
+    "database_sha256",
+    "learned_matrix_sha256",
+    "semantic_evidence_sha256",
+    "algorithm_requested",
+    "learned_percent",
+    "seed_limit",
+    "parallel_execution",
+    "source_track_ids",
+    "legs",
+    "transition_sum",
+    "worst_transition",
+    "objective"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "artifact_kind": { "const": "contextual-adaptive-scoring-v1" },
+    "program": { "const": "bliss-playlist-optimizer" },
+    "version": { "type": "string" },
+    "core_api": { "type": "string" },
+    "job_id": { "type": "string", "minLength": 1 },
+    "request_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "database_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "learned_matrix_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "semantic_evidence_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "algorithm_requested": { "const": "adaptive" },
+    "learned_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "seed_limit": { "type": "integer", "minimum": 1 },
+    "parallel_execution": { "const": "rayon-indexed" },
+    "source_track_ids": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "legs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "position",
+          "seed_start",
+          "seed_track_ids",
+          "candidate_track_id",
+          "algorithm",
+          "distance"
+        ],
+        "properties": {
+          "position": { "type": "integer", "minimum": 1 },
+          "seed_start": { "type": "integer", "minimum": 0 },
+          "seed_track_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "candidate_track_id": { "type": "string", "minLength": 1 },
+          "algorithm": { "type": "string", "minLength": 1 },
+          "distance": { "type": "number", "minimum": 0 }
+        }
+      }
+    },
+    "transition_sum": { "type": "number", "minimum": 0 },
+    "worst_transition": { "type": "number", "minimum": 0 },
+    "objective": { "type": "number", "minimum": 0 }
+  }
+}
