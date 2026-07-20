@@ -24,7 +24,11 @@
       "required": ["kind", "id"],
       "properties": {
         "kind": { "enum": ["recording", "artist"] },
-        "id": { "type": "string", "minLength": 1 },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optimizer-local identity: a request track ID or bliss-row-N recording ID, or a canonical artist identity; MBIDs may additionally bind the entity"
+        },
         "mbid": { "type": "string", "format": "uuid" },
         "name": { "type": "string" },
         "title": { "type": "string" }
@@ -73,6 +77,41 @@
       "anyOf": [
         { "required": ["raw_rank"] },
         { "required": ["raw_score"] }
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "properties": { "kind": { "const": "recording" } }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "candidate": {
+                "properties": { "kind": { "const": "recording" } }
+              },
+              "scope": { "const": "endpoint_local" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "properties": { "kind": { "const": "artist" } }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "candidate": {
+                "properties": { "kind": { "const": "artist" } }
+              }
+            }
+          }
+        }
       ]
     }
   }

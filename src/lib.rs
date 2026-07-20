@@ -3,3 +3,4 @@
 pub mod bridge;
 pub mod contextual;
 pub mod route;
+pub mod semantic;

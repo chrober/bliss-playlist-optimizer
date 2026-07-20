@@ -17,6 +17,7 @@ From the repository root, run:
 cargo run -- score --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- route --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-bridge-request.json
+cargo run -- bridge --request fixtures/synthetic/semantic-bridge-request.json
 ```
 
 The score result must exactly match `expected-native-scoring-v1.json`; its
@@ -40,5 +41,13 @@ frozen contextual reference scores, 11 internal gaps, opaque candidate IDs,
 and no automatic trigger for the already-smooth selected route. Manual runs
 with one and four Rayon workers must be byte-identical.
 
-Regeneration writes both the adaptive scoring request and the automatic bridge
-request; their hashes are recorded in manifest.json.
+The semantic bridge result must exactly match
+expected-native-semantic-bridge-analysis-v1.json. Its frozen graph records a
+failed LastMix/Last.fm provider alongside partial cached ListenBrainz evidence.
+It covers recording support from both endpoints, recording support from one,
+endpoint-local artist support, collection-artist fallback only where the local
+pool is empty, and deterministic Bliss acoustic/repeat gates beneath every
+semantic tier. No provider call is made by the native optimizer.
+
+Regeneration writes the adaptive scoring request, both bridge requests, and the
+mixed semantic evidence bundle; their hashes are recorded in manifest.json.

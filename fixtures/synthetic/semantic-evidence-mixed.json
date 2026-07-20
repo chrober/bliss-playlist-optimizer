@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "frozen_at": "2026-07-20T12:00:00Z",
+  "providers": [
+    {
+      "provider": "last.fm-via-lastmix",
+      "dataset_or_algorithm": "similar-artists",
+      "state": "failed",
+      "request_count": 1,
+      "failure_count": 1,
+      "error_codes": [
+        "timeout"
+      ]
+    },
+    {
+      "provider": "listenbrainz",
+      "dataset_or_algorithm": "synthetic-collaborative-filtering-v1",
+      "state": "partial",
+      "request_count": 5,
+      "failure_count": 1,
+      "error_codes": [
+        "temporary-unavailable"
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "provider": "listenbrainz",
+      "dataset_or_algorithm": "synthetic-collaborative-filtering-v1",
+      "source": {
+        "kind": "recording",
+        "id": "track-09",
+        "title": "Synthetic Track 09"
+      },
+      "candidate": {
+        "kind": "recording",
+        "id": "bliss-row-13",
+        "title": "Synthetic Track 13"
+      },
+      "scope": "endpoint_local",
+      "raw_rank": 2,
+      "identity_confidence": 1.0,
+      "observed_at": "2026-07-20T11:58:00Z",
+      "cache_state": "cached"
+    },
+    {
+      "provider": "listenbrainz",
+      "dataset_or_algorithm": "synthetic-collaborative-filtering-v1",
+      "source": {
+        "kind": "recording",
+        "id": "track-10",
+        "title": "Synthetic Track 10"
+      },
+      "candidate": {
+        "kind": "recording",
+        "id": "bliss-row-13",
+        "title": "Synthetic Track 13"
+      },
+      "scope": "endpoint_local",
+      "raw_rank": 1,
+      "identity_confidence": 1.0,
+      "observed_at": "2026-07-20T11:58:00Z",
+      "cache_state": "cached"
+    },
+    {
+      "provider": "listenbrainz",
+      "dataset_or_algorithm": "synthetic-collaborative-filtering-v1",
+      "source": {
+        "kind": "artist",
+        "id": "artist:synthetic artist 10",
+        "name": "Synthetic Artist 10"
+      },
+      "candidate": {
+        "kind": "artist",
+        "id": "artist:synthetic artist 14",
+        "name": "Synthetic Artist 14"
+      },
+      "scope": "endpoint_local",
+      "raw_score": 0.85,
+      "identity_confidence": 0.95,
+      "observed_at": "2026-07-20T11:58:00Z",
+      "cache_state": "cached"
+    },
+    {
+      "provider": "listenbrainz",
+      "dataset_or_algorithm": "synthetic-collaborative-filtering-v1",
+      "source": {
+        "kind": "artist",
+        "id": "artist:synthetic artist 01",
+        "name": "Synthetic Artist 01"
+      },
+      "candidate": {
+        "kind": "artist",
+        "id": "artist:synthetic artist 15",
+        "name": "Synthetic Artist 15"
+      },
+      "scope": "collection_fallback",
+      "raw_rank": 4,
+      "identity_confidence": 0.9,
+      "observed_at": "2026-07-20T11:58:00Z",
+      "cache_state": "cached"
+    }
+  ]
+}

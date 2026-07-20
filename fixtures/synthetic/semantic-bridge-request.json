@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "job_id": "synthetic-semantic-bridge-001",
+  "artifacts": {
+    "database": {
+      "path": "fixtures/synthetic/bliss.db",
+      "schema_identity": "TracksV2"
+    },
+    "learned_matrix": {
+      "path": "fixtures/synthetic/learned_matrix.json"
+    }
+  },
+  "source_tracks": [
+    {
+      "id": "track-01",
+      "lms_url": "file:///music/Synthetic%20Artist%2001/Synthetic%20Album%2001/01%20-%20Synthetic%20Track%2001.flac",
+      "database_file": "Synthetic Artist 01/Synthetic Album 01/01 - Synthetic Track 01.flac",
+      "title": "Synthetic Track 01",
+      "artist": "Synthetic Artist 01",
+      "album": "Synthetic Album 01"
+    },
+    {
+      "id": "track-08",
+      "lms_url": "file:///music/Synthetic%20Artist%2008/Synthetic%20Album%2008/01%20-%20Synthetic%20Track%2008.flac",
+      "database_file": "Synthetic Artist 08/Synthetic Album 08/01 - Synthetic Track 08.flac",
+      "title": "Synthetic Track 08",
+      "artist": "Synthetic Artist 08",
+      "album": "Synthetic Album 08"
+    },
+    {
+      "id": "track-03",
+      "lms_url": "file:///music/Synthetic%20Artist%2003/Synthetic%20Album%2003/01%20-%20Synthetic%20Track%2003.flac",
+      "database_file": "Synthetic Artist 03/Synthetic Album 03/01 - Synthetic Track 03.flac",
+      "title": "Synthetic Track 03",
+      "artist": "Synthetic Artist 03",
+      "album": "Synthetic Album 03"
+    },
+    {
+      "id": "track-11",
+      "lms_url": "file:///music/Synthetic%20Artist%2011/Synthetic%20Album%2011/01%20-%20Synthetic%20Track%2011.flac",
+      "database_file": "Synthetic Artist 11/Synthetic Album 11/01 - Synthetic Track 11.flac",
+      "title": "Synthetic Track 11",
+      "artist": "Synthetic Artist 11",
+      "album": "Synthetic Album 11"
+    },
+    {
+      "id": "track-05",
+      "lms_url": "file:///music/Synthetic%20Artist%2005/Synthetic%20Album%2005/01%20-%20Synthetic%20Track%2005.flac",
+      "database_file": "Synthetic Artist 05/Synthetic Album 05/01 - Synthetic Track 05.flac",
+      "title": "Synthetic Track 05",
+      "artist": "Synthetic Artist 05",
+      "album": "Synthetic Album 05"
+    },
+    {
+      "id": "track-12",
+      "lms_url": "file:///music/Synthetic%20Artist%2012/Synthetic%20Album%2012/01%20-%20Synthetic%20Track%2012.flac",
+      "database_file": "Synthetic Artist 12/Synthetic Album 12/01 - Synthetic Track 12.flac",
+      "title": "Synthetic Track 12",
+      "artist": "Synthetic Artist 12",
+      "album": "Synthetic Album 12"
+    },
+    {
+      "id": "track-02",
+      "lms_url": "file:///music/Synthetic%20Artist%2002/Synthetic%20Album%2002/01%20-%20Synthetic%20Track%2002.flac",
+      "database_file": "Synthetic Artist 02/Synthetic Album 02/01 - Synthetic Track 02.flac",
+      "title": "Synthetic Track 02",
+      "artist": "Synthetic Artist 02",
+      "album": "Synthetic Album 02"
+    },
+    {
+      "id": "track-10",
+      "lms_url": "file:///music/Synthetic%20Artist%2010/Synthetic%20Album%2010/01%20-%20Synthetic%20Track%2010.flac",
+      "database_file": "Synthetic Artist 10/Synthetic Album 10/01 - Synthetic Track 10.flac",
+      "title": "Synthetic Track 10",
+      "artist": "Synthetic Artist 10",
+      "album": "Synthetic Album 10"
+    },
+    {
+      "id": "track-06",
+      "lms_url": "file:///music/Synthetic%20Artist%2006/Synthetic%20Album%2006/01%20-%20Synthetic%20Track%2006.flac",
+      "database_file": "Synthetic Artist 06/Synthetic Album 06/01 - Synthetic Track 06.flac",
+      "title": "Synthetic Track 06",
+      "artist": "Synthetic Artist 06",
+      "album": "Synthetic Album 06"
+    },
+    {
+      "id": "track-09",
+      "lms_url": "file:///music/Synthetic%20Artist%2009/Synthetic%20Album%2009/01%20-%20Synthetic%20Track%2009.flac",
+      "database_file": "Synthetic Artist 09/Synthetic Album 09/01 - Synthetic Track 09.flac",
+      "title": "Synthetic Track 09",
+      "artist": "Synthetic Artist 09",
+      "album": "Synthetic Album 09"
+    },
+    {
+      "id": "track-04",
+      "lms_url": "file:///music/Synthetic%20Artist%2004/Synthetic%20Album%2004/01%20-%20Synthetic%20Track%2004.flac",
+      "database_file": "Synthetic Artist 04/Synthetic Album 04/01 - Synthetic Track 04.flac",
+      "title": "Synthetic Track 04",
+      "artist": "Synthetic Artist 04",
+      "album": "Synthetic Album 04"
+    },
+    {
+      "id": "track-07",
+      "lms_url": "file:///music/Synthetic%20Artist%2007/Synthetic%20Album%2007/01%20-%20Synthetic%20Track%2007.flac",
+      "database_file": "Synthetic Artist 07/Synthetic Album 07/01 - Synthetic Track 07.flac",
+      "title": "Synthetic Track 07",
+      "artist": "Synthetic Artist 07",
+      "album": "Synthetic Album 07"
+    }
+  ],
+  "scoring": {
+    "algorithm": "adaptive",
+    "adaptive": {
+      "seed_limit": 3,
+      "learned_percent": 20
+    },
+    "captured_blissmixer_preferences": {
+      "algorithm": "adaptive",
+      "learnedblend": 20
+    }
+  },
+  "route": {
+    "ordering_policy": "optimize_order",
+    "objective": "bottleneck_then_sum",
+    "search": {
+      "deterministic_seed": 20260717,
+      "restart_count": 50
+    }
+  },
+  "repeat_windows": {
+    "artist": 5,
+    "album": 10,
+    "track": 100
+  },
+  "extension": {
+    "mode": "automatic",
+    "candidate_limit": 3
+  },
+  "semantic_evidence": {
+    "path": "fixtures/synthetic/semantic-evidence-mixed.json",
+    "schema_identity": "semantic-evidence-v1"
+  },
+  "output": {
+    "include_private_paths": false,
+    "include_rejected_candidates": false
+  }
+}

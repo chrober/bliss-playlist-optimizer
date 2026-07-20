@@ -194,6 +194,110 @@ def write_bridge_request(path: pathlib.Path, scoring_request: pathlib.Path) -> N
     )
 
 
+def write_semantic_evidence(path: pathlib.Path) -> None:
+    def entity(kind: str, identity: str, **metadata: str) -> dict[str, object]:
+        return {"kind": kind, "id": identity, **metadata}
+
+    def edge(
+        source: dict[str, object],
+        candidate: dict[str, object],
+        scope: str,
+        **score: object,
+    ) -> dict[str, object]:
+        return {
+            "provider": "listenbrainz",
+            "dataset_or_algorithm": "synthetic-collaborative-filtering-v1",
+            "source": source,
+            "candidate": candidate,
+            "scope": scope,
+            **score,
+            "observed_at": "2026-07-20T11:58:00Z",
+            "cache_state": "cached",
+        }
+
+    evidence = {
+        "schema_version": 1,
+        "frozen_at": "2026-07-20T12:00:00Z",
+        "providers": [
+            {
+                "provider": "last.fm-via-lastmix",
+                "dataset_or_algorithm": "similar-artists",
+                "state": "failed",
+                "request_count": 1,
+                "failure_count": 1,
+                "error_codes": ["timeout"],
+            },
+            {
+                "provider": "listenbrainz",
+                "dataset_or_algorithm": "synthetic-collaborative-filtering-v1",
+                "state": "partial",
+                "request_count": 5,
+                "failure_count": 1,
+                "error_codes": ["temporary-unavailable"],
+            },
+        ],
+        "edges": [
+            edge(
+                entity("recording", "track-09", title="Synthetic Track 09"),
+                entity("recording", "bliss-row-13", title="Synthetic Track 13"),
+                "endpoint_local",
+                raw_rank=2,
+                identity_confidence=1.0,
+            ),
+            edge(
+                entity("recording", "track-10", title="Synthetic Track 10"),
+                entity("recording", "bliss-row-13", title="Synthetic Track 13"),
+                "endpoint_local",
+                raw_rank=1,
+                identity_confidence=1.0,
+            ),
+            edge(
+                entity(
+                    "artist", "artist:synthetic artist 10",
+                    name="Synthetic Artist 10",
+                ),
+                entity(
+                    "artist", "artist:synthetic artist 14",
+                    name="Synthetic Artist 14",
+                ),
+                "endpoint_local",
+                raw_score=0.85,
+                identity_confidence=0.95,
+            ),
+            edge(
+                entity(
+                    "artist", "artist:synthetic artist 01",
+                    name="Synthetic Artist 01",
+                ),
+                entity(
+                    "artist", "artist:synthetic artist 15",
+                    name="Synthetic Artist 15",
+                ),
+                "collection_fallback",
+                raw_rank=4,
+                identity_confidence=0.9,
+            ),
+        ],
+    }
+    path.write_text(
+        json.dumps(evidence, indent=2) + "\n", encoding="utf-8", newline="\n",
+    )
+
+
+def write_semantic_bridge_request(
+    path: pathlib.Path,
+    bridge_request: pathlib.Path,
+) -> None:
+    request = json.loads(bridge_request.read_text(encoding="utf-8"))
+    request["job_id"] = "synthetic-semantic-bridge-001"
+    request["semantic_evidence"]["path"] = (
+        "fixtures/synthetic/semantic-evidence-mixed.json"
+    )
+    path.write_text(
+        json.dumps(request, indent=2) + "\n", encoding="utf-8", newline="\n",
+    )
+
+
 def main() -> None:
     destination = pathlib.Path(__file__).resolve().parent
     tracks = [track(index) for index in range(TRACK_COUNT)]
@@ -202,11 +306,15 @@ def main() -> None:
     matrix = destination / "learned_matrix.json"
     scoring_request = destination / "adaptive-scoring-request.json"
     bridge_request = destination / "automatic-bridge-request.json"
+    semantic_evidence = destination / "semantic-evidence-mixed.json"
+    semantic_bridge_request = destination / "semantic-bridge-request.json"
     write_database(database, tracks)
     write_playlist(playlist, tracks)
     write_matrix(matrix)
     write_scoring_request(scoring_request, tracks)
     write_bridge_request(bridge_request, scoring_request)
+    write_semantic_evidence(semantic_evidence)
+    write_semantic_bridge_request(semantic_bridge_request, bridge_request)
     manifest = {
         "fixture_version": 1,
         "description": "Private-data-free TracksV2 and Lyrion extended-M3U parity fixture.",
@@ -222,6 +330,8 @@ def main() -> None:
             "learned_matrix.json": sha256(matrix),
             "adaptive-scoring-request.json": sha256(scoring_request),
             "automatic-bridge-request.json": sha256(bridge_request),
+            "semantic-evidence-mixed.json": sha256(semantic_evidence),
+            "semantic-bridge-request.json": sha256(semantic_bridge_request),
         },
         "python_oracle": {
             "working_directory": "../bliss-similarity-design",

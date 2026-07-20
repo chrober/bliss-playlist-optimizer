@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use bliss_playlist_optimizer::{bridge, route};
+use bliss_playlist_optimizer::{bridge, route, semantic};
 
 const PROGRAM: &str = "bliss-playlist-optimizer";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -51,6 +51,9 @@ struct SourceTrack {
     title: Option<String>,
     artist: Option<String>,
     album: Option<String>,
+    recording_mbid: Option<String>,
+    #[serde(default)]
+    artist_mbids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,7 +221,8 @@ struct BridgeAnalysisArtifact {
     max_leg_percentile: f64,
     max_detour_percentile: f64,
     retained_candidate_limit: usize,
-    semantic_mode: &'static str,
+    semantic_mode: String,
+    provider_states: Vec<semantic::ProviderState>,
     gaps: Vec<BridgeGapArtifact>,
 }
 
@@ -230,6 +234,9 @@ struct BridgeGapArtifact {
     direct_distance: f64,
     direct_percentile: f64,
     triggering: bool,
+    semantic_pool: semantic::SemanticPool,
+    semantic_candidate_count: usize,
+    semantic_excluded_count: usize,
     evaluated_candidate_count: usize,
     accepted_candidate_count: usize,
     repeat_rejected_count: usize,
@@ -240,6 +247,8 @@ struct BridgeGapArtifact {
 #[derive(Debug, Serialize)]
 struct BridgeCandidateArtifact {
     candidate_id: String,
+    semantic_tier: semantic::SemanticTier,
+    semantic_evidence: Vec<semantic::MatchedEvidence>,
     left_distance: f64,
     right_distance: f64,
     left_percentile: f64,
@@ -624,34 +633,66 @@ fn load_usable_library(database: &BlissDatabase) -> Result<Vec<LibraryTrack>, Co
     Ok(library)
 }
 
-fn require_empty_semantic_graph(artifact: &Artifact) -> Result<(), CommandFailure> {
+fn load_semantic_bundle(artifact: &Artifact) -> Result<semantic::EvidenceBundle, CommandFailure> {
     let bytes = fs::read(&artifact.path).map_err(|error| {
         CommandFailure::new(
             "SEMANTIC_EVIDENCE_UNREADABLE",
             format!("failed to read semantic evidence: {error}"),
         )
     })?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+    let bundle: semantic::EvidenceBundle = serde_json::from_slice(&bytes).map_err(|error| {
         CommandFailure::new(
             "SEMANTIC_EVIDENCE_INVALID",
             format!("failed to decode semantic evidence: {error}"),
         )
     })?;
-    if value
-        .get("edges")
-        .and_then(Value::as_array)
-        .is_some_and(|edges| !edges.is_empty())
-    {
-        return Err(CommandFailure::new(
-            "SEMANTIC_EVIDENCE_UNSUPPORTED",
-            "this bridge-analysis slice supports Bliss-only ranking; non-empty semantic edges are not ignored",
-        ));
-    }
-    Ok(())
+    bundle.validate().map_err(|error| {
+        CommandFailure::new(
+            "SEMANTIC_EVIDENCE_INVALID",
+            format!("invalid semantic evidence: {error}"),
+        )
+    })?;
+    Ok(bundle)
 }
 
 fn bridge_candidate_id(row_id: u64) -> String {
     format!("bliss-row-{row_id}")
+}
+
+fn source_semantic_identity(
+    source: &SourceTrack,
+    library_track: &LibraryTrack,
+) -> semantic::TrackIdentity {
+    let artist_name = source
+        .artist
+        .as_deref()
+        .map(semantic::normalize_identity)
+        .unwrap_or_else(|| library_track.artist_key.clone());
+    let mut artist_ids = source.artist_mbids.clone();
+    artist_ids.push(semantic::canonical_artist_id(&artist_name));
+    artist_ids.sort();
+    artist_ids.dedup();
+    semantic::TrackIdentity {
+        recording_id: source.id.clone(),
+        recording_mbid: source.recording_mbid.clone(),
+        artist_ids,
+        artist_name,
+    }
+}
+
+fn candidate_semantic_identity(
+    library_index: usize,
+    library_track: &LibraryTrack,
+) -> semantic::CandidateIdentity {
+    semantic::CandidateIdentity {
+        candidate: library_index,
+        track: semantic::TrackIdentity {
+            recording_id: bridge_candidate_id(library_track.row_id),
+            recording_mbid: None,
+            artist_ids: vec![semantic::canonical_artist_id(&library_track.artist_key)],
+            artist_name: library_track.artist_key.clone(),
+        },
+    }
 }
 
 fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> {
@@ -834,6 +875,7 @@ fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> 
 fn analyze_bridge_validated(
     validation: ValidationSummary,
     request: Request,
+    semantic_bundle: semantic::EvidenceBundle,
 ) -> Result<BridgeAnalysisArtifact, CommandFailure> {
     let adaptive = request.scoring.adaptive.as_ref().ok_or_else(|| {
         CommandFailure::new(
@@ -874,6 +916,7 @@ fn analyze_bridge_validated(
     let mut source_identities = HashSet::new();
     let mut source_library_indices = Vec::with_capacity(request.source_tracks.len());
     let mut source_route_tracks = Vec::with_capacity(request.source_tracks.len());
+    let mut source_semantic_identities = Vec::with_capacity(request.source_tracks.len());
     for source in &request.source_tracks {
         let database_file = source.database_file.as_deref().ok_or_else(|| {
             CommandFailure::new(
@@ -909,6 +952,7 @@ fn analyze_bridge_validated(
         source_files.insert(library_track.file.clone());
         source_identities.insert((artist_key.clone(), title_key));
         source_library_indices.push(library_index);
+        source_semantic_identities.push(source_semantic_identity(source, library_track));
         source_route_tracks.push(route::RouteTrack {
             features: library_track.route_track.features,
             artist_key,
@@ -943,6 +987,10 @@ fn analyze_bridge_validated(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
+    let semantic_candidates = eligible_candidates
+        .iter()
+        .map(|index| candidate_semantic_identity(*index, &library[*index]))
+        .collect::<Vec<_>>();
     let bridge_tracks = library
         .iter()
         .map(|track| track.route_track.clone())
@@ -965,6 +1013,7 @@ fn analyze_bridge_validated(
     .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
 
     let mut gaps = Vec::with_capacity(selected_library_route.len() - 1);
+    let mut semantic_assisted = false;
     for position in 1..selected_library_route.len() {
         let gap = bridge::evaluate_gap(
             &selected_library_route,
@@ -975,16 +1024,48 @@ fn analyze_bridge_validated(
             &reference,
         )
         .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
-        let evaluations = bridge::rank_candidates(
+        let left_source_index = selected_local_route[position - 1];
+        let right_source_index = selected_local_route[position];
+        let gap_semantics = semantic::select_gap_candidates(
+            &semantic_bundle,
+            &source_semantic_identities[left_source_index],
+            &source_semantic_identities[right_source_index],
+            &source_semantic_identities,
+            &semantic_candidates,
+        );
+        semantic_assisted |= gap_semantics.pool != semantic::SemanticPool::BlissOnly;
+        let semantics_by_candidate = gap_semantics
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.candidate, candidate))
+            .collect::<HashMap<_, _>>();
+        let gap_candidate_indices = gap_semantics
+            .candidates
+            .iter()
+            .map(|candidate| candidate.candidate)
+            .collect::<Vec<_>>();
+        let mut evaluations = bridge::rank_candidates(
             &selected_library_route,
             position,
-            &eligible_candidates,
+            &gap_candidate_indices,
             &bridge_tracks,
             &learned_matrix,
             &bridge_config,
             &reference,
         )
         .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
+        evaluations.sort_by(|left, right| {
+            right
+                .accepted
+                .cmp(&left.accepted)
+                .then_with(|| {
+                    semantics_by_candidate[&left.candidate]
+                        .compare_priority(semantics_by_candidate[&right.candidate])
+                })
+                .then_with(|| left.max_percentile.total_cmp(&right.max_percentile))
+                .then_with(|| left.detour_percentile.total_cmp(&right.detour_percentile))
+                .then_with(|| left.candidate.cmp(&right.candidate))
+        });
         let accepted_candidate_count = evaluations
             .iter()
             .filter(|candidate| candidate.accepted)
@@ -999,14 +1080,19 @@ fn analyze_bridge_validated(
             .iter()
             .filter(|candidate| candidate.accepted)
             .take(retained_candidate_limit)
-            .map(|candidate| BridgeCandidateArtifact {
-                candidate_id: bridge_candidate_id(library[candidate.candidate].row_id),
-                left_distance: candidate.left_distance,
-                right_distance: candidate.right_distance,
-                left_percentile: candidate.left_percentile,
-                right_percentile: candidate.right_percentile,
-                max_percentile: candidate.max_percentile,
-                detour_percentile: candidate.detour_percentile,
+            .map(|candidate| {
+                let semantics = semantics_by_candidate[&candidate.candidate];
+                BridgeCandidateArtifact {
+                    candidate_id: bridge_candidate_id(library[candidate.candidate].row_id),
+                    semantic_tier: semantics.tier,
+                    semantic_evidence: semantics.evidence.clone(),
+                    left_distance: candidate.left_distance,
+                    right_distance: candidate.right_distance,
+                    left_percentile: candidate.left_percentile,
+                    right_percentile: candidate.right_percentile,
+                    max_percentile: candidate.max_percentile,
+                    detour_percentile: candidate.detour_percentile,
+                }
             })
             .collect();
         gaps.push(BridgeGapArtifact {
@@ -1016,6 +1102,9 @@ fn analyze_bridge_validated(
             direct_distance: gap.direct_distance,
             direct_percentile: gap.direct_percentile,
             triggering: gap.direct_percentile > BRIDGE_TRIGGER_PERCENTILE,
+            semantic_pool: gap_semantics.pool,
+            semantic_candidate_count: gap_candidate_indices.len(),
+            semantic_excluded_count: eligible_candidates.len() - gap_candidate_indices.len(),
             evaluated_candidate_count: evaluations.len(),
             accepted_candidate_count,
             repeat_rejected_count,
@@ -1053,7 +1142,14 @@ fn analyze_bridge_validated(
         max_leg_percentile: bridge::DEFAULT_MAX_LEG_PERCENTILE,
         max_detour_percentile: bridge::DEFAULT_MAX_DETOUR_PERCENTILE,
         retained_candidate_limit,
-        semantic_mode: "bliss-only-empty-graph",
+        semantic_mode: if semantic_assisted {
+            "semantic-assisted".to_owned()
+        } else if semantic_bundle.edges.is_empty() && semantic_bundle.providers.is_empty() {
+            "bliss-only-empty-graph".to_owned()
+        } else {
+            "bliss-only-no-usable-edges".to_owned()
+        },
+        provider_states: semantic_bundle.providers,
         gaps,
     })
 }
@@ -1109,8 +1205,8 @@ fn analyze_bridge_request(path: &Path) -> Result<BridgeAnalysisArtifact, Command
             ),
         ));
     }
-    require_empty_semantic_graph(&request.semantic_evidence)?;
-    analyze_bridge_validated(validation, request)
+    let semantic_bundle = load_semantic_bundle(&request.semantic_evidence)?;
+    analyze_bridge_validated(validation, request, semantic_bundle)
 }
 
 fn repeat_key(value: &str) -> String {
@@ -1210,20 +1306,24 @@ mod tests {
         let artifact = score_request(Path::new(
             "fixtures/synthetic/adaptive-scoring-request.json",
         ));
-        let (route_artifact, bridge_artifact) = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap()
-            .install(|| {
-                (
-                    optimize_route_request(Path::new(
-                        "fixtures/synthetic/adaptive-scoring-request.json",
-                    )),
-                    analyze_bridge_request(Path::new(
-                        "fixtures/synthetic/automatic-bridge-request.json",
-                    )),
-                )
-            });
+        let (route_artifact, bridge_artifact, semantic_bridge_artifact) =
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap()
+                .install(|| {
+                    (
+                        optimize_route_request(Path::new(
+                            "fixtures/synthetic/adaptive-scoring-request.json",
+                        )),
+                        analyze_bridge_request(Path::new(
+                            "fixtures/synthetic/automatic-bridge-request.json",
+                        )),
+                        analyze_bridge_request(Path::new(
+                            "fixtures/synthetic/semantic-bridge-request.json",
+                        )),
+                    )
+                });
 
         std::env::set_current_dir(original).unwrap();
         let summary = validation.unwrap();
@@ -1298,5 +1398,48 @@ mod tests {
             .iter()
             .flat_map(|gap| &gap.accepted_candidates)
             .all(|candidate| candidate.candidate_id.starts_with("bliss-row-")));
+        assert_eq!(bridge_artifact.semantic_mode, "bliss-only-empty-graph");
+        assert!(bridge_artifact.provider_states.is_empty());
+        assert!(bridge_artifact
+            .gaps
+            .iter()
+            .all(|gap| gap.semantic_pool == semantic::SemanticPool::BlissOnly));
+
+        let semantic_bridge_artifact = semantic_bridge_artifact.unwrap();
+        let semantic_bridge_expected =
+            include_str!("../fixtures/synthetic/expected-native-semantic-bridge-analysis-v1.json")
+                .trim();
+        assert_eq!(
+            serde_json::to_string(&semantic_bridge_artifact).unwrap(),
+            semantic_bridge_expected
+        );
+        assert_eq!(semantic_bridge_artifact.semantic_mode, "semantic-assisted");
+        assert!(semantic_bridge_artifact
+            .provider_states
+            .iter()
+            .any(|provider| provider.state == semantic::ProviderStatus::Failed));
+        assert_eq!(
+            semantic_bridge_artifact.gaps[8]
+                .accepted_candidates
+                .iter()
+                .map(|candidate| candidate.semantic_tier)
+                .collect::<Vec<_>>(),
+            vec![
+                semantic::SemanticTier::RecordingBoth,
+                semantic::SemanticTier::ArtistLocal,
+            ]
+        );
+        assert_eq!(
+            semantic_bridge_artifact.gaps[9].accepted_candidates[0].semantic_tier,
+            semantic::SemanticTier::RecordingOne
+        );
+        assert_eq!(
+            semantic_bridge_artifact.gaps[10].semantic_pool,
+            semantic::SemanticPool::CollectionFallback
+        );
+        assert_eq!(
+            semantic_bridge_artifact.gaps[10].accepted_candidates[0].semantic_tier,
+            semantic::SemanticTier::ArtistCollection
+        );
     }
 }

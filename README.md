@@ -12,6 +12,7 @@ cargo run -- validate --request examples/reorder-only-request.json
 cargo run -- score --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- route --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-bridge-request.json
+cargo run -- bridge --request fixtures/synthetic/semantic-bridge-request.json
 ```
 
 `validate` checks both JSON schemas, declared artifact hashes, SQLite integrity
@@ -52,10 +53,22 @@ opaque row IDs bound to the database hash, aggregate rejection counts, and a
 bounded list of accepted candidates per gap; it exposes no library paths.
 Independent candidates are ranked deterministically with Rayon.
 
-This slice accepts an empty semantic graph and identifies its result as
-Bliss-only. It rejects non-empty semantic edges rather than silently ignoring
-them. Semantic evidence tiers, automatic insertion decisions, exact-count
-policies, and playlist writing remain future slices.
+The bridge command consumes a frozen provider-neutral evidence graph. Recording
+support for both or one endpoint precedes endpoint-local artist support. When
+any usable endpoint-local evidence exists, collection and Bliss-only candidates
+are excluded for that gap; collection-artist fallback is considered only when
+the local pool is empty, followed by Bliss-only operation when no usable edge
+remains. Provider states and every matched assertion retain provenance, rank or
+score, identity confidence, observation time, and cache state. Raw scores from
+different providers are reported but never compared. Disabled, unavailable,
+partial, or failed providers are non-fatal and may coexist with cached evidence.
+Within one evidence tier, candidates are ordered by identity confidence, then
+the best provider-local ordinal rank when present, then acoustic worst-leg and
+detour percentiles and stable row identity. Semantic candidate resolution and
+acoustic candidate evaluation both use deterministic parallel iteration.
+
+This remains analysis-only. Automatic insertion decisions, exact-count
+policies, and playlist writing are future slices.
 
 Success is written as one JSON object to stdout. Validation or search failures
 are written as one JSON object to stderr and exit with status 1; invalid CLI

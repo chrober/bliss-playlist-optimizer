@@ -70,8 +70,16 @@ fn published_examples_satisfy_their_v1_contracts() {
             "fixtures/synthetic/automatic-bridge-request.json",
         ),
         (
+            "schemas/optimizer-request-v1.schema.json",
+            "fixtures/synthetic/semantic-bridge-request.json",
+        ),
+        (
             "schemas/semantic-evidence-v1.schema.json",
             "examples/semantic-evidence-empty.json",
+        ),
+        (
+            "schemas/semantic-evidence-v1.schema.json",
+            "fixtures/synthetic/semantic-evidence-mixed.json",
         ),
         (
             "schemas/progress-event-v1.schema.json",
@@ -93,7 +101,28 @@ fn published_examples_satisfy_their_v1_contracts() {
             "schemas/bridge-analysis-artifact-v1.schema.json",
             "fixtures/synthetic/expected-native-bridge-analysis-v1.json",
         ),
+        (
+            "schemas/bridge-analysis-artifact-v1.schema.json",
+            "fixtures/synthetic/expected-native-semantic-bridge-analysis-v1.json",
+        ),
     ] {
         assert_valid(schema, example);
     }
+}
+
+#[test]
+fn semantic_contract_rejects_cross_kind_and_recording_collection_edges() {
+    let schema = read_json(&repository_path("schemas/semantic-evidence-v1.schema.json"));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let example = read_json(&repository_path(
+        "fixtures/synthetic/semantic-evidence-mixed.json",
+    ));
+
+    let mut cross_kind = example.clone();
+    cross_kind["edges"][0]["candidate"]["kind"] = Value::String("artist".to_owned());
+    assert!(!validator.is_valid(&cross_kind));
+
+    let mut recording_collection = example;
+    recording_collection["edges"][0]["scope"] = Value::String("collection_fallback".to_owned());
+    assert!(!validator.is_valid(&recording_collection));
 }

@@ -12,7 +12,8 @@
     "selected_strategy", "selected_track_ids", "selected_route_objective",
     "usable_library_track_count", "eligible_candidate_count",
     "frozen_reference_count", "trigger_percentile", "max_leg_percentile",
-    "max_detour_percentile", "retained_candidate_limit", "semantic_mode", "gaps"
+    "max_detour_percentile", "retained_candidate_limit", "semantic_mode",
+    "provider_states", "gaps"
   ],
   "properties": {
     "schema_version": { "const": 1 },
@@ -41,7 +42,17 @@
     "max_leg_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
     "max_detour_percentile": { "type": "number", "minimum": 0 },
     "retained_candidate_limit": { "type": "integer", "minimum": 1 },
-    "semantic_mode": { "const": "bliss-only-empty-graph" },
+    "semantic_mode": {
+      "enum": [
+        "bliss-only-empty-graph",
+        "bliss-only-no-usable-edges",
+        "semantic-assisted"
+      ]
+    },
+    "provider_states": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/provider_state" }
+    },
     "gaps": {
       "type": "array",
       "minItems": 1,
@@ -61,7 +72,9 @@
       "additionalProperties": false,
       "required": [
         "position", "left_track_id", "right_track_id", "direct_distance",
-        "direct_percentile", "triggering", "evaluated_candidate_count",
+        "direct_percentile", "triggering", "semantic_pool",
+        "semantic_candidate_count", "semantic_excluded_count",
+        "evaluated_candidate_count",
         "accepted_candidate_count", "repeat_rejected_count",
         "acoustic_rejected_count", "accepted_candidates"
       ],
@@ -72,6 +85,11 @@
         "direct_distance": { "type": "number", "minimum": 0 },
         "direct_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
         "triggering": { "type": "boolean" },
+        "semantic_pool": {
+          "enum": ["endpoint_local", "collection_fallback", "bliss_only"]
+        },
+        "semantic_candidate_count": { "type": "integer", "minimum": 0 },
+        "semantic_excluded_count": { "type": "integer", "minimum": 0 },
         "evaluated_candidate_count": { "type": "integer", "minimum": 0 },
         "accepted_candidate_count": { "type": "integer", "minimum": 0 },
         "repeat_rejected_count": { "type": "integer", "minimum": 0 },
@@ -86,11 +104,22 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "candidate_id", "left_distance", "right_distance", "left_percentile",
+        "candidate_id", "semantic_tier", "semantic_evidence",
+        "left_distance", "right_distance", "left_percentile",
         "right_percentile", "max_percentile", "detour_percentile"
       ],
       "properties": {
         "candidate_id": { "type": "string", "pattern": "^bliss-row-[1-9][0-9]*$" },
+        "semantic_tier": {
+          "enum": [
+            "recording_both", "recording_one", "artist_local",
+            "artist_collection", "bliss_only"
+          ]
+        },
+        "semantic_evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/matched_evidence" }
+        },
         "left_distance": { "type": "number", "minimum": 0 },
         "right_distance": { "type": "number", "minimum": 0 },
         "left_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
@@ -98,6 +127,52 @@
         "max_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
         "detour_percentile": { "type": "number", "minimum": 0 }
       }
+    },
+    "provider_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "state"],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "dataset_or_algorithm": { "type": "string" },
+        "state": {
+          "enum": [
+            "disabled", "fresh", "cached", "stale", "partial",
+            "unavailable", "failed"
+          ]
+        },
+        "request_count": { "type": "integer", "minimum": 0 },
+        "failure_count": { "type": "integer", "minimum": 0 },
+        "error_codes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "matched_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider", "source_endpoint", "source_id", "kind", "scope",
+        "identity_confidence"
+      ],
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "dataset_or_algorithm": { "type": "string" },
+        "source_endpoint": { "enum": ["left", "right", "collection"] },
+        "source_id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["recording", "artist"] },
+        "scope": { "enum": ["endpoint_local", "collection_fallback"] },
+        "raw_rank": { "type": "integer", "minimum": 1 },
+        "raw_score": { "type": "number" },
+        "identity_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "observed_at": { "type": "string", "format": "date-time" },
+        "cache_state": { "enum": ["fresh", "cached", "stale"] }
+      },
+      "anyOf": [
+        { "required": ["raw_rank"] },
+        { "required": ["raw_score"] }
+      ]
     }
   }
 }
