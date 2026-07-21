@@ -209,12 +209,14 @@ struct BridgeAnalysisArtifact {
     learned_matrix_sha256: String,
     semantic_evidence_sha256: String,
     algorithm_requested: String,
+    ordering_policy: String,
     learned_percent: u16,
     seed_limit: usize,
     deterministic_seed: u64,
     restart_count: usize,
     parallel_execution: &'static str,
     selected_strategy: &'static str,
+    source_track_ids: Vec<String>,
     selected_track_ids: Vec<String>,
     selected_route_objective: f64,
     usable_library_track_count: usize,
@@ -1105,10 +1107,54 @@ fn analyze_bridge_validated(
         artist_window: request.repeat_windows.artist,
         album_window: request.repeat_windows.album,
     };
-    let route_result =
-        route::optimize_adaptive_route(&source_route_tracks, &learned_matrix, &route_config)
-            .map_err(|error| CommandFailure::new("ROUTE_SEARCH_FAILED", error.to_string()))?;
-    let selected_local_route = route_result.selected.route.clone();
+    let (selected_local_route, selected_strategy, selected_route_objective, parallel_execution) =
+        match request.route.ordering_policy.as_str() {
+            "optimize_order" => {
+                let result = route::optimize_adaptive_route(
+                    &source_route_tracks,
+                    &learned_matrix,
+                    &route_config,
+                )
+                .map_err(|error| CommandFailure::new("ROUTE_SEARCH_FAILED", error.to_string()))?;
+                (
+                    result.selected.route,
+                    result.selected.strategy,
+                    result.selected.metrics.objective,
+                    "rayon-route-restarts-and-candidates-indexed",
+                )
+            }
+            "preserve_order" => {
+                let preserved = (0..source_route_tracks.len()).collect::<Vec<_>>();
+                let violations =
+                    route::repeat_violations(&preserved, &source_route_tracks, &route_config);
+                if !violations.is_empty() {
+                    return Err(CommandFailure::new(
+                        "PRESERVED_ANCHOR_REPEAT_CONFLICT",
+                        format!(
+                            "the immutable source order has {} repeat-window violation(s)",
+                            violations.len()
+                        ),
+                    ));
+                }
+                let metrics = route::evaluate_adaptive_sequence(
+                    &preserved,
+                    &source_route_tracks,
+                    &learned_matrix,
+                    seed_limit,
+                    learned_percent,
+                )
+                .map_err(|error| {
+                    CommandFailure::new("PRESERVED_ROUTE_SCORING_FAILED", error.to_string())
+                })?;
+                (
+                    preserved,
+                    "preserve-order",
+                    metrics.objective,
+                    "rayon-candidates-indexed",
+                )
+            }
+            _ => unreachable!("bridge route policy is checked before analysis"),
+        };
     let selected_library_route = selected_local_route
         .iter()
         .map(|index| source_library_indices[*index])
@@ -1444,14 +1490,20 @@ fn analyze_bridge_validated(
             .expect("adaptive validation requires a learned matrix"),
         semantic_evidence_sha256: validation.semantic_evidence_sha256,
         algorithm_requested: request.scoring.algorithm,
+        ordering_policy: request.route.ordering_policy,
         learned_percent,
         seed_limit,
         deterministic_seed,
         restart_count,
-        parallel_execution: "rayon-route-restarts-and-candidates-indexed",
-        selected_strategy: route_result.selected.strategy,
+        parallel_execution,
+        selected_strategy,
+        source_track_ids: request
+            .source_tracks
+            .iter()
+            .map(|track| track.id.clone())
+            .collect(),
         selected_track_ids,
-        selected_route_objective: route_result.selected.metrics.objective,
+        selected_route_objective,
         usable_library_track_count: library.len(),
         eligible_candidate_count: eligible_candidates.len(),
         frozen_reference_count: reference.len(),
@@ -1484,11 +1536,14 @@ fn analyze_bridge_request(path: &Path) -> Result<BridgeAnalysisArtifact, Command
             ),
         ));
     }
-    if request.route.ordering_policy != "optimize_order" {
+    if !matches!(
+        request.route.ordering_policy.as_str(),
+        "optimize_order" | "preserve_order"
+    ) {
         return Err(CommandFailure::new(
             "ROUTE_POLICY_UNSUPPORTED",
             format!(
-                "the bridge command currently supports optimize_order, not '{}'",
+                "the bridge command currently supports optimize_order or preserve_order, not '{}'",
                 request.route.ordering_policy
             ),
         ));
@@ -1631,6 +1686,8 @@ mod tests {
             preview_artifact,
             exact_artifact,
             infeasible_exact_artifact,
+            preserve_automatic_artifact,
+            preserve_exact_artifact,
         ) = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
@@ -1655,9 +1712,20 @@ mod tests {
                     analyze_bridge_request(Path::new(
                         "fixtures/synthetic/exact-count-infeasible-request.json",
                     )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/preserve-automatic-request.json",
+                    )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/preserve-exact-count-request.json",
+                    )),
                 )
             });
-        let (exact_one_worker, infeasible_exact_one_worker) = rayon::ThreadPoolBuilder::new()
+        let (
+            exact_one_worker,
+            infeasible_exact_one_worker,
+            preserve_automatic_one_worker,
+            preserve_exact_one_worker,
+        ) = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .unwrap()
@@ -1669,8 +1737,28 @@ mod tests {
                     analyze_bridge_request(Path::new(
                         "fixtures/synthetic/exact-count-infeasible-request.json",
                     )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/preserve-automatic-request.json",
+                    )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/preserve-exact-count-request.json",
+                    )),
                 )
             });
+
+        let conflict_path = Path::new("fixtures/synthetic/preserve-automatic-request.json");
+        let conflict_validation = validate_request(conflict_path).unwrap();
+        let mut conflict_request = decode_request(conflict_path).unwrap();
+        let first_artist = conflict_request.source_tracks[0].artist.clone();
+        conflict_request.source_tracks[1].artist = first_artist;
+        let conflict_semantic_bundle =
+            load_semantic_bundle(&conflict_request.semantic_evidence).unwrap();
+        let preserve_repeat_conflict = analyze_bridge_validated(
+            conflict_validation,
+            conflict_request,
+            conflict_semantic_bundle,
+        )
+        .unwrap_err();
 
         std::env::set_current_dir(original).unwrap();
         let summary = validation.unwrap();
@@ -1892,6 +1980,107 @@ mod tests {
                 .unwrap()
                 .structural_upper_bound,
             6
+        );
+
+        let preserve_automatic_artifact = preserve_automatic_artifact.unwrap();
+        let preserve_automatic_expected =
+            include_str!("../fixtures/synthetic/expected-native-preserve-automatic-v1.json").trim();
+        assert_eq!(
+            serde_json::to_string(&preserve_automatic_artifact).unwrap(),
+            preserve_automatic_expected
+        );
+        assert_eq!(
+            serde_json::to_string(&preserve_automatic_artifact).unwrap(),
+            serde_json::to_string(&preserve_automatic_one_worker.unwrap()).unwrap()
+        );
+        assert_eq!(
+            preserve_automatic_artifact.ordering_policy,
+            "preserve_order"
+        );
+        assert_eq!(
+            preserve_automatic_artifact.selected_strategy,
+            "preserve-order"
+        );
+        assert_eq!(
+            preserve_automatic_artifact.source_track_ids,
+            preserve_automatic_artifact.selected_track_ids
+        );
+        let preserve_automatic = match &preserve_automatic_artifact.selection_preview {
+            SelectionPreviewArtifact::Automatic(automatic) => automatic,
+            SelectionPreviewArtifact::Exact(_) => panic!("expected automatic preview"),
+        };
+        assert_eq!(preserve_automatic.added_track_count, 1);
+        assert_eq!(
+            preserve_automatic
+                .final_sequence
+                .iter()
+                .filter(|entry| entry.kind == "original")
+                .map(|entry| entry.track_id.as_str())
+                .collect::<Vec<_>>(),
+            preserve_automatic_artifact
+                .source_track_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            preserve_automatic
+                .final_sequence
+                .iter()
+                .filter(|entry| entry.kind == "bridge")
+                .map(|entry| entry.track_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bliss-row-5"]
+        );
+
+        let preserve_exact_artifact = preserve_exact_artifact.unwrap();
+        let preserve_exact_expected =
+            include_str!("../fixtures/synthetic/expected-native-preserve-exact-count-v1.json")
+                .trim();
+        assert_eq!(
+            serde_json::to_string(&preserve_exact_artifact).unwrap(),
+            preserve_exact_expected
+        );
+        assert_eq!(
+            serde_json::to_string(&preserve_exact_artifact).unwrap(),
+            serde_json::to_string(&preserve_exact_one_worker.unwrap()).unwrap()
+        );
+        assert_eq!(preserve_exact_artifact.ordering_policy, "preserve_order");
+        assert_eq!(preserve_exact_artifact.selected_strategy, "preserve-order");
+        assert_eq!(
+            preserve_exact_artifact.source_track_ids,
+            preserve_exact_artifact.selected_track_ids
+        );
+        let preserve_exact = match &preserve_exact_artifact.selection_preview {
+            SelectionPreviewArtifact::Exact(exact) => exact,
+            SelectionPreviewArtifact::Automatic(_) => panic!("expected exact-count preview"),
+        };
+        assert!(preserve_exact.feasible);
+        assert_eq!(preserve_exact.added_track_count, 2);
+        let preserve_exact_sequence = preserve_exact.final_sequence.as_ref().unwrap();
+        assert_eq!(
+            preserve_exact_sequence
+                .iter()
+                .filter(|entry| entry.kind == "original")
+                .map(|entry| entry.track_id.as_str())
+                .collect::<Vec<_>>(),
+            preserve_exact_artifact
+                .source_track_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            preserve_exact_sequence
+                .iter()
+                .filter(|entry| entry.kind == "bridge")
+                .map(|entry| entry.track_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bliss-row-5", "bliss-row-8"]
+        );
+        assert_eq!(
+            preserve_repeat_conflict.code,
+            "PRESERVED_ANCHOR_REPEAT_CONFLICT"
         );
     }
 }

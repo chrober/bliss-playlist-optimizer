@@ -16,6 +16,8 @@ cargo run -- bridge --request fixtures/synthetic/semantic-bridge-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-preview-request.json
 cargo run -- bridge --request fixtures/synthetic/exact-count-request.json
 cargo run -- bridge --request fixtures/synthetic/exact-count-infeasible-request.json
+cargo run -- bridge --request fixtures/synthetic/preserve-automatic-request.json
+cargo run -- bridge --request fixtures/synthetic/preserve-exact-count-request.json
 ```
 
 `validate` checks both JSON schemas, declared artifact hashes, SQLite integrity
@@ -48,13 +50,15 @@ executable leaves one logical CPU for Lyrion; set `RAYON_NUM_THREADS` to overrid
 that policy. SQLite access and validation remain sequential.
 
 The bridge command is a read-only analysis slice for automatic extension. It
-enumerates usable TracksV2 rows in stable row-id order, excludes curated and
-duplicate recording identities, optimizes the original route, builds the frozen
-cross-context Adaptive reference distribution, and rescores both sides of each
-candidate insertion with the bridge present in the outgoing context. It emits
-opaque row IDs bound to the database hash, aggregate rejection counts, and a
-bounded list of accepted candidates per gap; it exposes no library paths.
-Independent candidates are ranked deterministically with Rayon.
+enumerates usable TracksV2 rows in stable row-id order and excludes curated and
+duplicate recording identities. Depending on the declared ordering policy, it
+either optimizes the original route or keeps the source order as immutable
+anchors. It then builds the frozen cross-context Adaptive reference distribution
+and rescores both sides of each candidate insertion with the bridge present in
+the outgoing context. It emits opaque row IDs bound to the database hash,
+aggregate rejection counts, and a bounded list of accepted candidates per gap;
+it exposes no library paths. Independent candidates are ranked deterministically
+with Rayon.
 
 The bridge command consumes a frozen provider-neutral evidence graph. Recording
 support for both or one endpoint precedes endpoint-local artist support. When
@@ -98,6 +102,16 @@ inside the bound is honestly labeled
 The current exact-count slice permits at most one bridge in each original
 internal gap. Endpoint slots and multi-track routes inside one preserved-anchor
 gap remain future extensions.
+
+With `route.ordering_policy = preserve_order`, both automatic and exact-count
+extension keep every source track in precisely its input position relative to
+the other source tracks. The artifact records the source IDs separately from the
+selected route IDs and tests their equality with the final original-track
+subsequence. Because source tracks are immutable in this mode, an input order
+that already violates an artist or album look-back window fails with
+`PRESERVED_ANCHOR_REPEAT_CONFLICT`; this slice does not misrepresent a
+single-bridge search as capable of repairing several interacting anchor
+conflicts.
 
 This remains analysis-only. Applying a preview and playlist writing are future
 slices.

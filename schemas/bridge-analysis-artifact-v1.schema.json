@@ -7,9 +7,11 @@
   "required": [
     "schema_version", "artifact_kind", "program", "version", "core_api",
     "job_id", "request_sha256", "database_sha256", "learned_matrix_sha256",
-    "semantic_evidence_sha256", "algorithm_requested", "learned_percent",
+    "semantic_evidence_sha256", "algorithm_requested", "ordering_policy",
+    "learned_percent",
     "seed_limit", "deterministic_seed", "restart_count", "parallel_execution",
-    "selected_strategy", "selected_track_ids", "selected_route_objective",
+    "selected_strategy", "source_track_ids", "selected_track_ids",
+    "selected_route_objective",
     "usable_library_track_count", "eligible_candidate_count",
     "frozen_reference_count", "trigger_percentile", "max_leg_percentile",
     "max_detour_percentile", "retained_candidate_limit", "semantic_mode",
@@ -27,12 +29,21 @@
     "learned_matrix_sha256": { "$ref": "#/$defs/sha256" },
     "semantic_evidence_sha256": { "$ref": "#/$defs/sha256" },
     "algorithm_requested": { "const": "adaptive" },
+    "ordering_policy": { "enum": ["optimize_order", "preserve_order"] },
     "learned_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
     "seed_limit": { "type": "integer", "minimum": 1 },
     "deterministic_seed": { "type": "integer", "minimum": 0 },
     "restart_count": { "type": "integer", "minimum": 0 },
-    "parallel_execution": { "const": "rayon-route-restarts-and-candidates-indexed" },
-    "selected_strategy": { "enum": ["adaptive", "adaptive-arc"] },
+    "parallel_execution": {
+      "enum": [
+        "rayon-route-restarts-and-candidates-indexed",
+        "rayon-candidates-indexed"
+      ]
+    },
+    "selected_strategy": {
+      "enum": ["adaptive", "adaptive-arc", "preserve-order"]
+    },
+    "source_track_ids": { "$ref": "#/$defs/track_ids" },
     "selected_track_ids": { "$ref": "#/$defs/track_ids" },
     "selected_route_objective": { "type": "number", "minimum": 0 },
     "usable_library_track_count": { "type": "integer", "minimum": 2 },

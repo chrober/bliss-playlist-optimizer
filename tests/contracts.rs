@@ -86,6 +86,14 @@ fn published_examples_satisfy_their_v1_contracts() {
             "fixtures/synthetic/exact-count-infeasible-request.json",
         ),
         (
+            "schemas/optimizer-request-v1.schema.json",
+            "fixtures/synthetic/preserve-automatic-request.json",
+        ),
+        (
+            "schemas/optimizer-request-v1.schema.json",
+            "fixtures/synthetic/preserve-exact-count-request.json",
+        ),
+        (
             "schemas/semantic-evidence-v1.schema.json",
             "examples/semantic-evidence-empty.json",
         ),
@@ -128,6 +136,14 @@ fn published_examples_satisfy_their_v1_contracts() {
         (
             "schemas/bridge-analysis-artifact-v1.schema.json",
             "fixtures/synthetic/expected-native-exact-count-infeasible-v1.json",
+        ),
+        (
+            "schemas/bridge-analysis-artifact-v1.schema.json",
+            "fixtures/synthetic/expected-native-preserve-automatic-v1.json",
+        ),
+        (
+            "schemas/bridge-analysis-artifact-v1.schema.json",
+            "fixtures/synthetic/expected-native-preserve-exact-count-v1.json",
         ),
     ] {
         assert_valid(schema, example);
@@ -254,4 +270,29 @@ fn exact_count_contract_never_represents_infeasibility_as_a_partial_route() {
     let mut feasible_without_route = feasible;
     feasible_without_route["selection_preview"]["final_sequence"] = Value::Null;
     assert!(!validator.is_valid(&feasible_without_route));
+}
+
+#[test]
+fn preserve_order_artifacts_keep_source_ids_as_the_original_subsequence() {
+    for path in [
+        "fixtures/synthetic/expected-native-preserve-automatic-v1.json",
+        "fixtures/synthetic/expected-native-preserve-exact-count-v1.json",
+    ] {
+        let artifact = read_json(&repository_path(path));
+        assert_eq!(artifact["ordering_policy"], "preserve_order");
+        assert_eq!(artifact["selected_strategy"], "preserve-order");
+        assert_eq!(artifact["source_track_ids"], artifact["selected_track_ids"]);
+
+        let original_ids = artifact["selection_preview"]["final_sequence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["kind"] == "original")
+            .map(|entry| entry["track_id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            original_ids,
+            artifact["source_track_ids"].as_array().unwrap().clone()
+        );
+    }
 }

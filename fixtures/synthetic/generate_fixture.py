@@ -343,6 +343,19 @@ def write_exact_count_request(
     )
 
 
+def write_preserve_order_request(
+    path: pathlib.Path,
+    source_request: pathlib.Path,
+    job_id: str,
+) -> None:
+    request = json.loads(source_request.read_text(encoding="utf-8"))
+    request["job_id"] = job_id
+    request["route"]["ordering_policy"] = "preserve_order"
+    path.write_text(
+        json.dumps(request, indent=2) + "\n", encoding="utf-8", newline="\n",
+    )
+
+
 def main() -> None:
     destination = pathlib.Path(__file__).resolve().parent
     tracks = [track(index) for index in range(TRACK_COUNT)]
@@ -358,6 +371,8 @@ def main() -> None:
     exact_count_infeasible_request = (
         destination / "exact-count-infeasible-request.json"
     )
+    preserve_automatic_request = destination / "preserve-automatic-request.json"
+    preserve_exact_count_request = destination / "preserve-exact-count-request.json"
     write_database(database, tracks)
     write_playlist(playlist, tracks)
     write_matrix(matrix)
@@ -377,6 +392,16 @@ def main() -> None:
         bridge_request,
         "synthetic-exact-count-infeasible-001",
         7,
+    )
+    write_preserve_order_request(
+        preserve_automatic_request,
+        automatic_preview_request,
+        "synthetic-preserve-automatic-001",
+    )
+    write_preserve_order_request(
+        preserve_exact_count_request,
+        exact_count_request,
+        "synthetic-preserve-exact-count-001",
     )
     manifest = {
         "fixture_version": 1,
@@ -399,6 +424,12 @@ def main() -> None:
             "exact-count-request.json": sha256(exact_count_request),
             "exact-count-infeasible-request.json": sha256(
                 exact_count_infeasible_request
+            ),
+            "preserve-automatic-request.json": sha256(
+                preserve_automatic_request
+            ),
+            "preserve-exact-count-request.json": sha256(
+                preserve_exact_count_request
             ),
         },
         "python_oracle": {

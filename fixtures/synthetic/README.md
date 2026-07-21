@@ -21,6 +21,8 @@ cargo run -- bridge --request fixtures/synthetic/semantic-bridge-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-preview-request.json
 cargo run -- bridge --request fixtures/synthetic/exact-count-request.json
 cargo run -- bridge --request fixtures/synthetic/exact-count-infeasible-request.json
+cargo run -- bridge --request fixtures/synthetic/preserve-automatic-request.json
+cargo run -- bridge --request fixtures/synthetic/preserve-exact-count-request.json
 ```
 
 The score result must exactly match `expected-native-scoring-v1.json`; its
@@ -73,6 +75,14 @@ sequence or partial decisions. Its structural upper bound is six, so the
 seven-track request is proven impossible and reports
 `EXACT_COUNT_INFEASIBLE`.
 
-Regeneration writes the adaptive scoring request, all three bridge requests,
-and the mixed semantic evidence bundle; their hashes are recorded in
-manifest.json.
+The preserve-order automatic and exact-count results must exactly match
+`expected-native-preserve-automatic-v1.json` and
+`expected-native-preserve-exact-count-v1.json`. Their deliberately unsorted
+four-track source order is retained as immutable anchors. The automatic result
+adds `bliss-row-5`; the exact-count result adds `bliss-row-5` and
+`bliss-row-8`. Both artifacts prove that `source_track_ids`,
+`selected_track_ids`, and the final sequence filtered to original entries are
+identical, and their one-worker and four-worker serializations are byte-equal.
+
+Regeneration writes the adaptive scoring request, all bridge requests, and the
+mixed semantic evidence bundle; their hashes are recorded in `manifest.json`.
