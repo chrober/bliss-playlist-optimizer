@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "job_id": "synthetic-preserve-endpoint-slots-001",
+  "artifacts": {
+    "database": {
+      "path": "fixtures/synthetic/bliss.db",
+      "schema_identity": "TracksV2"
+    },
+    "learned_matrix": {
+      "path": "fixtures/synthetic/learned_matrix.json"
+    }
+  },
+  "source_tracks": [
+    {
+      "id": "track-01",
+      "lms_url": "file:///music/Synthetic%20Artist%2001/Synthetic%20Album%2001/01%20-%20Synthetic%20Track%2001.flac",
+      "database_file": "Synthetic Artist 01/Synthetic Album 01/01 - Synthetic Track 01.flac",
+      "title": "Synthetic Track 01",
+      "artist": "Synthetic Artist 01",
+      "album": "Synthetic Album 01"
+    },
+    {
+      "id": "track-11",
+      "lms_url": "file:///music/Synthetic%20Artist%2011/Synthetic%20Album%2011/01%20-%20Synthetic%20Track%2011.flac",
+      "database_file": "Synthetic Artist 11/Synthetic Album 11/01 - Synthetic Track 11.flac",
+      "title": "Synthetic Track 11",
+      "artist": "Synthetic Artist 11",
+      "album": "Synthetic Album 11"
+    },
+    {
+      "id": "track-02",
+      "lms_url": "file:///music/Synthetic%20Artist%2002/Synthetic%20Album%2002/01%20-%20Synthetic%20Track%2002.flac",
+      "database_file": "Synthetic Artist 02/Synthetic Album 02/01 - Synthetic Track 02.flac",
+      "title": "Synthetic Track 02",
+      "artist": "Synthetic Artist 02",
+      "album": "Synthetic Album 02"
+    },
+    {
+      "id": "track-12",
+      "lms_url": "file:///music/Synthetic%20Artist%2012/Synthetic%20Album%2012/01%20-%20Synthetic%20Track%2012.flac",
+      "database_file": "Synthetic Artist 12/Synthetic Album 12/01 - Synthetic Track 12.flac",
+      "title": "Synthetic Track 12",
+      "artist": "Synthetic Artist 12",
+      "album": "Synthetic Album 12"
+    }
+  ],
+  "scoring": {
+    "algorithm": "adaptive",
+    "adaptive": {
+      "seed_limit": 3,
+      "learned_percent": 20
+    },
+    "captured_blissmixer_preferences": {
+      "algorithm": "adaptive",
+      "learnedblend": 20
+    }
+  },
+  "route": {
+    "ordering_policy": "preserve_order",
+    "objective": "bottleneck_then_sum",
+    "search": {
+      "deterministic_seed": 20260717,
+      "restart_count": 50
+    }
+  },
+  "repeat_windows": {
+    "artist": 5,
+    "album": 10,
+    "track": 100
+  },
+  "extension": {
+    "mode": "exact_count",
+    "candidate_limit": 3,
+    "additional_track_count": 4,
+    "allow_opening_track": true,
+    "allow_closing_track": true
+  },
+  "semantic_evidence": {
+    "path": "examples/semantic-evidence-empty.json",
+    "schema_identity": "semantic-evidence-v1"
+  },
+  "output": {
+    "include_private_paths": false,
+    "include_rejected_candidates": false
+  }
+}

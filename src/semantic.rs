@@ -406,6 +406,83 @@ fn collection_candidate(
     })
 }
 
+fn endpoint_candidate(
+    bundle: &EvidenceBundle,
+    anchor: &TrackIdentity,
+    source_endpoint: SourceEndpoint,
+    candidate: &CandidateIdentity,
+) -> Option<CandidateSemantics> {
+    let mut evidence = Vec::new();
+    let mut recording = false;
+    let mut artist = false;
+    for edge in &bundle.edges {
+        if edge.scope != EvidenceScope::EndpointLocal
+            || !candidate_matches(edge, &candidate.track)
+            || !source_matches(edge, anchor)
+        {
+            continue;
+        }
+        recording |= edge.source.kind == EntityKind::Recording;
+        artist |= edge.source.kind == EntityKind::Artist;
+        evidence.push(matched_evidence(edge, source_endpoint));
+    }
+    let tier = if recording {
+        SemanticTier::RecordingOne
+    } else if artist {
+        SemanticTier::ArtistLocal
+    } else {
+        return None;
+    };
+    sort_evidence(&mut evidence);
+    Some(CandidateSemantics {
+        candidate: candidate.candidate,
+        tier,
+        evidence,
+    })
+}
+
+pub fn select_endpoint_candidates(
+    bundle: &EvidenceBundle,
+    anchor: &TrackIdentity,
+    source_endpoint: SourceEndpoint,
+    collection_sources: &[TrackIdentity],
+    candidates: &[CandidateIdentity],
+) -> GapEvidence {
+    let local = candidates
+        .par_iter()
+        .filter_map(|candidate| endpoint_candidate(bundle, anchor, source_endpoint, candidate))
+        .collect::<Vec<_>>();
+    if !local.is_empty() {
+        return GapEvidence {
+            pool: SemanticPool::EndpointLocal,
+            candidates: local,
+        };
+    }
+
+    let collection = candidates
+        .par_iter()
+        .filter_map(|candidate| collection_candidate(bundle, collection_sources, candidate))
+        .collect::<Vec<_>>();
+    if !collection.is_empty() {
+        return GapEvidence {
+            pool: SemanticPool::CollectionFallback,
+            candidates: collection,
+        };
+    }
+
+    GapEvidence {
+        pool: SemanticPool::BlissOnly,
+        candidates: candidates
+            .par_iter()
+            .map(|candidate| CandidateSemantics {
+                candidate: candidate.candidate,
+                tier: SemanticTier::BlissOnly,
+                evidence: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
 pub fn select_gap_candidates(
     bundle: &EvidenceBundle,
     left: &TrackIdentity,
@@ -574,6 +651,69 @@ mod tests {
             selected.candidates[0].compare_priority(&selected.candidates[1]),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn one_anchor_endpoint_never_fabricates_two_sided_recording_support() {
+        let anchor = track("anchor", "Artist Anchor");
+        let other_source = track("other", "Artist Other");
+        let candidate = CandidateIdentity {
+            candidate: 10,
+            track: track("candidate", "Artist Candidate"),
+        };
+        let bundle = EvidenceBundle {
+            schema_version: 1,
+            frozen_at: "2026-07-20T00:00:00Z".to_owned(),
+            providers: Vec::new(),
+            edges: vec![
+                edge(
+                    EntityKind::Recording,
+                    "anchor",
+                    EntityKind::Recording,
+                    "candidate",
+                    EvidenceScope::EndpointLocal,
+                    1,
+                ),
+                edge(
+                    EntityKind::Recording,
+                    "other",
+                    EntityKind::Recording,
+                    "candidate",
+                    EvidenceScope::EndpointLocal,
+                    2,
+                ),
+            ],
+        };
+        let candidates = [candidate];
+        let collection_sources = [anchor.clone(), other_source];
+        let opening = select_endpoint_candidates(
+            &bundle,
+            &anchor,
+            SourceEndpoint::Right,
+            &collection_sources,
+            &candidates,
+        );
+        assert_eq!(opening.pool, SemanticPool::EndpointLocal);
+        assert_eq!(opening.candidates[0].tier, SemanticTier::RecordingOne);
+        assert_eq!(opening.candidates[0].evidence.len(), 1);
+        assert_eq!(
+            opening.candidates[0].evidence[0].source_endpoint,
+            SourceEndpoint::Right
+        );
+
+        let empty = EvidenceBundle {
+            edges: Vec::new(),
+            ..bundle
+        };
+        let fallback = select_endpoint_candidates(
+            &empty,
+            &anchor,
+            SourceEndpoint::Left,
+            &collection_sources,
+            &candidates,
+        );
+        assert_eq!(fallback.pool, SemanticPool::BlissOnly);
+        assert_eq!(fallback.candidates[0].tier, SemanticTier::BlissOnly);
     }
 
     #[test]

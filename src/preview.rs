@@ -8,7 +8,8 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::bridge::{
-    rank_candidates, BridgeCandidateEvaluation, BridgeConfig, BridgeError, FrozenReference,
+    rank_candidates, rank_endpoint_candidates, BridgeCandidateEvaluation, BridgeConfig,
+    BridgeError, EndpointCandidateEvaluation, EndpointSlot, FrozenReference,
 };
 use crate::route::{self, RouteTrack};
 use crate::semantic::{CandidateSemantics, GapEvidence, SemanticPool};
@@ -37,6 +38,26 @@ pub struct ExactSelectionConfig {
     pub candidate_limit: usize,
     pub beam_width: usize,
     pub max_tracks_per_gap: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExactEndpointSlot {
+    pub anchor: usize,
+    pub semantics: GapEvidence,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExactEndpointSlots {
+    pub opening: Option<ExactEndpointSlot>,
+    pub closing: Option<ExactEndpointSlot>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ExactScoringContext<'a> {
+    pub tracks: &'a [RouteTrack],
+    pub learned_matrix: &'a Array2<f32>,
+    pub config: &'a BridgeConfig,
+    pub reference: &'a FrozenReference,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -91,7 +112,23 @@ pub struct ExactSelection {
     pub requested_added_tracks: usize,
     pub final_route: Option<Vec<usize>>,
     pub decisions: Vec<GapDecision>,
+    pub endpoint_decisions: Vec<EndpointDecision>,
     pub stats: ExactSearchStats,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectedEndpoint {
+    pub semantics: CandidateSemantics,
+    pub evaluation: EndpointCandidateEvaluation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EndpointDecision {
+    pub slot: EndpointSlot,
+    pub anchor: usize,
+    pub semantic_pool: SemanticPool,
+    pub reason: DecisionReason,
+    pub selected: Option<SelectedEndpoint>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -587,6 +624,7 @@ fn select_exact_count_multi_gap_bridges(
         requested_added_tracks: selection_config.requested_added_tracks,
         final_route,
         decisions,
+        endpoint_decisions: Vec::new(),
         stats: ExactSearchStats {
             max_tracks_per_gap: selection_config.max_tracks_per_gap,
             evaluated_states,
@@ -647,6 +685,320 @@ pub fn select_exact_count_bridges(
             reference,
         )
     }
+}
+
+fn rank_endpoint_for_route(
+    route: &[usize],
+    slot: EndpointSlot,
+    endpoint: &ExactEndpointSlot,
+    candidate_limit: usize,
+    scoring: ExactScoringContext<'_>,
+) -> Result<Vec<SelectedEndpoint>, PreviewError> {
+    let ExactScoringContext {
+        tracks,
+        learned_matrix,
+        config,
+        reference,
+    } = scoring;
+    let semantics_by_candidate = endpoint
+        .semantics
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.candidate, candidate))
+        .collect::<HashMap<_, _>>();
+    let candidates = endpoint
+        .semantics
+        .candidates
+        .iter()
+        .map(|candidate| candidate.candidate)
+        .collect::<Vec<_>>();
+    let mut evaluations = rank_endpoint_candidates(
+        route,
+        slot,
+        &candidates,
+        tracks,
+        learned_matrix,
+        config,
+        reference,
+    )
+    .map_err(PreviewError::Scoring)?;
+    evaluations.sort_by(|left, right| {
+        right
+            .accepted
+            .cmp(&left.accepted)
+            .then_with(|| {
+                semantics_by_candidate[&left.candidate]
+                    .compare_priority(semantics_by_candidate[&right.candidate])
+            })
+            .then_with(|| left.percentile.total_cmp(&right.percentile))
+            .then_with(|| left.candidate.cmp(&right.candidate))
+    });
+    Ok(evaluations
+        .into_iter()
+        .filter(|evaluation| evaluation.accepted)
+        .take(candidate_limit)
+        .map(|evaluation| SelectedEndpoint {
+            semantics: semantics_by_candidate[&evaluation.candidate].clone(),
+            evaluation,
+        })
+        .collect())
+}
+
+#[derive(Clone, Debug)]
+struct EndpointExactVariant {
+    route: Vec<usize>,
+    decisions: Vec<GapDecision>,
+    endpoint_decisions: Vec<EndpointDecision>,
+    objective: f64,
+}
+
+fn endpoint_variant_precedes(left: &EndpointExactVariant, right: &EndpointExactVariant) -> bool {
+    left.objective.total_cmp(&right.objective).is_lt()
+        || (left.objective == right.objective && left.route < right.route)
+}
+
+pub fn select_exact_count_bridges_with_endpoints(
+    original_route: &[usize],
+    gaps: &[AutomaticGap],
+    selection_config: &ExactSelectionConfig,
+    endpoints: &ExactEndpointSlots,
+    scoring: ExactScoringContext<'_>,
+) -> Result<ExactSelection, PreviewError> {
+    let ExactScoringContext {
+        tracks,
+        learned_matrix,
+        config,
+        reference,
+    } = scoring;
+    if endpoints.opening.is_none() && endpoints.closing.is_none() {
+        return select_exact_count_bridges(
+            original_route,
+            gaps,
+            selection_config,
+            tracks,
+            learned_matrix,
+            config,
+            reference,
+        );
+    }
+
+    let opening_choices = if endpoints.opening.is_some() {
+        [false, true].as_slice()
+    } else {
+        [false].as_slice()
+    };
+    let closing_choices = if endpoints.closing.is_some() {
+        [false, true].as_slice()
+    } else {
+        [false].as_slice()
+    };
+    let mut variants = Vec::new();
+    let mut ordered_gaps = gaps.to_vec();
+    ordered_gaps.sort_by_key(|gap| gap.original_position);
+    let mut evaluated_states = 0usize;
+    let mut retained_states = 0usize;
+    let mut maximum_additions_found = 0usize;
+
+    for use_opening in opening_choices {
+        for use_closing in closing_choices {
+            let endpoint_count = usize::from(*use_opening) + usize::from(*use_closing);
+            if endpoint_count > selection_config.requested_added_tracks {
+                continue;
+            }
+            let internal_requested = selection_config.requested_added_tracks - endpoint_count;
+            let internal_config = ExactSelectionConfig {
+                requested_added_tracks: internal_requested,
+                ..*selection_config
+            };
+            let internal = select_exact_count_bridges(
+                original_route,
+                gaps,
+                &internal_config,
+                tracks,
+                learned_matrix,
+                config,
+                reference,
+            )?;
+            evaluated_states += internal.stats.evaluated_states;
+            retained_states += internal.stats.retained_states;
+            maximum_additions_found =
+                maximum_additions_found.max(internal.stats.maximum_additions_found);
+            let Some(internal_route) = internal.final_route else {
+                continue;
+            };
+
+            let opening_options = if *use_opening {
+                rank_endpoint_for_route(
+                    &internal_route,
+                    EndpointSlot::Opening,
+                    endpoints.opening.as_ref().expect("opening slot is enabled"),
+                    selection_config.candidate_limit,
+                    scoring,
+                )?
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>()
+            } else {
+                vec![None]
+            };
+            for opening in opening_options {
+                let mut opened_route = internal_route.clone();
+                let mut endpoint_decisions = Vec::new();
+                if let Some(selected) = &opening {
+                    opened_route.insert(0, selected.evaluation.candidate);
+                }
+                if let Some(endpoint) = &endpoints.opening {
+                    endpoint_decisions.push(EndpointDecision {
+                        slot: EndpointSlot::Opening,
+                        anchor: endpoint.anchor,
+                        semantic_pool: endpoint.semantics.pool,
+                        reason: if opening.is_some() {
+                            DecisionReason::Selected
+                        } else {
+                            DecisionReason::NotSelected
+                        },
+                        selected: opening.clone(),
+                    });
+                }
+
+                let closing_options = if *use_closing {
+                    rank_endpoint_for_route(
+                        &opened_route,
+                        EndpointSlot::Closing,
+                        endpoints.closing.as_ref().expect("closing slot is enabled"),
+                        selection_config.candidate_limit,
+                        scoring,
+                    )?
+                    .into_iter()
+                    .map(Some)
+                    .collect::<Vec<_>>()
+                } else {
+                    vec![None]
+                };
+                for closing in closing_options {
+                    let mut route = opened_route.clone();
+                    let mut candidate_decisions = endpoint_decisions.clone();
+                    if let Some(selected) = &closing {
+                        route.push(selected.evaluation.candidate);
+                    }
+                    if let Some(endpoint) = &endpoints.closing {
+                        candidate_decisions.push(EndpointDecision {
+                            slot: EndpointSlot::Closing,
+                            anchor: endpoint.anchor,
+                            semantic_pool: endpoint.semantics.pool,
+                            reason: if closing.is_some() {
+                                DecisionReason::Selected
+                            } else {
+                                DecisionReason::NotSelected
+                            },
+                            selected: closing.clone(),
+                        });
+                    }
+                    let metrics = route::evaluate_adaptive_sequence(
+                        &route,
+                        tracks,
+                        learned_matrix,
+                        config.seed_limit,
+                        config.learned_percent,
+                    )
+                    .map_err(PreviewError::RouteScoring)?;
+                    let gap_selections = ordered_gaps
+                        .iter()
+                        .map(|gap| {
+                            internal
+                                .decisions
+                                .iter()
+                                .filter(|decision| {
+                                    decision.original_position == gap.original_position
+                                })
+                                .filter_map(|decision| {
+                                    decision
+                                        .selected
+                                        .as_ref()
+                                        .map(|selected| selected.evaluation.candidate)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    let decisions = match final_exact_decisions(
+                        &route,
+                        &ordered_gaps,
+                        &gap_selections,
+                        tracks,
+                        learned_matrix,
+                        config,
+                        reference,
+                    ) {
+                        Ok(decisions) => decisions,
+                        Err(PreviewError::FinalRouteInvalid(_)) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    evaluated_states += 1;
+                    retained_states += 1;
+                    maximum_additions_found =
+                        maximum_additions_found.max(route.len() - original_route.len());
+                    variants.push(EndpointExactVariant {
+                        route,
+                        decisions,
+                        endpoint_decisions: candidate_decisions,
+                        objective: metrics.objective,
+                    });
+                }
+            }
+        }
+    }
+
+    let unique_candidates = gaps
+        .iter()
+        .flat_map(|gap| gap.semantics.candidates.iter())
+        .chain(
+            endpoints
+                .opening
+                .iter()
+                .flat_map(|endpoint| endpoint.semantics.candidates.iter()),
+        )
+        .chain(
+            endpoints
+                .closing
+                .iter()
+                .flat_map(|endpoint| endpoint.semantics.candidates.iter()),
+        )
+        .map(|candidate| candidate.candidate)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let endpoint_capacity =
+        usize::from(endpoints.opening.is_some()) + usize::from(endpoints.closing.is_some());
+    let structural_upper_bound = gaps
+        .len()
+        .saturating_mul(selection_config.max_tracks_per_gap)
+        .saturating_add(endpoint_capacity)
+        .min(unique_candidates);
+    let selected = variants.into_iter().min_by(|left, right| {
+        if endpoint_variant_precedes(left, right) {
+            std::cmp::Ordering::Less
+        } else if endpoint_variant_precedes(right, left) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    let (final_route, decisions, endpoint_decisions) = selected
+        .map(|state| (Some(state.route), state.decisions, state.endpoint_decisions))
+        .unwrap_or_else(|| (None, Vec::new(), Vec::new()));
+
+    Ok(ExactSelection {
+        requested_added_tracks: selection_config.requested_added_tracks,
+        final_route,
+        decisions,
+        endpoint_decisions,
+        stats: ExactSearchStats {
+            max_tracks_per_gap: selection_config.max_tracks_per_gap,
+            evaluated_states: evaluated_states.max(1),
+            retained_states: retained_states.max(1),
+            maximum_additions_found,
+            structural_upper_bound,
+        },
+    })
 }
 
 fn select_exact_count_single_gap_bridges(
@@ -815,6 +1167,7 @@ fn select_exact_count_single_gap_bridges(
         requested_added_tracks: selection_config.requested_added_tracks,
         final_route,
         decisions,
+        endpoint_decisions: Vec::new(),
         stats: ExactSearchStats {
             max_tracks_per_gap: 1,
             evaluated_states,
@@ -1143,5 +1496,102 @@ mod tests {
         .unwrap();
         assert!(single_per_gap.final_route.is_none());
         assert_eq!(single_per_gap.stats.structural_upper_bound, 1);
+    }
+
+    #[test]
+    fn explicit_endpoint_slots_make_an_otherwise_impossible_count_deterministic() {
+        let tracks = vec![
+            track(1.0, "anchor-a"),
+            track(0.0, "opening"),
+            track(3.0, "closing"),
+            track(2.0, "anchor-b"),
+        ];
+        let route = [0, 3];
+        let matrix = Array2::eye(23);
+        let config = BridgeConfig {
+            seed_limit: 2,
+            learned_percent: 20,
+            artist_window: 1,
+            album_window: 1,
+            max_leg_percentile: 1.0,
+            max_detour_percentile: 2.0,
+        };
+        let reference =
+            build_frozen_reference(&route, &[0, 1, 2, 3], &tracks, &matrix, &config).unwrap();
+        let exact = ExactSelectionConfig {
+            requested_added_tracks: 2,
+            candidate_limit: 2,
+            beam_width: 16,
+            max_tracks_per_gap: 1,
+        };
+        let without_endpoints =
+            select_exact_count_bridges(&route, &[], &exact, &tracks, &matrix, &config, &reference)
+                .unwrap();
+        assert!(without_endpoints.final_route.is_none());
+        assert_eq!(without_endpoints.stats.structural_upper_bound, 0);
+
+        let endpoints = ExactEndpointSlots {
+            opening: Some(ExactEndpointSlot {
+                anchor: 0,
+                semantics: GapEvidence {
+                    pool: SemanticPool::BlissOnly,
+                    candidates: vec![semantics(1)],
+                },
+            }),
+            closing: Some(ExactEndpointSlot {
+                anchor: 3,
+                semantics: GapEvidence {
+                    pool: SemanticPool::BlissOnly,
+                    candidates: vec![semantics(2)],
+                },
+            }),
+        };
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                select_exact_count_bridges_with_endpoints(
+                    &route,
+                    &[],
+                    &exact,
+                    &endpoints,
+                    ExactScoringContext {
+                        tracks: &tracks,
+                        learned_matrix: &matrix,
+                        config: &config,
+                        reference: &reference,
+                    },
+                )
+            })
+            .unwrap();
+        let four = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                select_exact_count_bridges_with_endpoints(
+                    &route,
+                    &[],
+                    &exact,
+                    &endpoints,
+                    ExactScoringContext {
+                        tracks: &tracks,
+                        learned_matrix: &matrix,
+                        config: &config,
+                        reference: &reference,
+                    },
+                )
+            })
+            .unwrap();
+
+        assert_eq!(one, four);
+        assert_eq!(one.final_route, Some(vec![1, 0, 3, 2]));
+        assert_eq!(one.endpoint_decisions.len(), 2);
+        assert!(one
+            .endpoint_decisions
+            .iter()
+            .all(|decision| decision.reason == DecisionReason::Selected));
+        assert_eq!(one.stats.structural_upper_bound, 2);
     }
 }

@@ -369,6 +369,20 @@ def write_multi_track_gap_request(
     )
 
 
+def write_endpoint_slot_request(
+    path: pathlib.Path,
+    source_request: pathlib.Path,
+) -> None:
+    request = json.loads(source_request.read_text(encoding="utf-8"))
+    request["job_id"] = "synthetic-preserve-endpoint-slots-001"
+    request["extension"]["additional_track_count"] = 4
+    request["extension"]["allow_opening_track"] = True
+    request["extension"]["allow_closing_track"] = True
+    path.write_text(
+        json.dumps(request, indent=2) + "\n", encoding="utf-8", newline="\n",
+    )
+
+
 def main() -> None:
     destination = pathlib.Path(__file__).resolve().parent
     tracks = [track(index) for index in range(TRACK_COUNT)]
@@ -387,6 +401,7 @@ def main() -> None:
     preserve_automatic_request = destination / "preserve-automatic-request.json"
     preserve_exact_count_request = destination / "preserve-exact-count-request.json"
     multi_track_gap_request = destination / "preserve-multi-track-gap-request.json"
+    endpoint_slot_request = destination / "preserve-endpoint-slots-request.json"
     write_database(database, tracks)
     write_playlist(playlist, tracks)
     write_matrix(matrix)
@@ -421,6 +436,10 @@ def main() -> None:
         multi_track_gap_request,
         preserve_exact_count_request,
     )
+    write_endpoint_slot_request(
+        endpoint_slot_request,
+        preserve_exact_count_request,
+    )
     manifest = {
         "fixture_version": 1,
         "description": "Private-data-free TracksV2 and Lyrion extended-M3U parity fixture.",
@@ -451,6 +470,9 @@ def main() -> None:
             ),
             "preserve-multi-track-gap-request.json": sha256(
                 multi_track_gap_request
+            ),
+            "preserve-endpoint-slots-request.json": sha256(
+                endpoint_slot_request
             ),
         },
         "python_oracle": {

@@ -24,6 +24,7 @@ cargo run -- bridge --request fixtures/synthetic/exact-count-infeasible-request.
 cargo run -- bridge --request fixtures/synthetic/preserve-automatic-request.json
 cargo run -- bridge --request fixtures/synthetic/preserve-exact-count-request.json
 cargo run -- bridge --request fixtures/synthetic/preserve-multi-track-gap-request.json
+cargo run -- bridge --request fixtures/synthetic/preserve-endpoint-slots-request.json
 ```
 
 The score result must exactly match `expected-native-scoring-v1.json`; its
@@ -92,6 +93,16 @@ internal gaps. With `max_tracks_per_gap = 2`, it returns two bridges between
 track 11 and track 02 and two between track 02 and track 12. Every selected
 bridge is reported with diagnostics recomputed against its final neighbors.
 The one-worker and four-worker artifacts must be byte-identical.
+
+The endpoint-slot result must exactly match
+`expected-native-preserve-endpoint-slots-v1.json`. It requests four
+additions while its four source anchors and one-track-per-gap policy provide
+only three internal slots. Explicit opening and closing flags add one bounded
+slot each, and the selected route uses both. The fixture proves one-sided
+endpoint diagnostics, an unchanged original subsequence, final-route positions
+for internal bridges, a structural upper bound of five, and byte equality
+between one and four Rayon workers. Without the explicit endpoint flags this
+count is structurally impossible under the same internal-gap policy.
 
 Regeneration writes the adaptive scoring request, all bridge requests, and the
 mixed semantic evidence bundle; their hashes are recorded in `manifest.json`.

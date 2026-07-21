@@ -240,7 +240,10 @@
       "properties": {
         "mode": { "const": "exact_count" },
         "processing_order": {
-          "const": "left-to-right-original-gaps-beam-search"
+          "enum": [
+            "left-to-right-original-gaps-beam-search",
+            "bounded-endpoints-and-original-gaps-beam-search"
+          ]
         },
         "requested_added_tracks": { "type": "integer", "minimum": 0 },
         "feasible": { "type": "boolean" },
@@ -264,6 +267,12 @@
         "decisions": {
           "type": "array",
           "items": { "$ref": "#/$defs/exact_preview_decision" }
+        },
+        "endpoint_policy": { "$ref": "#/$defs/endpoint_policy" },
+        "endpoint_decisions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/endpoint_decision" }
         },
         "search": { "$ref": "#/$defs/exact_search" },
         "infeasibility": {
@@ -300,6 +309,76 @@
           }
         }
       ]
+    },
+    "endpoint_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "opening_enabled", "closing_enabled", "maximum_opening_tracks",
+        "maximum_closing_tracks"
+      ],
+      "properties": {
+        "opening_enabled": { "type": "boolean" },
+        "closing_enabled": { "type": "boolean" },
+        "maximum_opening_tracks": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "maximum_closing_tracks": { "type": "integer", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "endpoint_decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "slot", "anchor_track_id", "semantic_pool", "reason", "selected_track"
+      ],
+      "properties": {
+        "slot": { "enum": ["opening", "closing"] },
+        "anchor_track_id": { "type": "string", "minLength": 1 },
+        "semantic_pool": {
+          "enum": ["endpoint_local", "collection_fallback", "bliss_only"]
+        },
+        "reason": { "enum": ["selected", "not_selected"] },
+        "selected_track": {
+          "anyOf": [
+            { "$ref": "#/$defs/endpoint_candidate" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "reason": { "const": "selected" } } },
+          "then": {
+            "properties": {
+              "selected_track": { "$ref": "#/$defs/endpoint_candidate" }
+            }
+          },
+          "else": {
+            "properties": { "selected_track": { "type": "null" } }
+          }
+        }
+      ]
+    },
+    "endpoint_candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id", "semantic_tier", "semantic_evidence", "distance",
+        "percentile"
+      ],
+      "properties": {
+        "candidate_id": { "type": "string", "minLength": 1 },
+        "semantic_tier": {
+          "enum": [
+            "recording_one", "artist_local", "artist_collection", "bliss_only"
+          ]
+        },
+        "semantic_evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/matched_evidence" }
+        },
+        "distance": { "type": "number", "minimum": 0 },
+        "percentile": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
     },
     "exact_search": {
       "type": "object",

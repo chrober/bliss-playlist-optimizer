@@ -98,6 +98,10 @@ fn published_examples_satisfy_their_v1_contracts() {
             "fixtures/synthetic/preserve-multi-track-gap-request.json",
         ),
         (
+            "schemas/optimizer-request-v1.schema.json",
+            "fixtures/synthetic/preserve-endpoint-slots-request.json",
+        ),
+        (
             "schemas/semantic-evidence-v1.schema.json",
             "examples/semantic-evidence-empty.json",
         ),
@@ -152,6 +156,10 @@ fn published_examples_satisfy_their_v1_contracts() {
         (
             "schemas/bridge-analysis-artifact-v1.schema.json",
             "fixtures/synthetic/expected-native-preserve-multi-track-gap-v1.json",
+        ),
+        (
+            "schemas/bridge-analysis-artifact-v1.schema.json",
+            "fixtures/synthetic/expected-native-preserve-endpoint-slots-v1.json",
         ),
     ] {
         assert_valid(schema, example);
@@ -260,6 +268,47 @@ fn multi_track_gap_bound_requires_exact_count_and_preserve_order() {
 }
 
 #[test]
+fn endpoint_slots_require_exact_count_mode() {
+    let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let example = read_json(&repository_path(
+        "fixtures/synthetic/preserve-endpoint-slots-request.json",
+    ));
+    assert!(validator.is_valid(&example));
+
+    let mut automatic = example;
+    automatic["extension"]["mode"] = Value::String("automatic".to_owned());
+    automatic["extension"]["max_added_tracks"] = Value::from(4);
+    automatic["extension"]["trigger_percentile"] = Value::from(0.7);
+    automatic["extension"]
+        .as_object_mut()
+        .unwrap()
+        .remove("additional_track_count");
+    assert!(!validator.is_valid(&automatic));
+}
+
+#[test]
+fn endpoint_decision_contract_binds_reason_to_selected_track() {
+    let schema = read_json(&repository_path(
+        "schemas/bridge-analysis-artifact-v1.schema.json",
+    ));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let example = read_json(&repository_path(
+        "fixtures/synthetic/expected-native-preserve-endpoint-slots-v1.json",
+    ));
+
+    let mut selected_without_track = example.clone();
+    selected_without_track["selection_preview"]["endpoint_decisions"][0]["selected_track"] =
+        Value::Null;
+    assert!(!validator.is_valid(&selected_without_track));
+
+    let mut skipped_with_track = example;
+    skipped_with_track["selection_preview"]["endpoint_decisions"][0]["reason"] =
+        Value::String("not_selected".to_owned());
+    assert!(!validator.is_valid(&skipped_with_track));
+}
+
+#[test]
 fn exact_count_contract_never_represents_infeasibility_as_a_partial_route() {
     let schema = read_json(&repository_path(
         "schemas/bridge-analysis-artifact-v1.schema.json",
@@ -312,6 +361,7 @@ fn preserve_order_artifacts_keep_source_ids_as_the_original_subsequence() {
         "fixtures/synthetic/expected-native-preserve-automatic-v1.json",
         "fixtures/synthetic/expected-native-preserve-exact-count-v1.json",
         "fixtures/synthetic/expected-native-preserve-multi-track-gap-v1.json",
+        "fixtures/synthetic/expected-native-preserve-endpoint-slots-v1.json",
     ] {
         let artifact = read_json(&repository_path(path));
         assert_eq!(artifact["ordering_policy"], "preserve_order");
@@ -356,4 +406,33 @@ fn multi_track_gap_artifact_exceeds_the_internal_gap_count_without_partial_outpu
         }
     }
     assert!(selected_per_gap.values().any(|count| *count > 1));
+}
+
+#[test]
+fn endpoint_slot_artifact_exceeds_internal_capacity_only_by_explicit_opt_in() {
+    let artifact = read_json(&repository_path(
+        "fixtures/synthetic/expected-native-preserve-endpoint-slots-v1.json",
+    ));
+    let preview = &artifact["selection_preview"];
+    let source_count = artifact["source_track_ids"].as_array().unwrap().len();
+    let requested = preview["requested_added_tracks"].as_u64().unwrap() as usize;
+    let per_gap = preview["search"]["max_tracks_per_gap"].as_u64().unwrap() as usize;
+    let internal_capacity = (source_count - 1) * per_gap;
+
+    assert!(requested > internal_capacity);
+    assert_eq!(
+        preview["added_track_count"].as_u64().unwrap() as usize,
+        requested
+    );
+    assert_eq!(preview["endpoint_policy"]["maximum_opening_tracks"], 1);
+    assert_eq!(preview["endpoint_policy"]["maximum_closing_tracks"], 1);
+    assert_eq!(preview["endpoint_decisions"].as_array().unwrap().len(), 2);
+    assert!(preview["endpoint_decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|decision| decision["reason"] == "selected"));
+    let sequence = preview["final_sequence"].as_array().unwrap();
+    assert_eq!(sequence.first().unwrap()["kind"], "bridge");
+    assert_eq!(sequence.last().unwrap()["kind"], "bridge");
 }

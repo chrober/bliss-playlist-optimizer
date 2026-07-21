@@ -95,6 +95,8 @@ struct RepeatWindows {
 struct ExtensionSettings {
     mode: String,
     additional_track_count: Option<usize>,
+    allow_opening_track: Option<bool>,
+    allow_closing_track: Option<bool>,
     candidate_limit: Option<usize>,
     max_tracks_per_gap: Option<usize>,
     max_added_tracks: Option<usize>,
@@ -294,8 +296,38 @@ struct ExactSelectionArtifact {
     unique_membership: Option<bool>,
     final_sequence: Option<Vec<PreviewSequenceEntryArtifact>>,
     decisions: Vec<ExactPreviewDecisionArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint_policy: Option<EndpointPolicyArtifact>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    endpoint_decisions: Vec<EndpointDecisionArtifact>,
     search: ExactSearchArtifact,
     infeasibility: Option<ExactInfeasibilityArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct EndpointPolicyArtifact {
+    opening_enabled: bool,
+    closing_enabled: bool,
+    maximum_opening_tracks: usize,
+    maximum_closing_tracks: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct EndpointDecisionArtifact {
+    slot: &'static str,
+    anchor_track_id: String,
+    semantic_pool: semantic::SemanticPool,
+    reason: preview::DecisionReason,
+    selected_track: Option<EndpointCandidateArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct EndpointCandidateArtifact {
+    candidate_id: String,
+    semantic_tier: semantic::SemanticTier,
+    semantic_evidence: Vec<semantic::MatchedEvidence>,
+    distance: f64,
+    percentile: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -804,6 +836,19 @@ fn bridge_candidate_artifact(
         right_percentile: evaluation.right_percentile,
         max_percentile: evaluation.max_percentile,
         detour_percentile: evaluation.detour_percentile,
+    }
+}
+
+fn endpoint_candidate_artifact(
+    selected: &preview::SelectedEndpoint,
+    library: &[LibraryTrack],
+) -> EndpointCandidateArtifact {
+    EndpointCandidateArtifact {
+        candidate_id: bridge_candidate_id(library[selected.evaluation.candidate].row_id),
+        semantic_tier: selected.semantics.tier,
+        semantic_evidence: selected.semantics.evidence.clone(),
+        distance: selected.evaluation.distance,
+        percentile: selected.evaluation.percentile,
     }
 }
 
@@ -1394,7 +1439,46 @@ fn analyze_bridge_validated(
             let requested_added_tracks =
                 requested_exact_count.expect("exact-count request has a validated count");
             let max_tracks_per_gap = request.extension.max_tracks_per_gap.unwrap_or(1);
-            let selection = preview::select_exact_count_bridges(
+            let opening_enabled = request.extension.allow_opening_track.unwrap_or(false);
+            let closing_enabled = request.extension.allow_closing_track.unwrap_or(false);
+            let endpoint_slots = preview::ExactEndpointSlots {
+                opening: opening_enabled.then(|| {
+                    let local_index = selected_local_route[0];
+                    preview::ExactEndpointSlot {
+                        anchor: selected_library_route[0],
+                        semantics: semantic::select_endpoint_candidates(
+                            &semantic_bundle,
+                            &source_semantic_identities[local_index],
+                            semantic::SourceEndpoint::Right,
+                            &source_semantic_identities,
+                            &semantic_candidates,
+                        ),
+                    }
+                }),
+                closing: closing_enabled.then(|| {
+                    let local_index = *selected_local_route
+                        .last()
+                        .expect("validated routes have at least two tracks");
+                    preview::ExactEndpointSlot {
+                        anchor: *selected_library_route
+                            .last()
+                            .expect("validated routes have at least two tracks"),
+                        semantics: semantic::select_endpoint_candidates(
+                            &semantic_bundle,
+                            &source_semantic_identities[local_index],
+                            semantic::SourceEndpoint::Left,
+                            &source_semantic_identities,
+                            &semantic_candidates,
+                        ),
+                    }
+                }),
+            };
+            semantic_assisted |= endpoint_slots
+                .opening
+                .iter()
+                .chain(endpoint_slots.closing.iter())
+                .any(|endpoint| endpoint.semantics.pool != semantic::SemanticPool::BlissOnly);
+            let selection = preview::select_exact_count_bridges_with_endpoints(
                 &selected_library_route,
                 &preview_gaps,
                 &preview::ExactSelectionConfig {
@@ -1403,10 +1487,13 @@ fn analyze_bridge_validated(
                     beam_width: EXACT_COUNT_BEAM_WIDTH,
                     max_tracks_per_gap,
                 },
-                &bridge_tracks,
-                &learned_matrix,
-                &bridge_config,
-                &reference,
+                &endpoint_slots,
+                preview::ExactScoringContext {
+                    tracks: &bridge_tracks,
+                    learned_matrix: &learned_matrix,
+                    config: &bridge_config,
+                    reference: &reference,
+                },
             )
             .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))?;
             let feasible = selection.final_route.is_some();
@@ -1429,6 +1516,23 @@ fn analyze_bridge_validated(
                             &library,
                         )
                     }),
+                })
+                .collect::<Vec<_>>();
+            let endpoint_decisions = selection
+                .endpoint_decisions
+                .iter()
+                .map(|decision| EndpointDecisionArtifact {
+                    slot: match decision.slot {
+                        bridge::EndpointSlot::Opening => "opening",
+                        bridge::EndpointSlot::Closing => "closing",
+                    },
+                    anchor_track_id: original_ids_by_library[&decision.anchor].clone(),
+                    semantic_pool: decision.semantic_pool,
+                    reason: decision.reason,
+                    selected_track: decision
+                        .selected
+                        .as_ref()
+                        .map(|selected| endpoint_candidate_artifact(selected, &library)),
                 })
                 .collect::<Vec<_>>();
             let final_sequence = selection.final_route.as_deref().map(&sequence_artifact);
@@ -1458,7 +1562,13 @@ fn analyze_bridge_validated(
             });
             SelectionPreviewArtifact::Exact(ExactSelectionArtifact {
                 mode: "exact_count",
-                processing_order: "left-to-right-original-gaps-beam-search",
+                processing_order: if endpoint_slots.opening.is_some()
+                    || endpoint_slots.closing.is_some()
+                {
+                    "bounded-endpoints-and-original-gaps-beam-search"
+                } else {
+                    "left-to-right-original-gaps-beam-search"
+                },
                 requested_added_tracks,
                 feasible,
                 added_track_count,
@@ -1466,6 +1576,15 @@ fn analyze_bridge_validated(
                 unique_membership,
                 final_sequence,
                 decisions,
+                endpoint_policy: (request.extension.allow_opening_track.is_some()
+                    || request.extension.allow_closing_track.is_some())
+                .then_some(EndpointPolicyArtifact {
+                    opening_enabled,
+                    closing_enabled,
+                    maximum_opening_tracks: usize::from(opening_enabled),
+                    maximum_closing_tracks: usize::from(closing_enabled),
+                }),
+                endpoint_decisions,
                 search: ExactSearchArtifact {
                     beam_width: EXACT_COUNT_BEAM_WIDTH,
                     candidate_limit: retained_candidate_limit,
@@ -1587,6 +1706,15 @@ fn analyze_bridge_request(path: &Path) -> Result<BridgeAnalysisArtifact, Command
         return Err(CommandFailure::new(
             "MAX_TRACKS_PER_GAP_UNSUPPORTED",
             "extension.max_tracks_per_gap is supported only for exact_count requests",
+        ));
+    }
+    if (request.extension.allow_opening_track.is_some()
+        || request.extension.allow_closing_track.is_some())
+        && request.extension.mode != "exact_count"
+    {
+        return Err(CommandFailure::new(
+            "ENDPOINT_SLOTS_UNSUPPORTED",
+            "endpoint slots are supported only for exact_count requests",
         ));
     }
     if request.extension.max_tracks_per_gap.unwrap_or(1) > 1
@@ -2166,6 +2294,83 @@ mod tests {
                 .filter(|decision| decision.reason == preview::DecisionReason::Selected)
                 .count(),
             4
+        );
+    }
+
+    #[test]
+    fn endpoint_slot_fixture_is_exact_and_worker_deterministic() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let path = Path::new("fixtures/synthetic/preserve-endpoint-slots-request.json");
+        let four = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| analyze_bridge_request(path));
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| analyze_bridge_request(path));
+        std::env::set_current_dir(original).unwrap();
+
+        let artifact = four.unwrap();
+        let expected =
+            include_str!("../fixtures/synthetic/expected-native-preserve-endpoint-slots-v1.json")
+                .trim();
+        assert_eq!(serde_json::to_string(&artifact).unwrap(), expected);
+        assert_eq!(
+            serde_json::to_string(&artifact).unwrap(),
+            serde_json::to_string(&one.unwrap()).unwrap()
+        );
+
+        let exact = match &artifact.selection_preview {
+            SelectionPreviewArtifact::Exact(exact) => exact,
+            SelectionPreviewArtifact::Automatic(_) => panic!("expected exact-count preview"),
+        };
+        assert!(exact.feasible);
+        assert_eq!(exact.requested_added_tracks, 4);
+        assert_eq!(exact.added_track_count, 4);
+        assert_eq!(exact.search.max_tracks_per_gap, 1);
+        assert_eq!(exact.search.structural_upper_bound, 5);
+        assert!(exact.requested_added_tracks > artifact.source_track_ids.len() - 1);
+        let policy = exact.endpoint_policy.as_ref().unwrap();
+        assert!(policy.opening_enabled);
+        assert!(policy.closing_enabled);
+        assert_eq!(policy.maximum_opening_tracks, 1);
+        assert_eq!(policy.maximum_closing_tracks, 1);
+        assert_eq!(exact.endpoint_decisions.len(), 2);
+        assert_eq!(exact.endpoint_decisions[0].slot, "opening");
+        assert_eq!(exact.endpoint_decisions[1].slot, "closing");
+        assert!(exact
+            .endpoint_decisions
+            .iter()
+            .all(|decision| decision.reason == preview::DecisionReason::Selected));
+
+        let sequence = exact.final_sequence.as_ref().unwrap();
+        assert_eq!(
+            sequence
+                .iter()
+                .filter(|entry| entry.kind == "original")
+                .map(|entry| entry.track_id.as_str())
+                .collect::<Vec<_>>(),
+            artifact
+                .source_track_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(sequence.first().unwrap().kind, "bridge");
+        assert_eq!(sequence.last().unwrap().kind, "bridge");
+        assert_eq!(
+            exact
+                .decisions
+                .iter()
+                .filter(|decision| decision.reason == preview::DecisionReason::Selected)
+                .map(|decision| decision.route_position)
+                .collect::<Vec<_>>(),
+            vec![3, 5]
         );
     }
 }

@@ -57,7 +57,8 @@
     "exact-count-infeasible-request.json": "35d1bd966f73aed3b1bbe2139184e4e0f4d11c965d22e76cb19195a2afe33980",
     "preserve-automatic-request.json": "64321710acbf4bda9ff99a7a19b42103d5d9b8854b1a691628b0642e9983acd3",
     "preserve-exact-count-request.json": "b6d03a6f78a1858b07e1a251b56dcb44aab4f4fba05381738245312b4692d5b0",
-    "preserve-multi-track-gap-request.json": "b43ecd7ede10ce412a57ef09c49bdbe971541f14b96faf61df9064f910a8857c"
+    "preserve-multi-track-gap-request.json": "b43ecd7ede10ce412a57ef09c49bdbe971541f14b96faf61df9064f910a8857c",
+    "preserve-endpoint-slots-request.json": "31727e9f39415b177892367705b8174ecdc0a20bc0791fb6db6fb1dd3b83060a"
   },
   "python_oracle": {
     "working_directory": "../bliss-similarity-design",

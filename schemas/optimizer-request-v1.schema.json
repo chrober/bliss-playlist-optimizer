@@ -113,6 +113,8 @@
           "enum": ["none", "automatic", "exact_count", "one_per_transition", "target_length"]
         },
         "additional_track_count": { "type": "integer", "minimum": 0 },
+        "allow_opening_track": { "type": "boolean" },
+        "allow_closing_track": { "type": "boolean" },
         "target_track_count": { "type": "integer", "minimum": 2 },
         "candidate_limit": { "type": "integer", "minimum": 1 },
         "max_tracks_per_gap": { "type": "integer", "minimum": 1, "maximum": 8 },
@@ -178,6 +180,25 @@
             "properties": {
               "ordering_policy": { "const": "preserve_order" }
             }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "extension": {
+            "anyOf": [
+              { "required": ["allow_opening_track"] },
+              { "required": ["allow_closing_track"] }
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "extension": {
+            "properties": { "mode": { "const": "exact_count" } }
           }
         }
       }

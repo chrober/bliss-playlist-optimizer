@@ -19,6 +19,7 @@ cargo run -- bridge --request fixtures/synthetic/exact-count-infeasible-request.
 cargo run -- bridge --request fixtures/synthetic/preserve-automatic-request.json
 cargo run -- bridge --request fixtures/synthetic/preserve-exact-count-request.json
 cargo run -- bridge --request fixtures/synthetic/preserve-multi-track-gap-request.json
+cargo run -- bridge --request fixtures/synthetic/preserve-endpoint-slots-request.json
 ```
 
 `validate` checks both JSON schemas, declared artifact hashes, SQLite integrity
@@ -114,8 +115,33 @@ repeat, and two-sided acoustic gates and causes the complete route objective to
 be recomputed. Once a route is selected, each inserted bridge is removed and
 reinserted virtually so its published two-leg diagnostics reflect its final
 neighbors and Adaptive context. All tracks in a chained gap currently come from
-the semantic pool frozen for the original anchor endpoints. Endpoint slots
-remain a future extension.
+the semantic pool frozen for the original anchor endpoints.
+
+Exact-count requests may independently opt into
+`extension.allow_opening_track` and `extension.allow_closing_track`. Each
+enabled endpoint has hard capacity one; endpoint tracks are never added unless
+the corresponding flag is explicitly true. An opening candidate has no
+invented incoming transition: it is scored only into the first source anchor,
+using the candidate as the one-track Adaptive context. A closing candidate is
+scored only from the complete preceding route into the candidate. Both must
+pass unique-membership, complete-route repeat, and max-leg percentile gates.
+The structural upper bound becomes the smaller of the unique candidate count
+and `internal gaps * max_tracks_per_gap + enabled endpoint slots`.
+
+Endpoint semantics are likewise one-sided. A recording edge from the real
+anchor yields `recording_one`, never fabricated `recording_both` support;
+endpoint-local artist evidence follows, then collection fallback, then
+Bliss-only operation. Opening evidence records the source anchor as the right
+endpoint and closing evidence records it as the left endpoint.
+
+Endpoint exact search is a deterministic bounded staged search, not a claim of
+joint global optimality. It enumerates the allowed opening/closing-use
+combinations, obtains the best bounded internal-gap route for the remaining
+count, enumerates retained endpoint candidates, and selects by the recomputed
+complete-route objective and stable route identity. Published internal bridge
+diagnostics are reconstructed against that complete route, including any
+opening shift. The artifact separately records the endpoint policy, each
+one-sided decision, and its evidence and percentile.
 
 With `route.ordering_policy = preserve_order`, both automatic and exact-count
 extension keep every source track in precisely its input position relative to

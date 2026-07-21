@@ -46,6 +46,21 @@ pub struct BridgeCandidateEvaluation {
     pub accepted: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointSlot {
+    Opening,
+    Closing,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EndpointCandidateEvaluation {
+    pub candidate: usize,
+    pub distance: f64,
+    pub percentile: f64,
+    pub repeat_safe: bool,
+    pub accepted: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BridgeError {
     InvalidGap,
@@ -307,6 +322,84 @@ pub fn rank_candidates(
     Ok(evaluations)
 }
 
+pub fn evaluate_endpoint_candidate(
+    route: &[usize],
+    slot: EndpointSlot,
+    candidate: usize,
+    tracks: &[RouteTrack],
+    learned_matrix: &Array2<f32>,
+    config: &BridgeConfig,
+    reference: &FrozenReference,
+) -> Result<EndpointCandidateEvaluation, BridgeError> {
+    validate_indices(route, tracks.len())?;
+    validate_indices(&[candidate], tracks.len())?;
+    if route.is_empty() {
+        return Err(BridgeError::InvalidGap);
+    }
+    let mut tentative = route.to_vec();
+    let distance = match slot {
+        EndpointSlot::Opening => {
+            tentative.insert(0, candidate);
+            contextual_distance(
+                &tentative[..1],
+                tentative[1],
+                tracks,
+                learned_matrix,
+                config,
+            )?
+        }
+        EndpointSlot::Closing => {
+            let distance =
+                contextual_distance(&tentative, candidate, tracks, learned_matrix, config)?;
+            tentative.push(candidate);
+            distance
+        }
+    };
+    let percentile = reference.percentile(distance)?;
+    let repeat_safe = !route.contains(&candidate) && repeat_safe(&tentative, tracks, config);
+    Ok(EndpointCandidateEvaluation {
+        candidate,
+        distance,
+        percentile,
+        repeat_safe,
+        accepted: repeat_safe && percentile <= config.max_leg_percentile,
+    })
+}
+
+pub fn rank_endpoint_candidates(
+    route: &[usize],
+    slot: EndpointSlot,
+    candidates: &[usize],
+    tracks: &[RouteTrack],
+    learned_matrix: &Array2<f32>,
+    config: &BridgeConfig,
+    reference: &FrozenReference,
+) -> Result<Vec<EndpointCandidateEvaluation>, BridgeError> {
+    let attempts = candidates
+        .par_iter()
+        .map(|candidate| {
+            evaluate_endpoint_candidate(
+                route,
+                slot,
+                *candidate,
+                tracks,
+                learned_matrix,
+                config,
+                reference,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut evaluations = attempts.into_iter().collect::<Result<Vec<_>, _>>()?;
+    evaluations.sort_by(|left, right| {
+        right
+            .accepted
+            .cmp(&left.accepted)
+            .then_with(|| left.percentile.total_cmp(&right.percentile))
+            .then_with(|| left.candidate.cmp(&right.candidate))
+    });
+    Ok(evaluations)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +502,87 @@ mod tests {
         assert_eq!(one, four);
         assert_eq!(one[0].candidate, 1);
         assert!(one[0].accepted);
+    }
+
+    #[test]
+    fn endpoint_scoring_is_one_sided_repeat_safe_and_worker_deterministic() {
+        let tracks = tracks();
+        let route = [0, 2, 4];
+        let matrix = Array2::eye(23);
+        let reference =
+            build_frozen_reference(&route, &route, &tracks, &matrix, &config()).unwrap();
+        let candidates = [5, 3, 1, 0];
+
+        let opening = evaluate_endpoint_candidate(
+            &route,
+            EndpointSlot::Opening,
+            1,
+            &tracks,
+            &matrix,
+            &config(),
+            &reference,
+        )
+        .unwrap();
+        let closing = evaluate_endpoint_candidate(
+            &route,
+            EndpointSlot::Closing,
+            1,
+            &tracks,
+            &matrix,
+            &config(),
+            &reference,
+        )
+        .unwrap();
+        assert!(opening.accepted);
+        assert!(closing.accepted);
+        assert_ne!(opening.distance, closing.distance);
+
+        let existing = evaluate_endpoint_candidate(
+            &route,
+            EndpointSlot::Opening,
+            0,
+            &tracks,
+            &matrix,
+            &config(),
+            &reference,
+        )
+        .unwrap();
+        assert!(!existing.repeat_safe);
+        assert!(!existing.accepted);
+
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                rank_endpoint_candidates(
+                    &route,
+                    EndpointSlot::Opening,
+                    &candidates,
+                    &tracks,
+                    &matrix,
+                    &config(),
+                    &reference,
+                )
+            })
+            .unwrap();
+        let four = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                rank_endpoint_candidates(
+                    &route,
+                    EndpointSlot::Opening,
+                    &candidates,
+                    &tracks,
+                    &matrix,
+                    &config(),
+                    &reference,
+                )
+            })
+            .unwrap();
+        assert_eq!(one, four);
     }
 
     #[test]
