@@ -1,0 +1,35 @@
+name: Build ARM64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-arm64.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "src/**"
+
+jobs:
+  linux-aarch64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - name: Install ARM64 linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-aarch64-linux-gnu
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+      - name: Verify binary architecture
+        run: file target/aarch64-unknown-linux-gnu/release/bliss-playlist-optimizer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bliss-playlist-optimizer-aarch64-linux
+          path: target/aarch64-unknown-linux-gnu/release/bliss-playlist-optimizer
+          if-no-files-found: error
