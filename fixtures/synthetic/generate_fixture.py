@@ -356,6 +356,19 @@ def write_preserve_order_request(
     )
 
 
+def write_multi_track_gap_request(
+    path: pathlib.Path,
+    source_request: pathlib.Path,
+) -> None:
+    request = json.loads(source_request.read_text(encoding="utf-8"))
+    request["job_id"] = "synthetic-preserve-multi-track-gap-001"
+    request["extension"]["additional_track_count"] = 4
+    request["extension"]["max_tracks_per_gap"] = 2
+    path.write_text(
+        json.dumps(request, indent=2) + "\n", encoding="utf-8", newline="\n",
+    )
+
+
 def main() -> None:
     destination = pathlib.Path(__file__).resolve().parent
     tracks = [track(index) for index in range(TRACK_COUNT)]
@@ -373,6 +386,7 @@ def main() -> None:
     )
     preserve_automatic_request = destination / "preserve-automatic-request.json"
     preserve_exact_count_request = destination / "preserve-exact-count-request.json"
+    multi_track_gap_request = destination / "preserve-multi-track-gap-request.json"
     write_database(database, tracks)
     write_playlist(playlist, tracks)
     write_matrix(matrix)
@@ -403,6 +417,10 @@ def main() -> None:
         exact_count_request,
         "synthetic-preserve-exact-count-001",
     )
+    write_multi_track_gap_request(
+        multi_track_gap_request,
+        preserve_exact_count_request,
+    )
     manifest = {
         "fixture_version": 1,
         "description": "Private-data-free TracksV2 and Lyrion extended-M3U parity fixture.",
@@ -430,6 +448,9 @@ def main() -> None:
             ),
             "preserve-exact-count-request.json": sha256(
                 preserve_exact_count_request
+            ),
+            "preserve-multi-track-gap-request.json": sha256(
+                multi_track_gap_request
             ),
         },
         "python_oracle": {

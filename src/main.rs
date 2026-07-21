@@ -96,6 +96,7 @@ struct ExtensionSettings {
     mode: String,
     additional_track_count: Option<usize>,
     candidate_limit: Option<usize>,
+    max_tracks_per_gap: Option<usize>,
     max_added_tracks: Option<usize>,
     trigger_percentile: Option<f64>,
 }
@@ -301,6 +302,7 @@ struct ExactSelectionArtifact {
 struct ExactSearchArtifact {
     beam_width: usize,
     candidate_limit: usize,
+    max_tracks_per_gap: usize,
     evaluated_states: usize,
     retained_states: usize,
     maximum_additions_found: usize,
@@ -1391,6 +1393,7 @@ fn analyze_bridge_validated(
         "exact_count" => {
             let requested_added_tracks =
                 requested_exact_count.expect("exact-count request has a validated count");
+            let max_tracks_per_gap = request.extension.max_tracks_per_gap.unwrap_or(1);
             let selection = preview::select_exact_count_bridges(
                 &selected_library_route,
                 &preview_gaps,
@@ -1398,6 +1401,7 @@ fn analyze_bridge_validated(
                     requested_added_tracks,
                     candidate_limit: retained_candidate_limit,
                     beam_width: EXACT_COUNT_BEAM_WIDTH,
+                    max_tracks_per_gap,
                 },
                 &bridge_tracks,
                 &learned_matrix,
@@ -1465,6 +1469,7 @@ fn analyze_bridge_validated(
                 search: ExactSearchArtifact {
                     beam_width: EXACT_COUNT_BEAM_WIDTH,
                     candidate_limit: retained_candidate_limit,
+                    max_tracks_per_gap: selection.stats.max_tracks_per_gap,
                     evaluated_states: selection.stats.evaluated_states,
                     retained_states: selection.stats.retained_states,
                     maximum_additions_found: selection.stats.maximum_additions_found,
@@ -1578,6 +1583,20 @@ fn analyze_bridge_request(path: &Path) -> Result<BridgeAnalysisArtifact, Command
             ),
         ));
     }
+    if request.extension.max_tracks_per_gap.is_some() && request.extension.mode != "exact_count" {
+        return Err(CommandFailure::new(
+            "MAX_TRACKS_PER_GAP_UNSUPPORTED",
+            "extension.max_tracks_per_gap is supported only for exact_count requests",
+        ));
+    }
+    if request.extension.max_tracks_per_gap.unwrap_or(1) > 1
+        && request.route.ordering_policy != "preserve_order"
+    {
+        return Err(CommandFailure::new(
+            "MULTI_TRACK_GAPS_REQUIRE_PRESERVE_ORDER",
+            "more than one bridge per gap currently requires preserve_order",
+        ));
+    }
     let semantic_bundle = load_semantic_bundle(&request.semantic_evidence)?;
     analyze_bridge_validated(validation, request, semantic_bundle)
 }
@@ -1688,6 +1707,7 @@ mod tests {
             infeasible_exact_artifact,
             preserve_automatic_artifact,
             preserve_exact_artifact,
+            preserve_multi_track_artifact,
         ) = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
@@ -1718,6 +1738,9 @@ mod tests {
                     analyze_bridge_request(Path::new(
                         "fixtures/synthetic/preserve-exact-count-request.json",
                     )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/preserve-multi-track-gap-request.json",
+                    )),
                 )
             });
         let (
@@ -1725,6 +1748,7 @@ mod tests {
             infeasible_exact_one_worker,
             preserve_automatic_one_worker,
             preserve_exact_one_worker,
+            preserve_multi_track_one_worker,
         ) = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
@@ -1742,6 +1766,9 @@ mod tests {
                     )),
                     analyze_bridge_request(Path::new(
                         "fixtures/synthetic/preserve-exact-count-request.json",
+                    )),
+                    analyze_bridge_request(Path::new(
+                        "fixtures/synthetic/preserve-multi-track-gap-request.json",
                     )),
                 )
             });
@@ -2081,6 +2108,64 @@ mod tests {
         assert_eq!(
             preserve_repeat_conflict.code,
             "PRESERVED_ANCHOR_REPEAT_CONFLICT"
+        );
+
+        let preserve_multi_track_artifact = preserve_multi_track_artifact.unwrap();
+        let preserve_multi_track_expected =
+            include_str!("../fixtures/synthetic/expected-native-preserve-multi-track-gap-v1.json")
+                .trim();
+        assert_eq!(
+            serde_json::to_string(&preserve_multi_track_artifact).unwrap(),
+            preserve_multi_track_expected
+        );
+        assert_eq!(
+            serde_json::to_string(&preserve_multi_track_artifact).unwrap(),
+            serde_json::to_string(&preserve_multi_track_one_worker.unwrap()).unwrap()
+        );
+        assert_eq!(
+            preserve_multi_track_artifact.source_track_ids,
+            preserve_multi_track_artifact.selected_track_ids
+        );
+        let preserve_multi_track = match &preserve_multi_track_artifact.selection_preview {
+            SelectionPreviewArtifact::Exact(exact) => exact,
+            SelectionPreviewArtifact::Automatic(_) => panic!("expected exact-count preview"),
+        };
+        assert!(preserve_multi_track.feasible);
+        assert_eq!(preserve_multi_track.requested_added_tracks, 4);
+        assert_eq!(preserve_multi_track.added_track_count, 4);
+        assert_eq!(preserve_multi_track.search.max_tracks_per_gap, 2);
+        assert!(
+            preserve_multi_track.requested_added_tracks
+                > preserve_multi_track_artifact.source_track_ids.len() - 1
+        );
+        let preserve_multi_track_sequence = preserve_multi_track.final_sequence.as_ref().unwrap();
+        assert_eq!(
+            preserve_multi_track_sequence
+                .iter()
+                .filter(|entry| entry.kind == "original")
+                .map(|entry| entry.track_id.as_str())
+                .collect::<Vec<_>>(),
+            preserve_multi_track_artifact
+                .source_track_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            preserve_multi_track_sequence
+                .iter()
+                .filter(|entry| entry.kind == "bridge")
+                .map(|entry| entry.track_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bliss-row-5", "bliss-row-6", "bliss-row-8", "bliss-row-7"]
+        );
+        assert_eq!(
+            preserve_multi_track
+                .decisions
+                .iter()
+                .filter(|decision| decision.reason == preview::DecisionReason::Selected)
+                .count(),
+            4
         );
     }
 }

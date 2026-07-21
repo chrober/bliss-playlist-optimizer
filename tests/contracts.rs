@@ -94,6 +94,10 @@ fn published_examples_satisfy_their_v1_contracts() {
             "fixtures/synthetic/preserve-exact-count-request.json",
         ),
         (
+            "schemas/optimizer-request-v1.schema.json",
+            "fixtures/synthetic/preserve-multi-track-gap-request.json",
+        ),
+        (
             "schemas/semantic-evidence-v1.schema.json",
             "examples/semantic-evidence-empty.json",
         ),
@@ -144,6 +148,10 @@ fn published_examples_satisfy_their_v1_contracts() {
         (
             "schemas/bridge-analysis-artifact-v1.schema.json",
             "fixtures/synthetic/expected-native-preserve-exact-count-v1.json",
+        ),
+        (
+            "schemas/bridge-analysis-artifact-v1.schema.json",
+            "fixtures/synthetic/expected-native-preserve-multi-track-gap-v1.json",
         ),
     ] {
         assert_valid(schema, example);
@@ -226,6 +234,32 @@ fn exact_count_request_requires_the_requested_addition_count() {
 }
 
 #[test]
+fn multi_track_gap_bound_requires_exact_count_and_preserve_order() {
+    let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let example = read_json(&repository_path(
+        "fixtures/synthetic/preserve-multi-track-gap-request.json",
+    ));
+    assert!(validator.is_valid(&example));
+
+    let mut zero_bound = example.clone();
+    zero_bound["extension"]["max_tracks_per_gap"] = Value::from(0);
+    assert!(!validator.is_valid(&zero_bound));
+
+    let mut excessive_bound = example.clone();
+    excessive_bound["extension"]["max_tracks_per_gap"] = Value::from(9);
+    assert!(!validator.is_valid(&excessive_bound));
+
+    let mut automatic = example.clone();
+    automatic["extension"]["mode"] = Value::String("automatic".to_owned());
+    assert!(!validator.is_valid(&automatic));
+
+    let mut optimized = example;
+    optimized["route"]["ordering_policy"] = Value::String("optimize_order".to_owned());
+    assert!(!validator.is_valid(&optimized));
+}
+
+#[test]
 fn exact_count_contract_never_represents_infeasibility_as_a_partial_route() {
     let schema = read_json(&repository_path(
         "schemas/bridge-analysis-artifact-v1.schema.json",
@@ -277,6 +311,7 @@ fn preserve_order_artifacts_keep_source_ids_as_the_original_subsequence() {
     for path in [
         "fixtures/synthetic/expected-native-preserve-automatic-v1.json",
         "fixtures/synthetic/expected-native-preserve-exact-count-v1.json",
+        "fixtures/synthetic/expected-native-preserve-multi-track-gap-v1.json",
     ] {
         let artifact = read_json(&repository_path(path));
         assert_eq!(artifact["ordering_policy"], "preserve_order");
@@ -295,4 +330,30 @@ fn preserve_order_artifacts_keep_source_ids_as_the_original_subsequence() {
             artifact["source_track_ids"].as_array().unwrap().clone()
         );
     }
+}
+
+#[test]
+fn multi_track_gap_artifact_exceeds_the_internal_gap_count_without_partial_output() {
+    let artifact = read_json(&repository_path(
+        "fixtures/synthetic/expected-native-preserve-multi-track-gap-v1.json",
+    ));
+    let preview = &artifact["selection_preview"];
+    let source_count = artifact["source_track_ids"].as_array().unwrap().len();
+    let requested = preview["requested_added_tracks"].as_u64().unwrap() as usize;
+    assert!(requested > source_count - 1);
+    assert_eq!(
+        preview["added_track_count"].as_u64().unwrap() as usize,
+        requested
+    );
+    assert_eq!(preview["search"]["max_tracks_per_gap"], 2);
+
+    let mut selected_per_gap = std::collections::HashMap::<u64, usize>::new();
+    for decision in preview["decisions"].as_array().unwrap() {
+        if decision["reason"] == "selected" {
+            *selected_per_gap
+                .entry(decision["original_position"].as_u64().unwrap())
+                .or_default() += 1;
+        }
+    }
+    assert!(selected_per_gap.values().any(|count| *count > 1));
 }

@@ -305,13 +305,14 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "beam_width", "candidate_limit", "evaluated_states",
-        "retained_states", "maximum_additions_found",
+        "beam_width", "candidate_limit", "max_tracks_per_gap",
+        "evaluated_states", "retained_states", "maximum_additions_found",
         "structural_upper_bound"
       ],
       "properties": {
         "beam_width": { "type": "integer", "minimum": 1 },
         "candidate_limit": { "type": "integer", "minimum": 1 },
+        "max_tracks_per_gap": { "type": "integer", "minimum": 1, "maximum": 8 },
         "evaluated_states": { "type": "integer", "minimum": 1 },
         "retained_states": { "type": "integer", "minimum": 1 },
         "maximum_additions_found": { "type": "integer", "minimum": 0 },

@@ -18,6 +18,7 @@ cargo run -- bridge --request fixtures/synthetic/exact-count-request.json
 cargo run -- bridge --request fixtures/synthetic/exact-count-infeasible-request.json
 cargo run -- bridge --request fixtures/synthetic/preserve-automatic-request.json
 cargo run -- bridge --request fixtures/synthetic/preserve-exact-count-request.json
+cargo run -- bridge --request fixtures/synthetic/preserve-multi-track-gap-request.json
 ```
 
 `validate` checks both JSON schemas, declared artifact hashes, SQLite integrity
@@ -99,9 +100,22 @@ reports both the maximum count found and the structural upper bound. Only a
 request above that upper bound is labeled `EXACT_COUNT_INFEASIBLE`; failure
 inside the bound is honestly labeled
 `EXACT_COUNT_NOT_FOUND_WITHIN_SEARCH_BOUNDS`.
-The current exact-count slice permits at most one bridge in each original
-internal gap. Endpoint slots and multi-track routes inside one preserved-anchor
-gap remain future extensions.
+Exact-count requests default to one bridge in each original internal gap.
+Preserve-order requests may opt into a larger, explicit
+`extension.max_tracks_per_gap` bound from 1 through 8. The search appends
+candidates before the right anchor, so candidate order forms a small route
+inside the gap. It retains separate global beams per total addition count and a
+bounded local frontier per gap depth. The structural upper bound is the smaller
+of the unique frozen candidate count and
+`internal gaps * max_tracks_per_gap`.
+
+Every tentative append passes the existing frozen semantic pool, membership,
+repeat, and two-sided acoustic gates and causes the complete route objective to
+be recomputed. Once a route is selected, each inserted bridge is removed and
+reinserted virtually so its published two-leg diagnostics reflect its final
+neighbors and Adaptive context. All tracks in a chained gap currently come from
+the semantic pool frozen for the original anchor endpoints. Endpoint slots
+remain a future extension.
 
 With `route.ordering_policy = preserve_order`, both automatic and exact-count
 extension keep every source track in precisely its input position relative to
@@ -110,8 +124,8 @@ selected route IDs and tests their equality with the final original-track
 subsequence. Because source tracks are immutable in this mode, an input order
 that already violates an artist or album look-back window fails with
 `PRESERVED_ANCHOR_REPEAT_CONFLICT`; this slice does not misrepresent a
-single-bridge search as capable of repairing several interacting anchor
-conflicts.
+bounded gap search as capable of repairing several interacting anchor
+conflicts. Automatic mode remains limited to one bridge per gap.
 
 This remains analysis-only. Applying a preview and playlist writing are future
 slices.

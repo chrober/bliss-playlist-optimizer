@@ -23,6 +23,7 @@ cargo run -- bridge --request fixtures/synthetic/exact-count-request.json
 cargo run -- bridge --request fixtures/synthetic/exact-count-infeasible-request.json
 cargo run -- bridge --request fixtures/synthetic/preserve-automatic-request.json
 cargo run -- bridge --request fixtures/synthetic/preserve-exact-count-request.json
+cargo run -- bridge --request fixtures/synthetic/preserve-multi-track-gap-request.json
 ```
 
 The score result must exactly match `expected-native-scoring-v1.json`; its
@@ -83,6 +84,14 @@ adds `bliss-row-5`; the exact-count result adds `bliss-row-5` and
 `bliss-row-8`. Both artifacts prove that `source_track_ids`,
 `selected_track_ids`, and the final sequence filtered to original entries are
 identical, and their one-worker and four-worker serializations are byte-equal.
+
+The multi-track preserved-gap result must exactly match
+`expected-native-preserve-multi-track-gap-v1.json`. It requests four
+additions for four source anchors, so the requested count exceeds the three
+internal gaps. With `max_tracks_per_gap = 2`, it returns two bridges between
+track 11 and track 02 and two between track 02 and track 12. Every selected
+bridge is reported with diagnostics recomputed against its final neighbors.
+The one-worker and four-worker artifacts must be byte-identical.
 
 Regeneration writes the adaptive scoring request, all bridge requests, and the
 mixed semantic evidence bundle; their hashes are recorded in `manifest.json`.
