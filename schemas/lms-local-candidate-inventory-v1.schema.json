@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chrober/bliss-playlist-optimizer/schemas/lms-local-candidate-inventory-v1.schema.json",
+  "title": "Frozen LMS-local Bliss candidate inventory v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_identity",
+    "generated_at",
+    "database_cache_identity",
+    "lms_scan_time",
+    "lms_local_track_count",
+    "usable_bliss_row_count",
+    "allowed_row_ids"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "schema_identity": { "const": "lms-local-candidate-inventory-v1" },
+    "generated_at": { "type": "integer", "minimum": 0 },
+    "database_cache_identity": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "lms_scan_time": { "type": "integer", "minimum": 0 },
+    "lms_local_track_count": { "type": "integer", "minimum": 0 },
+    "usable_bliss_row_count": { "type": "integer", "minimum": 0 },
+    "allowed_row_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 1 }
+    }
+  }
+}

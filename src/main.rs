@@ -20,6 +20,8 @@ const PROGRAM: &str = "bliss-playlist-optimizer";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REQUEST_SCHEMA: &str = include_str!("../schemas/optimizer-request-v1.schema.json");
 const SEMANTIC_SCHEMA: &str = include_str!("../schemas/semantic-evidence-v1.schema.json");
+const LOCAL_CANDIDATE_INVENTORY_SCHEMA: &str =
+    include_str!("../schemas/lms-local-candidate-inventory-v1.schema.json");
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 const EXACT_COUNT_BEAM_WIDTH: usize = 64;
 const SEMANTIC_SHORTLIST_RESERVE: usize = 32;
@@ -43,6 +45,7 @@ struct Request {
 struct Artifacts {
     database: Artifact,
     learned_matrix: Option<Artifact>,
+    local_candidate_inventory: Option<Artifact>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +54,13 @@ struct Artifact {
     sha256: Option<String>,
     schema_identity: Option<String>,
     cache_identity: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalCandidateInventory {
+    schema_identity: String,
+    database_cache_identity: String,
+    allowed_row_ids: Vec<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +133,8 @@ struct ValidationSummary {
     database_schema: &'static str,
     database_sha256: String,
     learned_matrix_sha256: Option<String>,
+    local_candidate_inventory_sha256: Option<String>,
+    local_candidate_track_count: Option<usize>,
     semantic_evidence_sha256: String,
     source_track_count: usize,
 }
@@ -222,6 +234,8 @@ struct BridgeAnalysisArtifact {
     request_sha256: String,
     database_sha256: String,
     learned_matrix_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_candidate_inventory_sha256: Option<String>,
     semantic_evidence_sha256: String,
     algorithm_requested: String,
     ordering_policy: String,
@@ -235,6 +249,10 @@ struct BridgeAnalysisArtifact {
     selected_track_ids: Vec<String>,
     selected_route_objective: f64,
     usable_library_track_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_candidate_track_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    non_local_candidate_excluded_count: Option<usize>,
     eligible_candidate_count: usize,
     frozen_reference_count: usize,
     trigger_percentile: Option<f64>,
@@ -479,6 +497,7 @@ struct ValidatedRequest {
     learned_matrix: Option<Array2<f32>>,
     semantic_bundle: semantic::EvidenceBundle,
     library: Option<Vec<LibraryTrack>>,
+    local_candidate_rows: Option<HashSet<u64>>,
     database_cache: &'static str,
 }
 #[derive(Debug, Serialize)]
@@ -686,6 +705,65 @@ fn read_artifact(
     Ok((bytes, actual))
 }
 
+fn load_local_candidate_inventory(
+    artifact: &Artifact,
+    database_artifact: &Artifact,
+    library: &[LibraryTrack],
+) -> Result<(HashSet<u64>, String), CommandFailure> {
+    if artifact.schema_identity.as_deref() != Some("lms-local-candidate-inventory-v1") {
+        return Err(CommandFailure::new(
+            "CANDIDATE_INVENTORY_SCHEMA_MISMATCH",
+            "artifacts.local_candidate_inventory must declare lms-local-candidate-inventory-v1",
+        ));
+    }
+    let database_identity = database_artifact.cache_identity.as_deref().ok_or_else(|| {
+        CommandFailure::new(
+            "CANDIDATE_INVENTORY_DATABASE_IDENTITY_REQUIRED",
+            "the database cache identity is required when a local candidate inventory is supplied",
+        )
+    })?;
+    let (bytes, hash) = read_artifact(artifact, "local candidate inventory")?;
+    let value = parse_json(&bytes, "local candidate inventory")?;
+    validate_json(
+        &value,
+        LOCAL_CANDIDATE_INVENTORY_SCHEMA,
+        "local candidate inventory",
+    )?;
+    let inventory: LocalCandidateInventory = serde_json::from_value(value).map_err(|error| {
+        CommandFailure::new(
+            "CANDIDATE_INVENTORY_INVALID",
+            format!("failed to decode local candidate inventory: {error}"),
+        )
+    })?;
+    if inventory.schema_identity != "lms-local-candidate-inventory-v1" {
+        return Err(CommandFailure::new(
+            "CANDIDATE_INVENTORY_SCHEMA_MISMATCH",
+            "the local candidate inventory payload has an unsupported schema identity",
+        ));
+    }
+    if inventory.database_cache_identity != database_identity {
+        return Err(CommandFailure::new(
+            "CANDIDATE_INVENTORY_DATABASE_MISMATCH",
+            "the local candidate inventory was generated for a different bliss.db identity",
+        ));
+    }
+    let rows = inventory
+        .allowed_row_ids
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let library_rows = library
+        .iter()
+        .map(|track| track.row_id)
+        .collect::<HashSet<_>>();
+    if let Some(unknown) = rows.iter().find(|row_id| !library_rows.contains(row_id)) {
+        return Err(CommandFailure::new(
+            "CANDIDATE_INVENTORY_UNKNOWN_ROW",
+            format!("local candidate inventory contains unknown or unusable Bliss row {unknown}"),
+        ));
+    }
+    Ok((rows, hash))
+}
+
 fn validate_json(
     value: &Value,
     schema_source: &str,
@@ -816,6 +894,22 @@ fn prepare_runtime_request(
     };
 
     let started = Instant::now();
+    let (local_candidate_rows, local_candidate_inventory_sha256) =
+        if let Some(inventory) = &request.artifacts.local_candidate_inventory {
+            let (rows, hash) = load_local_candidate_inventory(
+                inventory,
+                &request.artifacts.database,
+                library
+                    .as_deref()
+                    .expect("runtime preparation always loads the library"),
+            )?;
+            (Some(rows), Some(hash))
+        } else {
+            (None, None)
+        };
+    timings.record("local_candidate_inventory_load", started.elapsed());
+
+    let started = Instant::now();
     let (learned_matrix, learned_matrix_sha256) =
         if let Some(matrix) = &request.artifacts.learned_matrix {
             let (bytes, hash) = read_artifact(matrix, "learned matrix")?;
@@ -898,11 +992,23 @@ fn prepare_runtime_request(
                 format!("duplicate Bliss file identity '{database_file}'"),
             ));
         }
-        if !file_to_index.contains_key(database_file) {
+        let Some(library_index) = file_to_index.get(database_file).copied() else {
             return Err(CommandFailure::new(
                 "TRACK_NOT_ANALYZED",
                 format!(
                     "source track '{}' is absent or ignored in the Bliss database",
+                    track.id
+                ),
+            ));
+        };
+        if local_candidate_rows
+            .as_ref()
+            .is_some_and(|rows| !rows.contains(&library[library_index].row_id))
+        {
+            return Err(CommandFailure::new(
+                "SOURCE_NOT_IN_LOCAL_CANDIDATE_INVENTORY",
+                format!(
+                    "source track '{}' is not present in the frozen LMS-local inventory",
                     track.id
                 ),
             ));
@@ -920,6 +1026,8 @@ fn prepare_runtime_request(
         database_schema: SUPPORTED_SCHEMA_IDENTITY,
         database_sha256,
         learned_matrix_sha256,
+        local_candidate_inventory_sha256,
+        local_candidate_track_count: local_candidate_rows.as_ref().map(HashSet::len),
         semantic_evidence_sha256,
         source_track_count: request.source_tracks.len(),
     };
@@ -929,6 +1037,7 @@ fn prepare_runtime_request(
         learned_matrix,
         semantic_bundle,
         library: Some(library),
+        local_candidate_rows,
         database_cache,
     })
 }
@@ -957,6 +1066,16 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
     database
         .quick_check()
         .map_err(|error| CommandFailure::new("DATABASE_INTEGRITY_FAILED", error.to_string()))?;
+
+    let (local_candidate_rows, local_candidate_inventory_sha256) =
+        if let Some(inventory) = &request.artifacts.local_candidate_inventory {
+            let library = load_usable_library(&database)?;
+            let (rows, hash) =
+                load_local_candidate_inventory(inventory, &request.artifacts.database, &library)?;
+            (Some(rows), Some(hash))
+        } else {
+            (None, None)
+        };
 
     let learned_matrix_sha256 = if let Some(matrix) = &request.artifacts.learned_matrix {
         let (_, hash) = read_artifact(matrix, "learned matrix")?;
@@ -1016,11 +1135,23 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         let row_id = database
             .usable_row_id_for_file(database_file)
             .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?;
-        if row_id.is_none() {
+        let Some(row_id) = row_id else {
             return Err(CommandFailure::new(
                 "TRACK_NOT_ANALYZED",
                 format!(
                     "source track '{}' is absent or ignored in the Bliss database",
+                    track.id
+                ),
+            ));
+        };
+        if local_candidate_rows
+            .as_ref()
+            .is_some_and(|rows| !rows.contains(&row_id))
+        {
+            return Err(CommandFailure::new(
+                "SOURCE_NOT_IN_LOCAL_CANDIDATE_INVENTORY",
+                format!(
+                    "source track '{}' is not present in the frozen LMS-local inventory",
                     track.id
                 ),
             ));
@@ -1037,6 +1168,8 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         database_schema: SUPPORTED_SCHEMA_IDENTITY,
         database_sha256,
         learned_matrix_sha256,
+        local_candidate_inventory_sha256,
+        local_candidate_track_count: local_candidate_rows.as_ref().map(HashSet::len),
         semantic_evidence_sha256,
         source_track_count: request.source_tracks.len(),
     })
@@ -1279,6 +1412,7 @@ fn optimize_route_request_with_options(
         learned_matrix,
         semantic_bundle: _,
         library,
+        local_candidate_rows: _,
         database_cache,
     } = validated;
     if request.scoring.algorithm != "adaptive" {
@@ -1445,6 +1579,7 @@ fn analyze_bridge_validated(
     semantic_bundle: semantic::EvidenceBundle,
     learned_matrix: Array2<f32>,
     library: Vec<LibraryTrack>,
+    local_candidate_rows: Option<HashSet<u64>>,
     timings: &mut StageTimings,
 ) -> Result<BridgeAnalysisArtifact, CommandFailure> {
     let adaptive = request.scoring.adaptive.as_ref().ok_or_else(|| {
@@ -1620,7 +1755,10 @@ fn analyze_bridge_validated(
         .iter()
         .enumerate()
         .filter(|(_, track)| {
-            !source_files.contains(&track.file)
+            local_candidate_rows
+                .as_ref()
+                .map_or(true, |rows| rows.contains(&track.row_id))
+                && !source_files.contains(&track.file)
                 && !source_identities.contains(&(track.artist_key.clone(), track.title_key.clone()))
         })
         .map(|(index, _)| index)
@@ -2079,6 +2217,7 @@ fn analyze_bridge_validated(
         learned_matrix_sha256: validation
             .learned_matrix_sha256
             .expect("adaptive validation requires a learned matrix"),
+        local_candidate_inventory_sha256: validation.local_candidate_inventory_sha256,
         semantic_evidence_sha256: validation.semantic_evidence_sha256,
         algorithm_requested: request.scoring.algorithm,
         ordering_policy: request.route.ordering_policy,
@@ -2096,6 +2235,10 @@ fn analyze_bridge_validated(
         selected_track_ids,
         selected_route_objective,
         usable_library_track_count: library.len(),
+        local_candidate_track_count: validation.local_candidate_track_count,
+        non_local_candidate_excluded_count: validation
+            .local_candidate_track_count
+            .map(|count| library.len().saturating_sub(count)),
         eligible_candidate_count: eligible_candidates.len(),
         frozen_reference_count: reference.len(),
         trigger_percentile,
@@ -2134,6 +2277,7 @@ fn analyze_bridge_request_with_options(
         learned_matrix,
         semantic_bundle,
         library,
+        local_candidate_rows,
         database_cache,
     } = validated;
     if request.scoring.algorithm != "adaptive" {
@@ -2216,6 +2360,7 @@ fn analyze_bridge_request_with_options(
         semantic_bundle,
         learned_matrix.expect("adaptive runtime validation requires a learned matrix"),
         library.expect("runtime validation always provides a decoded library"),
+        local_candidate_rows,
         &mut timings,
     )?;
     artifact.performance = timings.finish(options.timings, overall_started, database_cache);
@@ -2355,6 +2500,130 @@ mod tests {
         request.artifacts.database.cache_identity = Some("changed".to_owned());
         assert!(load_library_cache(&cache_dir, &request.artifacts.database).is_none());
         let _ = fs::remove_dir_all(cache_dir);
+        std::env::set_current_dir(original).unwrap();
+    }
+
+    #[test]
+    fn local_candidate_inventory_is_hash_and_database_bound() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let temporary_root = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-inventory-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temporary_root).unwrap();
+        let mut request = decode_request(Path::new(
+            "fixtures/synthetic/automatic-bridge-request.json",
+        ))
+        .unwrap();
+        request.artifacts.database.cache_identity = Some("inventory-fixture-v1".to_owned());
+        let database = BlissDatabase::open_read_only(&request.artifacts.database.path).unwrap();
+        let library = load_usable_library(&database).unwrap();
+        let allowed = vec![library[0].row_id, library[1].row_id];
+        let inventory_path = temporary_root.join("inventory.json");
+        let inventory = serde_json::json!({
+            "schema_version": 1,
+            "schema_identity": "lms-local-candidate-inventory-v1",
+            "generated_at": 1,
+            "database_cache_identity": "inventory-fixture-v1",
+            "lms_scan_time": 1,
+            "lms_local_track_count": 2,
+            "usable_bliss_row_count": library.len(),
+            "allowed_row_ids": allowed,
+        });
+        let bytes = serde_json::to_vec(&inventory).unwrap();
+        fs::write(&inventory_path, &bytes).unwrap();
+        let artifact = Artifact {
+            path: inventory_path.to_string_lossy().into_owned(),
+            sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
+            schema_identity: Some("lms-local-candidate-inventory-v1".to_owned()),
+            cache_identity: None,
+        };
+
+        let (rows, _) =
+            load_local_candidate_inventory(&artifact, &request.artifacts.database, &library)
+                .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&library[0].row_id));
+
+        request.artifacts.database.cache_identity = Some("changed".to_owned());
+        let failure =
+            load_local_candidate_inventory(&artifact, &request.artifacts.database, &library)
+                .unwrap_err();
+        assert_eq!(failure.code, "CANDIDATE_INVENTORY_DATABASE_MISMATCH");
+
+        let _ = fs::remove_dir_all(temporary_root);
+        std::env::set_current_dir(original).unwrap();
+    }
+
+    #[test]
+    fn bridge_search_excludes_every_row_outside_the_local_inventory() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let temporary_root = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-inventory-filter-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temporary_root).unwrap();
+        let mut request: Value = serde_json::from_slice(
+            &fs::read("fixtures/synthetic/preserve-automatic-request.json").unwrap(),
+        )
+        .unwrap();
+        request["artifacts"]["database"]["cache_identity"] =
+            Value::String("inventory-filter-fixture-v1".to_owned());
+        let database_path = request["artifacts"]["database"]["path"].as_str().unwrap();
+        let database = BlissDatabase::open_read_only(database_path).unwrap();
+        let library = load_usable_library(&database).unwrap();
+        let allowed = request["source_tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|track| {
+                database
+                    .usable_row_id_for_file(track["database_file"].as_str().unwrap())
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let allowed_count = allowed.len();
+        let inventory_path = temporary_root.join("inventory.json");
+        let inventory = serde_json::json!({
+            "schema_version": 1,
+            "schema_identity": "lms-local-candidate-inventory-v1",
+            "generated_at": 1,
+            "database_cache_identity": "inventory-filter-fixture-v1",
+            "lms_scan_time": 1,
+            "lms_local_track_count": allowed_count,
+            "usable_bliss_row_count": library.len(),
+            "allowed_row_ids": allowed,
+        });
+        let inventory_bytes = serde_json::to_vec(&inventory).unwrap();
+        fs::write(&inventory_path, &inventory_bytes).unwrap();
+        request["artifacts"]["local_candidate_inventory"] = serde_json::json!({
+            "path": inventory_path.to_string_lossy(),
+            "sha256": format!("{:x}", Sha256::digest(&inventory_bytes)),
+            "schema_identity": "lms-local-candidate-inventory-v1",
+        });
+        let request_path = temporary_root.join("request.json");
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+
+        let artifact = analyze_bridge_request(&request_path).unwrap();
+        assert_eq!(artifact.local_candidate_track_count, Some(allowed_count));
+        assert_eq!(artifact.eligible_candidate_count, 0);
+        assert_eq!(
+            artifact.non_local_candidate_excluded_count,
+            Some(library.len() - allowed_count)
+        );
+        match artifact.selection_preview {
+            SelectionPreviewArtifact::Automatic(preview) => {
+                assert_eq!(preview.added_track_count, 0)
+            }
+            SelectionPreviewArtifact::Exact(_) => panic!("expected automatic preview"),
+        }
+
+        let _ = fs::remove_dir_all(temporary_root);
         std::env::set_current_dir(original).unwrap();
     }
 
@@ -2555,6 +2824,7 @@ mod tests {
             conflict.semantic_bundle,
             conflict.learned_matrix.unwrap(),
             conflict.library.unwrap(),
+            conflict.local_candidate_rows,
             &mut conflict_timings,
         )
         .unwrap_err();

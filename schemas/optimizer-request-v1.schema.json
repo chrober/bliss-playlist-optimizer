@@ -25,7 +25,8 @@
       "required": ["database"],
       "properties": {
         "database": { "$ref": "#/$defs/artifact" },
-        "learned_matrix": { "$ref": "#/$defs/artifact" }
+        "learned_matrix": { "$ref": "#/$defs/artifact" },
+        "local_candidate_inventory": { "$ref": "#/$defs/artifact" }
       }
     },
     "source_tracks": {

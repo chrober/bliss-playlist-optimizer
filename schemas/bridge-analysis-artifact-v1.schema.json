@@ -27,6 +27,7 @@
     "request_sha256": { "$ref": "#/$defs/sha256" },
     "database_sha256": { "$ref": "#/$defs/sha256" },
     "learned_matrix_sha256": { "$ref": "#/$defs/sha256" },
+    "local_candidate_inventory_sha256": { "$ref": "#/$defs/sha256" },
     "semantic_evidence_sha256": { "$ref": "#/$defs/sha256" },
     "algorithm_requested": { "const": "adaptive" },
     "ordering_policy": { "enum": ["optimize_order", "preserve_order"] },
@@ -47,6 +48,8 @@
     "selected_track_ids": { "$ref": "#/$defs/track_ids" },
     "selected_route_objective": { "type": "number", "minimum": 0 },
     "usable_library_track_count": { "type": "integer", "minimum": 2 },
+    "local_candidate_track_count": { "type": "integer", "minimum": 0 },
+    "non_local_candidate_excluded_count": { "type": "integer", "minimum": 0 },
     "eligible_candidate_count": { "type": "integer", "minimum": 0 },
     "frozen_reference_count": { "type": "integer", "minimum": 1 },
     "trigger_percentile": {
