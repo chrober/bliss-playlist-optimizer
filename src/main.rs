@@ -1757,7 +1757,7 @@ fn analyze_bridge_validated(
         .filter(|(_, track)| {
             local_candidate_rows
                 .as_ref()
-                .map_or(true, |rows| rows.contains(&track.row_id))
+                .is_none_or(|rows| rows.contains(&track.row_id))
                 && !source_files.contains(&track.file)
                 && !source_identities.contains(&(track.artist_key.clone(), track.title_key.clone()))
         })
