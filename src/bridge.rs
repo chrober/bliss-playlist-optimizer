@@ -5,8 +5,6 @@ use std::fmt;
 use ndarray::Array2;
 use rayon::prelude::*;
 
-use bliss_mixer_core::scoring::adaptive_distance;
-
 use crate::contextual::{
     adaptive_distance_from_seeds, prepare_adaptive_context, ContextualError,
     PreparedAdaptiveContext,
@@ -184,17 +182,25 @@ pub fn shortlist_candidates(
     }
 
     let left_context = prepared_context(&route[..position], tracks, learned_matrix, config)?;
-    let right = &tracks[route[position]].features;
-    let mut scored = candidates
+    let attempts = candidates
         .par_iter()
         .map(|candidate| {
             let features = &tracks[*candidate].features;
             let left = left_context.distance_to(features);
-            let right = f64::from(adaptive_distance(features, right, learned_matrix));
+            let mut tentative = route.to_vec();
+            tentative.insert(position, *candidate);
+            let right = contextual_distance(
+                &tentative[..=position],
+                tentative[position + 1],
+                tracks,
+                learned_matrix,
+                config,
+            )?;
             let worst = left.max(right);
-            (*candidate, left + right + 2.0 * worst)
+            Ok((*candidate, left + right + 2.0 * worst))
         })
         .collect::<Vec<_>>();
+    let mut scored = attempts.into_iter().collect::<Result<Vec<_>, _>>()?;
     scored.sort_by(|left, right| {
         left.1
             .total_cmp(&right.1)
