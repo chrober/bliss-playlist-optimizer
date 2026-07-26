@@ -1706,9 +1706,12 @@ fn analyze_bridge_validated(
                 position,
                 &remaining,
                 shortlist_limit.saturating_sub(selected.len()),
-                &bridge_tracks,
-                &learned_matrix,
-                &bridge_config,
+                bridge::ShortlistScoringContext {
+                    tracks: &bridge_tracks,
+                    learned_matrix: &learned_matrix,
+                    config: &bridge_config,
+                    reference: &reference,
+                },
             )
             .map_err(|error| CommandFailure::new("BRIDGE_SHORTLIST_FAILED", error.to_string()))?;
             selected.extend(acoustic);

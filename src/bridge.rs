@@ -24,6 +24,13 @@ pub struct BridgeConfig {
     pub max_detour_percentile: f64,
 }
 
+pub struct ShortlistScoringContext<'a> {
+    pub tracks: &'a [RouteTrack],
+    pub learned_matrix: &'a Array2<f32>,
+    pub config: &'a BridgeConfig,
+    pub reference: &'a FrozenReference,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrozenReference {
     distances: Vec<f64>,
@@ -165,12 +172,10 @@ pub fn shortlist_candidates(
     position: usize,
     candidates: &[usize],
     limit: usize,
-    tracks: &[RouteTrack],
-    learned_matrix: &Array2<f32>,
-    config: &BridgeConfig,
+    context: ShortlistScoringContext<'_>,
 ) -> Result<Vec<usize>, BridgeError> {
-    validate_indices(route, tracks.len())?;
-    validate_indices(candidates, tracks.len())?;
+    validate_indices(route, context.tracks.len())?;
+    validate_indices(candidates, context.tracks.len())?;
     if position == 0 || position >= route.len() {
         return Err(BridgeError::InvalidGap);
     }
@@ -181,33 +186,20 @@ pub fn shortlist_candidates(
         return Ok(candidates.to_vec());
     }
 
-    let left_context = prepared_context(&route[..position], tracks, learned_matrix, config)?;
-    let attempts = candidates
-        .par_iter()
-        .map(|candidate| {
-            let features = &tracks[*candidate].features;
-            let left = left_context.distance_to(features);
-            let mut tentative = route.to_vec();
-            tentative.insert(position, *candidate);
-            let right = contextual_distance(
-                &tentative[..=position],
-                tentative[position + 1],
-                tracks,
-                learned_matrix,
-                config,
-            )?;
-            let worst = left.max(right);
-            Ok((*candidate, left + right + 2.0 * worst))
-        })
-        .collect::<Vec<_>>();
-    let mut scored = attempts.into_iter().collect::<Result<Vec<_>, _>>()?;
-    scored.sort_by(|left, right| {
-        left.1
-            .total_cmp(&right.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    scored.truncate(limit);
-    Ok(scored.into_iter().map(|(candidate, _)| candidate).collect())
+    let mut ranked = rank_candidates(
+        route,
+        position,
+        candidates,
+        context.tracks,
+        context.learned_matrix,
+        context.config,
+        context.reference,
+    )?;
+    ranked.truncate(limit);
+    Ok(ranked
+        .into_iter()
+        .map(|evaluation| evaluation.candidate)
+        .collect())
 }
 
 pub fn build_frozen_reference(
@@ -622,7 +614,18 @@ mod tests {
             .build()
             .unwrap()
             .install(|| {
-                shortlist_candidates(&route, 1, &candidates, 2, &tracks, &matrix, &config())
+                shortlist_candidates(
+                    &route,
+                    1,
+                    &candidates,
+                    2,
+                    ShortlistScoringContext {
+                        tracks: &tracks,
+                        learned_matrix: &matrix,
+                        config: &config(),
+                        reference: &reference,
+                    },
+                )
             })
             .unwrap();
         let four = rayon::ThreadPoolBuilder::new()
@@ -630,7 +633,18 @@ mod tests {
             .build()
             .unwrap()
             .install(|| {
-                shortlist_candidates(&route, 1, &candidates, 2, &tracks, &matrix, &config())
+                shortlist_candidates(
+                    &route,
+                    1,
+                    &candidates,
+                    2,
+                    ShortlistScoringContext {
+                        tracks: &tracks,
+                        learned_matrix: &matrix,
+                        config: &config(),
+                        reference: &reference,
+                    },
+                )
             })
             .unwrap();
         assert_eq!(one, four);
@@ -682,9 +696,12 @@ mod tests {
                 position,
                 &candidates,
                 128,
-                &tracks,
-                &matrix,
-                &config,
+                ShortlistScoringContext {
+                    tracks: &tracks,
+                    learned_matrix: &matrix,
+                    config: &config,
+                    reference: &reference,
+                },
             )
             .unwrap();
             retained += usize::from(shortlist.contains(&strict[0].candidate));

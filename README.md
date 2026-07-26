@@ -89,10 +89,10 @@ with Rayon.
 
 Large libraries may set `extension.shortlist_limit` to bound the candidates
 that enter strict contextual bridge scoring and exact-count search. The
-deterministic acoustic proxy reuses the exact prepared left Adaptive context and
-scores the candidate-augmented right leg with the same dynamic Adaptive rule for
-the original gap; it only narrows the pool and never replaces the final scorer
-for evolving search states or any
+deterministic shortlist reuses the strict dynamic two-leg Adaptive ranker for
+the original gap, including accepted status, worst-leg percentile, and detour
+percentile. It only narrows the pool and never replaces final rescoring for
+evolving search states or any
 semantic, repeat, membership, and acoustic gate. Up to 32 candidates carrying
 endpoint-local semantic evidence are reserved before the remaining shortlist is
 filled acoustically. Per-gap diagnostics report the shortlisted and excluded
