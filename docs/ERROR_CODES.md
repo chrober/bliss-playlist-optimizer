@@ -12,10 +12,10 @@ human-readable messages may improve without a schema-version change.
 | `MATRIX_REQUIRED` | The captured algorithm requires a learned matrix that is absent or invalid. |
 | `INFEASIBLE_REPEAT_WINDOWS` | No route satisfies the captured repeat constraints. |
 | `INFEASIBLE_EXTENSION_COUNT` | The exact requested bridge count cannot be achieved safely. |
+| `BRIDGE_SHORTLIST_FAILED` | Deterministic bridge-candidate shortlisting could not be completed. |
 | `SEMANTIC_EVIDENCE_REDUCED` | Optional semantic evidence is partial, stale, or unavailable. |
 | `CANCELLED` | The caller requested cancellation before atomic completion. |
 | `INTERNAL_ERROR` | An unexpected failure prevented a safe result. |
 
 The implementation may add codes, but must never silently reinterpret an
 existing code within schema version 1.
-

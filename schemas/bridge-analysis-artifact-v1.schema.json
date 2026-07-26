@@ -118,6 +118,8 @@
         },
         "semantic_candidate_count": { "type": "integer", "minimum": 0 },
         "semantic_excluded_count": { "type": "integer", "minimum": 0 },
+        "shortlisted_candidate_count": { "type": "integer", "minimum": 1 },
+        "acoustic_shortlist_excluded_count": { "type": "integer", "minimum": 1 },
         "evaluated_candidate_count": { "type": "integer", "minimum": 0 },
         "accepted_candidate_count": { "type": "integer", "minimum": 0 },
         "repeat_rejected_count": { "type": "integer", "minimum": 0 },

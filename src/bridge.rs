@@ -5,7 +5,12 @@ use std::fmt;
 use ndarray::Array2;
 use rayon::prelude::*;
 
-use crate::contextual::{adaptive_distance_from_seeds, ContextualError};
+use bliss_mixer_core::scoring::adaptive_distance;
+
+use crate::contextual::{
+    adaptive_distance_from_seeds, prepare_adaptive_context, ContextualError,
+    PreparedAdaptiveContext,
+};
 use crate::route::RouteTrack;
 
 pub const DEFAULT_MAX_LEG_PERCENTILE: f64 = 0.70;
@@ -139,6 +144,64 @@ fn contextual_distance(
         config.learned_percent,
     )
     .map_err(BridgeError::Scoring)
+}
+
+fn prepared_context(
+    prefix: &[usize],
+    tracks: &[RouteTrack],
+    learned_matrix: &Array2<f32>,
+    config: &BridgeConfig,
+) -> Result<PreparedAdaptiveContext, BridgeError> {
+    validate_indices(prefix, tracks.len())?;
+    let seed_start = prefix.len().saturating_sub(config.seed_limit);
+    let seeds = prefix[seed_start..]
+        .iter()
+        .map(|index| tracks[*index].features)
+        .collect::<Vec<_>>();
+    prepare_adaptive_context(&seeds, learned_matrix, config.learned_percent)
+        .map_err(BridgeError::Scoring)
+}
+
+pub fn shortlist_candidates(
+    route: &[usize],
+    position: usize,
+    candidates: &[usize],
+    limit: usize,
+    tracks: &[RouteTrack],
+    learned_matrix: &Array2<f32>,
+    config: &BridgeConfig,
+) -> Result<Vec<usize>, BridgeError> {
+    validate_indices(route, tracks.len())?;
+    validate_indices(candidates, tracks.len())?;
+    if position == 0 || position >= route.len() {
+        return Err(BridgeError::InvalidGap);
+    }
+    if limit == 0 || candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    if candidates.len() <= limit {
+        return Ok(candidates.to_vec());
+    }
+
+    let left_context = prepared_context(&route[..position], tracks, learned_matrix, config)?;
+    let right = &tracks[route[position]].features;
+    let mut scored = candidates
+        .par_iter()
+        .map(|candidate| {
+            let features = &tracks[*candidate].features;
+            let left = left_context.distance_to(features);
+            let right = f64::from(adaptive_distance(features, right, learned_matrix));
+            let worst = left.max(right);
+            (*candidate, left + right + 2.0 * worst)
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        left.1
+            .total_cmp(&right.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    scored.truncate(limit);
+    Ok(scored.into_iter().map(|(candidate, _)| candidate).collect())
 }
 
 pub fn build_frozen_reference(
@@ -296,18 +359,44 @@ pub fn rank_candidates(
     config: &BridgeConfig,
     reference: &FrozenReference,
 ) -> Result<Vec<BridgeCandidateEvaluation>, BridgeError> {
+    validate_indices(route, tracks.len())?;
+    validate_indices(candidates, tracks.len())?;
+    if position == 0 || position >= route.len() {
+        return Err(BridgeError::InvalidGap);
+    }
+    let left_context = prepared_context(&route[..position], tracks, learned_matrix, config)?;
     let attempts = candidates
         .par_iter()
         .map(|candidate| {
-            evaluate_candidate(
-                route,
-                position,
-                *candidate,
+            let mut tentative = route.to_vec();
+            tentative.insert(position, *candidate);
+            let left_distance = left_context.distance_to(&tracks[*candidate].features);
+            let right_distance = contextual_distance(
+                &tentative[..=position],
+                tentative[position + 1],
                 tracks,
                 learned_matrix,
                 config,
-                reference,
-            )
+            )?;
+            let left_percentile = reference.percentile(left_distance)?;
+            let right_percentile = reference.percentile(right_distance)?;
+            let max_percentile = left_percentile.max(right_percentile);
+            let detour_percentile = left_percentile + right_percentile;
+            let repeat_safe = !route.contains(candidate) && repeat_safe(&tentative, tracks, config);
+            let accepted = repeat_safe
+                && max_percentile <= config.max_leg_percentile
+                && detour_percentile <= config.max_detour_percentile;
+            Ok(BridgeCandidateEvaluation {
+                candidate: *candidate,
+                left_distance,
+                right_distance,
+                left_percentile,
+                right_percentile,
+                max_percentile,
+                detour_percentile,
+                repeat_safe,
+                accepted,
+            })
         })
         .collect::<Vec<_>>();
     let mut evaluations = attempts.into_iter().collect::<Result<Vec<_>, _>>()?;
@@ -502,6 +591,102 @@ mod tests {
         assert_eq!(one, four);
         assert_eq!(one[0].candidate, 1);
         assert!(one[0].accepted);
+    }
+
+    #[test]
+    fn acoustic_shortlist_is_worker_deterministic_and_retains_the_strict_winner() {
+        let tracks = tracks();
+        let route = [0, 2, 4];
+        let matrix = Array2::eye(23);
+        let reference =
+            build_frozen_reference(&route, &route, &tracks, &matrix, &config()).unwrap();
+        let candidates = [5, 3, 1];
+        let exhaustive = rank_candidates(
+            &route,
+            1,
+            &candidates,
+            &tracks,
+            &matrix,
+            &config(),
+            &reference,
+        )
+        .unwrap();
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                shortlist_candidates(&route, 1, &candidates, 2, &tracks, &matrix, &config())
+            })
+            .unwrap();
+        let four = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                shortlist_candidates(&route, 1, &candidates, 2, &tracks, &matrix, &config())
+            })
+            .unwrap();
+        assert_eq!(one, four);
+        assert!(one.contains(&exhaustive[0].candidate));
+    }
+
+    #[test]
+    fn acoustic_shortlist_has_high_strict_winner_recall_on_contextual_corpus() {
+        let tracks = (0..768)
+            .map(|track_index| RouteTrack {
+                features: std::array::from_fn(|feature_index| {
+                    let x = track_index as f32 * 0.017 + feature_index as f32 * 0.113;
+                    x.sin() + (x * 0.37).cos() * 0.4 + track_index as f32 / 4096.0
+                }),
+                artist_key: format!("artist-{track_index}"),
+                album_key: format!("album-{track_index}"),
+            })
+            .collect::<Vec<_>>();
+        let matrix = Array2::eye(23);
+        let config = BridgeConfig {
+            seed_limit: 3,
+            learned_percent: 20,
+            artist_window: 0,
+            album_window: 0,
+            max_leg_percentile: 1.0,
+            max_detour_percentile: 2.0,
+        };
+        let candidates = (64..tracks.len()).collect::<Vec<_>>();
+        let mut retained = 0usize;
+        let trials = 16usize;
+        for trial in 0..trials {
+            let base = trial * 3;
+            let route = [base, base + 7, base + 19, base + 31];
+            let position = 1 + trial % 3;
+            let reference =
+                build_frozen_reference(&route, &route, &tracks, &matrix, &config).unwrap();
+            let strict = rank_candidates(
+                &route,
+                position,
+                &candidates,
+                &tracks,
+                &matrix,
+                &config,
+                &reference,
+            )
+            .unwrap();
+            let shortlist = shortlist_candidates(
+                &route,
+                position,
+                &candidates,
+                128,
+                &tracks,
+                &matrix,
+                &config,
+            )
+            .unwrap();
+            retained += usize::from(shortlist.contains(&strict[0].candidate));
+        }
+        assert!(
+            retained >= 15,
+            "strict winner retained in {retained} of {trials} trials"
+        );
     }
 
     #[test]

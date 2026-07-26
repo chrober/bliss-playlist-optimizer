@@ -22,6 +22,7 @@ const REQUEST_SCHEMA: &str = include_str!("../schemas/optimizer-request-v1.schem
 const SEMANTIC_SCHEMA: &str = include_str!("../schemas/semantic-evidence-v1.schema.json");
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 const EXACT_COUNT_BEAM_WIDTH: usize = 64;
+const SEMANTIC_SHORTLIST_RESERVE: usize = 32;
 const LIBRARY_CACHE_VERSION: u8 = 1;
 const MAX_LIBRARY_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v1\n";
@@ -109,6 +110,7 @@ struct ExtensionSettings {
     max_tracks_per_gap: Option<usize>,
     max_added_tracks: Option<usize>,
     trigger_percentile: Option<f64>,
+    shortlist_limit: Option<usize>,
 }
 #[derive(Debug, Serialize)]
 struct ValidationSummary {
@@ -271,6 +273,10 @@ struct BridgeGapArtifact {
     semantic_pool: semantic::SemanticPool,
     semantic_candidate_count: usize,
     semantic_excluded_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shortlisted_candidate_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acoustic_shortlist_excluded_count: Option<usize>,
     evaluated_candidate_count: usize,
     accepted_candidate_count: usize,
     repeat_rejected_count: usize,
@@ -1455,6 +1461,7 @@ fn analyze_bridge_validated(
         .extension
         .candidate_limit
         .unwrap_or(DEFAULT_RETAINED_CANDIDATES);
+    let shortlist_limit = request.extension.shortlist_limit.unwrap_or(usize::MAX);
     let (max_added_tracks, trigger_percentile, requested_exact_count) =
         match request.extension.mode.as_str() {
             "automatic" => (
@@ -1646,7 +1653,8 @@ fn analyze_bridge_validated(
     .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
     timings.record("frozen_reference", started.elapsed());
 
-    let started = Instant::now();
+    let mut shortlist_elapsed = Duration::ZERO;
+    let mut strict_scoring_elapsed = Duration::ZERO;
     let mut gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut preview_gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut semantic_assisted = false;
@@ -1662,7 +1670,7 @@ fn analyze_bridge_validated(
         .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
         let left_source_index = selected_local_route[position - 1];
         let right_source_index = selected_local_route[position];
-        let gap_semantics = semantic::select_gap_candidates(
+        let mut gap_semantics = semantic::select_gap_candidates(
             &semantic_bundle,
             &source_semantic_identities[left_source_index],
             &source_semantic_identities[right_source_index],
@@ -1670,6 +1678,46 @@ fn analyze_bridge_validated(
             &semantic_candidates,
         );
         semantic_assisted |= gap_semantics.pool != semantic::SemanticPool::BlissOnly;
+        let semantic_candidate_count = gap_semantics.candidates.len();
+        let shortlist_started = Instant::now();
+        if gap_semantics.candidates.len() > shortlist_limit {
+            let mut reserved = gap_semantics
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.tier != semantic::SemanticTier::BlissOnly)
+                .collect::<Vec<_>>();
+            reserved.sort_by(|left, right| {
+                left.compare_priority(right)
+                    .then_with(|| left.candidate.cmp(&right.candidate))
+            });
+            reserved.truncate(SEMANTIC_SHORTLIST_RESERVE.min(shortlist_limit));
+            let mut selected = reserved
+                .iter()
+                .map(|candidate| candidate.candidate)
+                .collect::<HashSet<_>>();
+            let remaining = gap_semantics
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate)
+                .filter(|candidate| !selected.contains(candidate))
+                .collect::<Vec<_>>();
+            let acoustic = bridge::shortlist_candidates(
+                &selected_library_route,
+                position,
+                &remaining,
+                shortlist_limit.saturating_sub(selected.len()),
+                &bridge_tracks,
+                &learned_matrix,
+                &bridge_config,
+            )
+            .map_err(|error| CommandFailure::new("BRIDGE_SHORTLIST_FAILED", error.to_string()))?;
+            selected.extend(acoustic);
+            gap_semantics
+                .candidates
+                .retain(|candidate| selected.contains(&candidate.candidate));
+        }
+        shortlist_elapsed += shortlist_started.elapsed();
+        let shortlisted_candidate_count = gap_semantics.candidates.len();
         preview_gaps.push(preview::AutomaticGap {
             original_position: position,
             left: selected_library_route[position - 1],
@@ -1688,6 +1736,7 @@ fn analyze_bridge_validated(
             .iter()
             .map(|candidate| candidate.candidate)
             .collect::<Vec<_>>();
+        let scoring_started = Instant::now();
         let mut evaluations = bridge::rank_candidates(
             &selected_library_route,
             position,
@@ -1698,6 +1747,7 @@ fn analyze_bridge_validated(
             &reference,
         )
         .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
+        strict_scoring_elapsed += scoring_started.elapsed();
         evaluations.sort_by(|left, right| {
             right
                 .accepted
@@ -1740,8 +1790,13 @@ fn analyze_bridge_validated(
             direct_percentile: gap.direct_percentile,
             triggering: trigger_percentile.map(|threshold| gap.direct_percentile > threshold),
             semantic_pool: gap_semantics.pool,
-            semantic_candidate_count: gap_candidate_indices.len(),
-            semantic_excluded_count: eligible_candidates.len() - gap_candidate_indices.len(),
+            semantic_candidate_count,
+            semantic_excluded_count: eligible_candidates.len() - semantic_candidate_count,
+            shortlisted_candidate_count: (shortlisted_candidate_count < semantic_candidate_count)
+                .then_some(shortlisted_candidate_count),
+            acoustic_shortlist_excluded_count: (shortlisted_candidate_count
+                < semantic_candidate_count)
+                .then_some(semantic_candidate_count - shortlisted_candidate_count),
             evaluated_candidate_count: evaluations.len(),
             accepted_candidate_count,
             repeat_rejected_count,
@@ -1749,7 +1804,8 @@ fn analyze_bridge_validated(
             accepted_candidates,
         });
     }
-    timings.record("gap_candidate_scoring", started.elapsed());
+    timings.record("gap_candidate_shortlisting", shortlist_elapsed);
+    timings.record("gap_candidate_scoring", strict_scoring_elapsed);
 
     let original_ids_by_library = selected_local_route
         .iter()
@@ -2347,6 +2403,48 @@ mod tests {
             serde_json::to_string(&cold).unwrap(),
             serde_json::to_string(&warm).unwrap()
         );
+
+        let _ = fs::remove_dir_all(temporary_root);
+        std::env::set_current_dir(original).unwrap();
+    }
+
+    #[test]
+    fn shortlisted_bridge_preview_matches_exhaustive_fixture_selection() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let temporary_root = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-shortlist-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temporary_root).unwrap();
+        let source = Path::new("fixtures/synthetic/automatic-bridge-request.json");
+        let exhaustive = analyze_bridge_request(source).unwrap();
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"]["shortlist_limit"] = Value::from(5);
+        let request_path = temporary_root.join("request.json");
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let shortlisted = analyze_bridge_request(&request_path).unwrap();
+
+        let exhaustive_json = serde_json::to_value(&exhaustive).unwrap();
+        let shortlisted_json = serde_json::to_value(&shortlisted).unwrap();
+        assert_eq!(
+            exhaustive_json["selection_preview"]["final_sequence"],
+            shortlisted_json["selection_preview"]["final_sequence"]
+        );
+        assert_eq!(
+            exhaustive_json["selection_preview"]["added_track_count"],
+            shortlisted_json["selection_preview"]["added_track_count"]
+        );
+        assert_eq!(
+            exhaustive.selected_route_objective,
+            shortlisted.selected_route_objective
+        );
+        assert!(shortlisted.gaps.iter().all(|gap| {
+            gap.shortlisted_candidate_count == Some(5)
+                && gap.acoustic_shortlist_excluded_count == Some(1)
+                && gap.evaluated_candidate_count == 5
+        }));
 
         let _ = fs::remove_dir_all(temporary_root);
         std::env::set_current_dir(original).unwrap();

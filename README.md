@@ -87,6 +87,17 @@ aggregate rejection counts, and a bounded list of accepted candidates per gap;
 it exposes no library paths. Independent candidates are ranked deterministically
 with Rayon.
 
+Large libraries may set `extension.shortlist_limit` to bound the candidates
+that enter strict contextual bridge scoring and exact-count search. The
+deterministic acoustic proxy reuses the exact prepared left Adaptive context and
+combines it with the learned-matrix distance into the right anchor; it only
+narrows the pool and never replaces the final two-sided Adaptive scorer or any
+semantic, repeat, membership, and acoustic gate. Up to 32 candidates carrying
+endpoint-local semantic evidence are reserved before the remaining shortlist is
+filled acoustically. Per-gap diagnostics report the shortlisted and excluded
+counts when narrowing occurred. Omitting the field preserves exhaustive
+evaluation; the LMS plugin currently uses a conservative limit of 256.
+
 The bridge command consumes a frozen provider-neutral evidence graph. Recording
 support for both or one endpoint precedes endpoint-local artist support. When
 any usable endpoint-local evidence exists, collection and Bliss-only candidates
