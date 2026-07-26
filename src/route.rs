@@ -8,6 +8,7 @@ use ndarray::Array2;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::contextual::adaptive_distance_from_seeds;
 
@@ -20,7 +21,7 @@ const EPSILON: f64 = 1e-12;
 
 type ScoreCache = HashMap<(Vec<usize>, usize), f64>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RouteTrack {
     pub features: FeatureVector,
     pub artist_key: String,

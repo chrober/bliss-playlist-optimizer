@@ -34,7 +34,8 @@
     "selected_track_ids": { "$ref": "#/$defs/track_ids" },
     "primary": { "$ref": "#/$defs/candidate" },
     "arc": { "$ref": "#/$defs/candidate" },
-    "repeat_validation": { "$ref": "#/$defs/repeat_validation" }
+    "repeat_validation": { "$ref": "#/$defs/repeat_validation" },
+    "performance": { "$ref": "#/$defs/performance" }
   },
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
@@ -85,6 +86,28 @@
           "maxItems": 2,
           "items": { "type": "integer", "minimum": 0 }
         }
+      }
+    },
+    "performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_ms", "database_cache", "stages"],
+      "properties": {
+        "total_ms": { "type": "integer", "minimum": 0 },
+        "database_cache": { "enum": ["disabled", "miss", "hit"] },
+        "stages": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/stage_timing" }
+        }
+      }
+    },
+    "stage_timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "elapsed_ms"],
+      "properties": {
+        "stage": { "type": "string", "minLength": 1 },
+        "elapsed_ms": { "type": "integer", "minimum": 0 }
       }
     }
   }

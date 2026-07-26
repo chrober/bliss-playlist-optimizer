@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use bincode::Options;
 use bliss_mixer_core::database::{BlissDatabase, SUPPORTED_SCHEMA_IDENTITY};
 use bliss_mixer_core::scoring::score_adaptive_sequence;
+use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -18,6 +22,9 @@ const REQUEST_SCHEMA: &str = include_str!("../schemas/optimizer-request-v1.schem
 const SEMANTIC_SCHEMA: &str = include_str!("../schemas/semantic-evidence-v1.schema.json");
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 const EXACT_COUNT_BEAM_WIDTH: usize = 64;
+const LIBRARY_CACHE_VERSION: u8 = 1;
+const MAX_LIBRARY_CACHE_BYTES: u64 = 512 * 1024 * 1024;
+const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v1\n";
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -42,6 +49,7 @@ struct Artifact {
     path: String,
     sha256: Option<String>,
     schema_identity: Option<String>,
+    cache_identity: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +182,8 @@ struct RouteArtifact {
     primary: RouteCandidateArtifact,
     arc: RouteCandidateArtifact,
     repeat_validation: RepeatValidationArtifact,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    performance: Option<PerformanceArtifact>,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,6 +243,21 @@ struct BridgeAnalysisArtifact {
     provider_states: Vec<semantic::ProviderState>,
     gaps: Vec<BridgeGapArtifact>,
     selection_preview: SelectionPreviewArtifact,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    performance: Option<PerformanceArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct PerformanceArtifact {
+    total_ms: u64,
+    database_cache: &'static str,
+    stages: Vec<StageTimingArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct StageTimingArtifact {
+    stage: &'static str,
+    elapsed_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -383,12 +408,72 @@ struct PreviewDecisionArtifact {
     selected_bridge: Option<BridgeCandidateArtifact>,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct LibraryTrack {
     row_id: u64,
     file: String,
     artist_key: String,
     title_key: String,
     route_track: route::RouteTrack,
+}
+
+#[derive(Deserialize, Serialize)]
+struct LibraryCache {
+    format_version: u8,
+    database_path: String,
+    database_identity: String,
+    database_sha256: String,
+    library: Vec<LibraryTrack>,
+}
+
+struct RuntimeOptions {
+    timings: bool,
+    cache_dir: Option<PathBuf>,
+}
+
+impl RuntimeOptions {
+    fn disabled() -> Self {
+        Self {
+            timings: false,
+            cache_dir: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct StageTimings {
+    stages: Vec<StageTimingArtifact>,
+}
+
+impl StageTimings {
+    fn record(&mut self, stage: &'static str, elapsed: Duration) {
+        self.stages.push(StageTimingArtifact {
+            stage,
+            elapsed_ms: elapsed.as_millis() as u64,
+        });
+    }
+
+    fn finish(
+        self,
+        enabled: bool,
+        started: Instant,
+        database_cache: &'static str,
+    ) -> Option<PerformanceArtifact> {
+        enabled.then(|| PerformanceArtifact {
+            total_ms: started.elapsed().as_millis() as u64,
+            database_cache,
+            stages: self.stages,
+        })
+    }
+}
+
+struct ValidatedRequest {
+    summary: ValidationSummary,
+    request: Request,
+    learned_matrix: Option<Array2<f32>>,
+    semantic_bundle: semantic::EvidenceBundle,
+    library: Option<Vec<LibraryTrack>>,
+    database_cache: &'static str,
 }
 #[derive(Debug, Serialize)]
 struct CommandFailure {
@@ -410,7 +495,33 @@ impl CommandFailure {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>\n  bliss-playlist-optimizer route --request <request.json>\n  bliss-playlist-optimizer bridge --request <request.json>"
+    "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>\n  bliss-playlist-optimizer route --request <request.json> [--timings] [--cache-dir <directory>]\n  bliss-playlist-optimizer bridge --request <request.json> [--timings] [--cache-dir <directory>]"
+}
+
+fn parse_request_command(args: &[String]) -> Option<(&str, &Path, RuntimeOptions)> {
+    if args.len() < 3 || args[1] != "--request" {
+        return None;
+    }
+    let command = args[0].as_str();
+    if !matches!(command, "validate" | "score" | "route" | "bridge") {
+        return None;
+    }
+    let mut options = RuntimeOptions::disabled();
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--timings" if !options.timings => {
+                options.timings = true;
+                index += 1;
+            }
+            "--cache-dir" if options.cache_dir.is_none() && index + 1 < args.len() => {
+                options.cache_dir = Some(PathBuf::from(&args[index + 1]));
+                index += 2;
+            }
+            _ => return None,
+        }
+    }
+    Some((command, Path::new(&args[2]), options))
 }
 
 fn default_parallel_workers(available: usize) -> usize {
@@ -429,6 +540,121 @@ fn configure_parallelism() {
         .build_global()
         .expect("Rayon pool must be configured before scoring starts");
 }
+
+fn hash_artifact(artifact: &Artifact, kind: &'static str) -> Result<String, CommandFailure> {
+    let file = File::open(&artifact.path).map_err(|error| {
+        CommandFailure::new(
+            "ARTIFACT_UNREADABLE",
+            format!("cannot read {kind} artifact '{}': {error}", artifact.path),
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).map_err(|error| {
+            CommandFailure::new(
+                "ARTIFACT_UNREADABLE",
+                format!("cannot read {kind} artifact '{}': {error}", artifact.path),
+            )
+        })?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let actual = format!("{:x}", digest.finalize());
+    verify_artifact_hash(artifact, kind, &actual)?;
+    Ok(actual)
+}
+
+fn verify_artifact_hash(
+    artifact: &Artifact,
+    kind: &'static str,
+    actual: &str,
+) -> Result<(), CommandFailure> {
+    if let Some(expected) = &artifact.sha256 {
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(CommandFailure::new(
+                "ARTIFACT_HASH_MISMATCH",
+                format!(
+                    "{kind} artifact '{}' does not match its declared SHA-256",
+                    artifact.path
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn library_cache_path(cache_dir: &Path, database_path: &str) -> PathBuf {
+    let key = format!("{:x}", Sha256::digest(database_path.as_bytes()));
+    cache_dir.join(format!("library-{key}.bin"))
+}
+
+fn load_library_cache(cache_dir: &Path, artifact: &Artifact) -> Option<LibraryCache> {
+    let identity = artifact.cache_identity.as_deref()?;
+    let path = library_cache_path(cache_dir, &artifact.path);
+    let metadata = fs::metadata(&path).ok()?;
+    if metadata.len() > MAX_LIBRARY_CACHE_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let encoded = bytes.strip_prefix(LIBRARY_CACHE_MAGIC)?;
+    if encoded.len() < 65 || encoded[64] != b'\n' {
+        return None;
+    }
+    let declared_hash = std::str::from_utf8(&encoded[..64]).ok()?;
+    let payload = &encoded[65..];
+    let actual_hash = format!("{:x}", Sha256::digest(payload));
+    if !actual_hash.eq_ignore_ascii_case(declared_hash) {
+        return None;
+    }
+    let cache: LibraryCache = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(MAX_LIBRARY_CACHE_BYTES)
+        .deserialize(payload)
+        .ok()?;
+    if cache.format_version != LIBRARY_CACHE_VERSION
+        || cache.database_path != artifact.path
+        || cache.database_identity != identity
+        || verify_artifact_hash(artifact, "database", &cache.database_sha256).is_err()
+    {
+        return None;
+    }
+    Some(cache)
+}
+
+fn store_library_cache(cache_dir: &Path, artifact: &Artifact, cache: &LibraryCache) {
+    if artifact.cache_identity.is_none() || fs::create_dir_all(cache_dir).is_err() {
+        return;
+    }
+    let Ok(payload) = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .serialize(cache)
+    else {
+        return;
+    };
+    if payload.len() as u64 > MAX_LIBRARY_CACHE_BYTES {
+        return;
+    }
+    let payload_hash = format!("{:x}", Sha256::digest(&payload));
+    let mut bytes = Vec::with_capacity(LIBRARY_CACHE_MAGIC.len() + 65 + payload.len());
+    bytes.extend_from_slice(LIBRARY_CACHE_MAGIC);
+    bytes.extend_from_slice(payload_hash.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(&payload);
+    let destination = library_cache_path(cache_dir, &artifact.path);
+    let temporary = destination.with_extension(format!("tmp-{}", std::process::id()));
+    if fs::write(&temporary, bytes).is_err() {
+        return;
+    }
+    if fs::rename(&temporary, &destination).is_err() {
+        let _ = fs::remove_file(&destination);
+        let _ = fs::rename(&temporary, &destination);
+    }
+}
+
 fn read_artifact(
     artifact: &Artifact,
     kind: &'static str,
@@ -493,6 +719,211 @@ fn decode_request(path: &Path) -> Result<Request, CommandFailure> {
     validate_json(&request_value, REQUEST_SCHEMA, "request")?;
     serde_json::from_value(request_value).map_err(|error| {
         CommandFailure::new("INVALID_REQUEST", format!("cannot decode request: {error}"))
+    })
+}
+
+fn decode_request_once(path: &Path) -> Result<(Request, String), CommandFailure> {
+    let request_bytes = fs::read(path).map_err(|error| {
+        CommandFailure::new(
+            "REQUEST_UNREADABLE",
+            format!("cannot read request '{}': {error}", path.display()),
+        )
+    })?;
+    let request_sha256 = format!("{:x}", Sha256::digest(&request_bytes));
+    let request_value = parse_json(&request_bytes, "request")?;
+    validate_json(&request_value, REQUEST_SCHEMA, "request")?;
+    let request = serde_json::from_value(request_value).map_err(|error| {
+        CommandFailure::new("INVALID_REQUEST", format!("cannot decode request: {error}"))
+    })?;
+    Ok((request, request_sha256))
+}
+
+fn prepare_runtime_request(
+    path: &Path,
+    options: &RuntimeOptions,
+    timings: &mut StageTimings,
+) -> Result<ValidatedRequest, CommandFailure> {
+    let started = Instant::now();
+    let (request, request_sha256) = decode_request_once(path)?;
+    timings.record("request_decode", started.elapsed());
+
+    if let Some(identity) = &request.artifacts.database.schema_identity {
+        if identity != "TracksV2" && identity != SUPPORTED_SCHEMA_IDENTITY {
+            return Err(CommandFailure::new(
+                "DATABASE_SCHEMA_MISMATCH",
+                format!("unsupported database schema identity '{identity}'"),
+            ));
+        }
+    }
+
+    let started = Instant::now();
+    let cached = options
+        .cache_dir
+        .as_deref()
+        .and_then(|cache_dir| load_library_cache(cache_dir, &request.artifacts.database));
+    timings.record("database_cache_read", started.elapsed());
+
+    let (database_sha256, library, database_cache) = if let Some(cache) = cached {
+        (cache.database_sha256, Some(cache.library), "hit")
+    } else {
+        let started = Instant::now();
+        let database_sha256 = hash_artifact(&request.artifacts.database, "database")?;
+        timings.record("database_hash", started.elapsed());
+
+        let started = Instant::now();
+        let database = BlissDatabase::open_read_only(&request.artifacts.database.path)
+            .map_err(|error| CommandFailure::new("DATABASE_INVALID", error.to_string()))?;
+        database
+            .quick_check()
+            .map_err(|error| CommandFailure::new("DATABASE_INTEGRITY_FAILED", error.to_string()))?;
+        timings.record("database_open_and_integrity", started.elapsed());
+
+        let started = Instant::now();
+        let library = load_usable_library(&database)?;
+        timings.record("library_decode", started.elapsed());
+
+        if let (Some(cache_dir), Some(identity)) = (
+            options.cache_dir.as_deref(),
+            request.artifacts.database.cache_identity.as_deref(),
+        ) {
+            let started = Instant::now();
+            store_library_cache(
+                cache_dir,
+                &request.artifacts.database,
+                &LibraryCache {
+                    format_version: LIBRARY_CACHE_VERSION,
+                    database_path: request.artifacts.database.path.clone(),
+                    database_identity: identity.to_owned(),
+                    database_sha256: database_sha256.clone(),
+                    library: library.clone(),
+                },
+            );
+            timings.record("database_cache_write", started.elapsed());
+        }
+        let cache_state =
+            if options.cache_dir.is_some() && request.artifacts.database.cache_identity.is_some() {
+                "miss"
+            } else {
+                "disabled"
+            };
+        (database_sha256, Some(library), cache_state)
+    };
+
+    let started = Instant::now();
+    let (learned_matrix, learned_matrix_sha256) =
+        if let Some(matrix) = &request.artifacts.learned_matrix {
+            let (bytes, hash) = read_artifact(matrix, "learned matrix")?;
+            let text = std::str::from_utf8(&bytes).map_err(|error| {
+                CommandFailure::new("MATRIX_INVALID", format!("matrix is not UTF-8: {error}"))
+            })?;
+            let parsed = bliss_mixer_core::matrix::parse_learned_matrix(text)
+                .map_err(|error| CommandFailure::new("MATRIX_INVALID", error.to_string()))?;
+            (Some(parsed), Some(hash))
+        } else {
+            if matches!(
+                request.scoring.algorithm.as_str(),
+                "learned_matrix" | "adaptive"
+            ) {
+                return Err(CommandFailure::new(
+                    "MATRIX_REQUIRED",
+                    format!(
+                        "{} scoring requires artifacts.learned_matrix",
+                        request.scoring.algorithm
+                    ),
+                ));
+            }
+            (None, None)
+        };
+    timings.record("learned_matrix_load", started.elapsed());
+
+    if let Some(identity) = &request.semantic_evidence.schema_identity {
+        if identity != "semantic-evidence-v1" {
+            return Err(CommandFailure::new(
+                "SEMANTIC_SCHEMA_MISMATCH",
+                format!("unsupported semantic evidence schema identity '{identity}'"),
+            ));
+        }
+    }
+    let started = Instant::now();
+    let (semantic_bytes, semantic_evidence_sha256) =
+        read_artifact(&request.semantic_evidence, "semantic evidence")?;
+    let semantic_value = parse_json(&semantic_bytes, "semantic evidence")?;
+    validate_json(&semantic_value, SEMANTIC_SCHEMA, "semantic evidence")?;
+    let semantic_bundle: semantic::EvidenceBundle = serde_json::from_value(semantic_value)
+        .map_err(|error| {
+            CommandFailure::new(
+                "SEMANTIC_EVIDENCE_INVALID",
+                format!("failed to decode semantic evidence: {error}"),
+            )
+        })?;
+    semantic_bundle.validate().map_err(|error| {
+        CommandFailure::new(
+            "SEMANTIC_EVIDENCE_INVALID",
+            format!("invalid semantic evidence: {error}"),
+        )
+    })?;
+    timings.record("semantic_evidence_load", started.elapsed());
+
+    let started = Instant::now();
+    let library = library.expect("runtime preparation always loads the library");
+    let file_to_index = library
+        .iter()
+        .enumerate()
+        .map(|(index, track)| (track.file.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut source_ids = HashSet::new();
+    let mut database_files = HashSet::new();
+    for track in &request.source_tracks {
+        if !source_ids.insert(track.id.as_str()) {
+            return Err(CommandFailure::new(
+                "DUPLICATE_SOURCE_TRACK",
+                format!("duplicate source track id '{}'", track.id),
+            ));
+        }
+        let database_file = track.database_file.as_deref().ok_or_else(|| {
+            CommandFailure::new(
+                "TRACK_IDENTITY_INCOMPLETE",
+                format!("source track '{}' has no database_file identity", track.id),
+            )
+        })?;
+        if !database_files.insert(database_file) {
+            return Err(CommandFailure::new(
+                "DUPLICATE_SOURCE_TRACK",
+                format!("duplicate Bliss file identity '{database_file}'"),
+            ));
+        }
+        if !file_to_index.contains_key(database_file) {
+            return Err(CommandFailure::new(
+                "TRACK_NOT_ANALYZED",
+                format!(
+                    "source track '{}' is absent or ignored in the Bliss database",
+                    track.id
+                ),
+            ));
+        }
+    }
+    timings.record("source_resolution", started.elapsed());
+
+    let summary = ValidationSummary {
+        schema_version: 1,
+        program: PROGRAM,
+        version: VERSION,
+        job_id: request.job_id.clone(),
+        valid: true,
+        request_sha256,
+        database_schema: SUPPORTED_SCHEMA_IDENTITY,
+        database_sha256,
+        learned_matrix_sha256,
+        semantic_evidence_sha256,
+        source_track_count: request.source_tracks.len(),
+    };
+    Ok(ValidatedRequest {
+        summary,
+        request,
+        learned_matrix,
+        semantic_bundle,
+        library: Some(library),
+        database_cache,
     })
 }
 
@@ -727,20 +1158,14 @@ fn score_request(path: &Path) -> Result<ScoringArtifact, CommandFailure> {
 }
 
 fn load_usable_library(database: &BlissDatabase) -> Result<Vec<LibraryTrack>, CommandFailure> {
-    let metrics = database
-        .all_raw_metrics()
+    let tracks = database
+        .all_usable_tracks()
         .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?;
-    let mut library = Vec::with_capacity(metrics.len());
-    for (row_id, features) in metrics {
-        let metadata = database
-            .metadata(row_id)
-            .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?
-            .ok_or_else(|| {
-                CommandFailure::new(
-                    "TRACK_METADATA_MISSING",
-                    format!("usable Bliss row {row_id} has no metadata"),
-                )
-            })?;
+    let mut library = Vec::with_capacity(tracks.len());
+    for track in tracks {
+        let row_id = track.row_id;
+        let features = track.features;
+        let metadata = track.metadata;
         let artist = metadata.artist.unwrap_or_default();
         let album = metadata.album.unwrap_or_default();
         let title = metadata.title.unwrap_or_default();
@@ -757,28 +1182,6 @@ fn load_usable_library(database: &BlissDatabase) -> Result<Vec<LibraryTrack>, Co
         });
     }
     Ok(library)
-}
-
-fn load_semantic_bundle(artifact: &Artifact) -> Result<semantic::EvidenceBundle, CommandFailure> {
-    let bytes = fs::read(&artifact.path).map_err(|error| {
-        CommandFailure::new(
-            "SEMANTIC_EVIDENCE_UNREADABLE",
-            format!("failed to read semantic evidence: {error}"),
-        )
-    })?;
-    let bundle: semantic::EvidenceBundle = serde_json::from_slice(&bytes).map_err(|error| {
-        CommandFailure::new(
-            "SEMANTIC_EVIDENCE_INVALID",
-            format!("failed to decode semantic evidence: {error}"),
-        )
-    })?;
-    bundle.validate().map_err(|error| {
-        CommandFailure::new(
-            "SEMANTIC_EVIDENCE_INVALID",
-            format!("invalid semantic evidence: {error}"),
-        )
-    })?;
-    Ok(bundle)
 }
 
 fn bridge_candidate_id(row_id: u64) -> String {
@@ -852,9 +1255,26 @@ fn endpoint_candidate_artifact(
     }
 }
 
+#[cfg(test)]
 fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> {
-    let validation = validate_request(path)?;
-    let request = decode_request(path)?;
+    optimize_route_request_with_options(path, &RuntimeOptions::disabled())
+}
+
+fn optimize_route_request_with_options(
+    path: &Path,
+    options: &RuntimeOptions,
+) -> Result<RouteArtifact, CommandFailure> {
+    let overall_started = Instant::now();
+    let mut timings = StageTimings::default();
+    let validated = prepare_runtime_request(path, options, &mut timings)?;
+    let ValidatedRequest {
+        summary: validation,
+        request,
+        learned_matrix,
+        semantic_bundle: _,
+        library,
+        database_cache,
+    } = validated;
     if request.scoring.algorithm != "adaptive" {
         return Err(CommandFailure::new(
             "SCORING_ALGORITHM_UNSUPPORTED",
@@ -911,17 +1331,14 @@ fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> 
     let learned_percent = adaptive.learned_percent;
     let deterministic_seed = request.route.search.deterministic_seed;
     let restart_count = request.route.search.restart_count;
-    let matrix_artifact = request.artifacts.learned_matrix.as_ref().ok_or_else(|| {
-        CommandFailure::new(
-            "MATRIX_REQUIRED",
-            "adaptive scoring requires artifacts.learned_matrix",
-        )
-    })?;
-    let learned_matrix = bliss_mixer_core::matrix::load_learned_matrix(&matrix_artifact.path)
-        .map_err(|error| CommandFailure::new("MATRIX_INVALID", error.to_string()))?;
-    let database = BlissDatabase::open_read_only(&request.artifacts.database.path)
-        .map_err(|error| CommandFailure::new("DATABASE_INVALID", error.to_string()))?;
-
+    let learned_matrix =
+        learned_matrix.expect("adaptive runtime validation requires a learned matrix");
+    let library = library.expect("runtime validation always provides a decoded library");
+    let file_to_track = library
+        .iter()
+        .map(|track| (track.file.as_str(), track))
+        .collect::<HashMap<_, _>>();
+    let started = Instant::now();
     let mut tracks = Vec::with_capacity(request.source_tracks.len());
     for source in &request.source_tracks {
         let database_file = source.database_file.as_deref().ok_or_else(|| {
@@ -930,48 +1347,30 @@ fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> 
                 format!("source track '{}' has no database_file identity", source.id),
             )
         })?;
-        let row_id = database
-            .usable_row_id_for_file(database_file)
-            .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?
-            .ok_or_else(|| {
-                CommandFailure::new(
-                    "TRACK_NOT_ANALYZED",
-                    format!(
-                        "source track '{}' is absent or ignored in the Bliss database",
-                        source.id
-                    ),
-                )
-            })?;
-        let features = database
-            .raw_metrics(row_id)
-            .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?
-            .ok_or_else(|| {
-                CommandFailure::new(
-                    "TRACK_METRICS_MISSING",
-                    format!("source track '{}' has no Bliss feature vector", source.id),
-                )
-            })?;
-        let metadata = database
-            .metadata(row_id)
-            .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?
-            .ok_or_else(|| {
-                CommandFailure::new(
-                    "TRACK_METADATA_MISSING",
-                    format!("source track '{}' has no Bliss metadata", source.id),
-                )
-            })?;
+        let library_track = file_to_track.get(database_file).ok_or_else(|| {
+            CommandFailure::new(
+                "TRACK_NOT_ANALYZED",
+                format!(
+                    "source track '{}' is absent or ignored in the Bliss database",
+                    source.id
+                ),
+            )
+        })?;
         let artist = source
             .artist
             .clone()
-            .or(metadata.artist)
-            .unwrap_or_default();
-        let album = source.album.clone().or(metadata.album).unwrap_or_default();
+            .unwrap_or_else(|| library_track.artist_key.clone());
+        let album = source
+            .album
+            .clone()
+            .unwrap_or_else(|| library_track.route_track.album_key.clone());
         tracks.push(route::RouteTrack {
-            features,
+            features: library_track.route_track.features,
             artist_key: repeat_key(&artist),
             album_key: repeat_key(&album),
         });
     }
+    timings.record("source_track_materialization", started.elapsed());
 
     let config = route::SearchConfig {
         seed_limit,
@@ -981,8 +1380,10 @@ fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> 
         artist_window: request.repeat_windows.artist,
         album_window: request.repeat_windows.album,
     };
+    let started = Instant::now();
     let result = route::optimize_adaptive_route(&tracks, &learned_matrix, &config)
         .map_err(|error| CommandFailure::new("ROUTE_SEARCH_FAILED", error.to_string()))?;
+    timings.record("route_search", started.elapsed());
     let selected_track_ids = route_track_ids(&result.selected.route, &request.source_tracks);
     let track_window_satisfied_by_unique_membership = request.repeat_windows.track == 0
         || selected_track_ids.iter().collect::<HashSet<_>>().len() == selected_track_ids.len();
@@ -997,7 +1398,7 @@ fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> 
         })
         .collect();
 
-    Ok(RouteArtifact {
+    let mut artifact = RouteArtifact {
         schema_version: 1,
         artifact_kind: "adaptive-route-v1",
         program: PROGRAM,
@@ -1026,13 +1427,19 @@ fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> 
             track_window_satisfied_by_unique_membership,
             violations,
         },
-    })
+        performance: None,
+    };
+    artifact.performance = timings.finish(options.timings, overall_started, database_cache);
+    Ok(artifact)
 }
 
 fn analyze_bridge_validated(
     validation: ValidationSummary,
     request: Request,
     semantic_bundle: semantic::EvidenceBundle,
+    learned_matrix: Array2<f32>,
+    library: Vec<LibraryTrack>,
+    timings: &mut StageTimings,
 ) -> Result<BridgeAnalysisArtifact, CommandFailure> {
     let adaptive = request.scoring.adaptive.as_ref().ok_or_else(|| {
         CommandFailure::new(
@@ -1077,17 +1484,7 @@ fn analyze_bridge_validated(
             ),
             _ => unreachable!("bridge mode is checked before analysis"),
         };
-    let matrix_artifact = request.artifacts.learned_matrix.as_ref().ok_or_else(|| {
-        CommandFailure::new(
-            "MATRIX_REQUIRED",
-            "adaptive scoring requires artifacts.learned_matrix",
-        )
-    })?;
-    let learned_matrix = bliss_mixer_core::matrix::load_learned_matrix(&matrix_artifact.path)
-        .map_err(|error| CommandFailure::new("MATRIX_INVALID", error.to_string()))?;
-    let database = BlissDatabase::open_read_only(&request.artifacts.database.path)
-        .map_err(|error| CommandFailure::new("DATABASE_INVALID", error.to_string()))?;
-    let library = load_usable_library(&database)?;
+    let started = Instant::now();
     let mut file_to_index = HashMap::with_capacity(library.len());
     for (index, track) in library.iter().enumerate() {
         if file_to_index.insert(track.file.clone(), index).is_some() {
@@ -1145,6 +1542,7 @@ fn analyze_bridge_validated(
             album_key,
         });
     }
+    timings.record("source_track_materialization", started.elapsed());
 
     let route_config = route::SearchConfig {
         seed_limit,
@@ -1154,6 +1552,7 @@ fn analyze_bridge_validated(
         artist_window: request.repeat_windows.artist,
         album_window: request.repeat_windows.album,
     };
+    let started = Instant::now();
     let (selected_local_route, selected_strategy, selected_route_objective, parallel_execution) =
         match request.route.ordering_policy.as_str() {
             "optimize_order" => {
@@ -1202,12 +1601,14 @@ fn analyze_bridge_validated(
             }
             _ => unreachable!("bridge route policy is checked before analysis"),
         };
+    timings.record("route_search", started.elapsed());
     let selected_library_route = selected_local_route
         .iter()
         .map(|index| source_library_indices[*index])
         .collect::<Vec<_>>();
     let selected_track_ids = route_track_ids(&selected_local_route, &request.source_tracks);
 
+    let started = Instant::now();
     let eligible_candidates = library
         .iter()
         .enumerate()
@@ -1233,6 +1634,8 @@ fn analyze_bridge_validated(
         max_leg_percentile: bridge::DEFAULT_MAX_LEG_PERCENTILE,
         max_detour_percentile: bridge::DEFAULT_MAX_DETOUR_PERCENTILE,
     };
+    timings.record("candidate_preparation", started.elapsed());
+    let started = Instant::now();
     let reference = bridge::build_frozen_reference(
         &selected_library_route,
         &selected_library_route,
@@ -1241,7 +1644,9 @@ fn analyze_bridge_validated(
         &bridge_config,
     )
     .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
+    timings.record("frozen_reference", started.elapsed());
 
+    let started = Instant::now();
     let mut gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut preview_gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut semantic_assisted = false;
@@ -1344,6 +1749,7 @@ fn analyze_bridge_validated(
             accepted_candidates,
         });
     }
+    timings.record("gap_candidate_scoring", started.elapsed());
 
     let original_ids_by_library = selected_local_route
         .iter()
@@ -1376,6 +1782,7 @@ fn analyze_bridge_validated(
             })
             .collect::<Vec<_>>()
     };
+    let started = Instant::now();
     let selection_preview = match request.extension.mode.as_str() {
         "automatic" => {
             let max_added_tracks =
@@ -1599,6 +2006,7 @@ fn analyze_bridge_validated(
         }
         _ => unreachable!("bridge mode is checked before analysis"),
     };
+    timings.record("bridge_selection", started.elapsed());
 
     Ok(BridgeAnalysisArtifact {
         schema_version: 1,
@@ -1645,12 +2053,30 @@ fn analyze_bridge_validated(
         provider_states: semantic_bundle.providers,
         gaps,
         selection_preview,
+        performance: None,
     })
 }
 
+#[cfg(test)]
 fn analyze_bridge_request(path: &Path) -> Result<BridgeAnalysisArtifact, CommandFailure> {
-    let validation = validate_request(path)?;
-    let request = decode_request(path)?;
+    analyze_bridge_request_with_options(path, &RuntimeOptions::disabled())
+}
+
+fn analyze_bridge_request_with_options(
+    path: &Path,
+    options: &RuntimeOptions,
+) -> Result<BridgeAnalysisArtifact, CommandFailure> {
+    let overall_started = Instant::now();
+    let mut timings = StageTimings::default();
+    let validated = prepare_runtime_request(path, options, &mut timings)?;
+    let ValidatedRequest {
+        summary: validation,
+        request,
+        learned_matrix,
+        semantic_bundle,
+        library,
+        database_cache,
+    } = validated;
     if request.scoring.algorithm != "adaptive" {
         return Err(CommandFailure::new(
             "SCORING_ALGORITHM_UNSUPPORTED",
@@ -1725,8 +2151,16 @@ fn analyze_bridge_request(path: &Path) -> Result<BridgeAnalysisArtifact, Command
             "more than one bridge per gap currently requires preserve_order",
         ));
     }
-    let semantic_bundle = load_semantic_bundle(&request.semantic_evidence)?;
-    analyze_bridge_validated(validation, request, semantic_bundle)
+    let mut artifact = analyze_bridge_validated(
+        validation,
+        request,
+        semantic_bundle,
+        learned_matrix.expect("adaptive runtime validation requires a learned matrix"),
+        library.expect("runtime validation always provides a decoded library"),
+        &mut timings,
+    )?;
+    artifact.performance = timings.finish(options.timings, overall_started, database_cache);
+    Ok(artifact)
 }
 
 fn repeat_key(value: &str) -> String {
@@ -1772,26 +2206,29 @@ fn print_result<T: Serialize>(result: Result<T, CommandFailure>) {
 fn main() {
     configure_parallelism();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some((command, path, options)) = parse_request_command(&args) {
+        match command {
+            "validate" if !options.timings && options.cache_dir.is_none() => {
+                print_result(validate_request(path));
+            }
+            "score" if !options.timings && options.cache_dir.is_none() => {
+                print_result(score_request(path));
+            }
+            "route" => print_result(optimize_route_request_with_options(path, &options)),
+            "bridge" => print_result(analyze_bridge_request_with_options(path, &options)),
+            _ => {
+                eprintln!("{}", usage());
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     match args.as_slice() {
         [command] if command == "version" => println!("{PROGRAM} {VERSION}"),
         [command, format] if command == "version" && format == "--json" => {
             println!(
                 "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\"}}"
             );
-        }
-        [command, request_option, path]
-            if command == "validate" && request_option == "--request" =>
-        {
-            print_result(validate_request(Path::new(path)));
-        }
-        [command, request_option, path] if command == "score" && request_option == "--request" => {
-            print_result(score_request(Path::new(path)));
-        }
-        [command, request_option, path] if command == "route" && request_option == "--request" => {
-            print_result(optimize_route_request(Path::new(path)));
-        }
-        [command, request_option, path] if command == "bridge" && request_option == "--request" => {
-            print_result(analyze_bridge_request(Path::new(path)));
         }
         _ => {
             eprintln!("{}", usage());
@@ -1811,9 +2248,108 @@ mod tests {
         assert!(usage().contains("score"));
         assert!(usage().contains("route"));
         assert!(usage().contains("bridge"));
+        assert!(usage().contains("--timings"));
+        assert!(usage().contains("--cache-dir"));
         assert_eq!(default_parallel_workers(1), 1);
         assert_eq!(default_parallel_workers(2), 1);
         assert_eq!(default_parallel_workers(4), 3);
+    }
+
+    #[test]
+    fn decoded_library_cache_is_identity_bound_and_round_trips() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let mut request = decode_request(Path::new(
+            "fixtures/synthetic/automatic-bridge-request.json",
+        ))
+        .unwrap();
+        request.artifacts.database.cache_identity = Some("fixture-identity-v1".to_owned());
+        let database = BlissDatabase::open_read_only(&request.artifacts.database.path).unwrap();
+        let library = load_usable_library(&database).unwrap();
+        let database_sha256 = hash_artifact(&request.artifacts.database, "database").unwrap();
+        let cache_dir = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-cache-test-{}",
+            std::process::id()
+        ));
+        let cache = LibraryCache {
+            format_version: LIBRARY_CACHE_VERSION,
+            database_path: request.artifacts.database.path.clone(),
+            database_identity: request.artifacts.database.cache_identity.clone().unwrap(),
+            database_sha256: database_sha256.clone(),
+            library: library.clone(),
+        };
+        store_library_cache(&cache_dir, &request.artifacts.database, &cache);
+        let loaded = load_library_cache(&cache_dir, &request.artifacts.database).unwrap();
+        assert_eq!(loaded.database_sha256, database_sha256);
+        assert_eq!(loaded.library.len(), library.len());
+        assert_eq!(loaded.library[0].file, library[0].file);
+
+        let cache_path = library_cache_path(&cache_dir, &request.artifacts.database.path);
+        let mut corrupted = fs::read(&cache_path).unwrap();
+        let last = corrupted.last_mut().unwrap();
+        *last ^= 0x01;
+        fs::write(&cache_path, corrupted).unwrap();
+        assert!(load_library_cache(&cache_dir, &request.artifacts.database).is_none());
+
+        store_library_cache(&cache_dir, &request.artifacts.database, &cache);
+        request.artifacts.database.cache_identity = Some("changed".to_owned());
+        assert!(load_library_cache(&cache_dir, &request.artifacts.database).is_none());
+        let _ = fs::remove_dir_all(cache_dir);
+        std::env::set_current_dir(original).unwrap();
+    }
+
+    #[test]
+    fn timed_bridge_request_reports_cold_miss_then_deterministic_warm_hit() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let temporary_root = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-runtime-test-{}",
+            std::process::id()
+        ));
+        let cache_dir = temporary_root.join("cache");
+        fs::create_dir_all(&temporary_root).unwrap();
+        let mut request: Value = serde_json::from_slice(
+            &fs::read("fixtures/synthetic/automatic-bridge-request.json").unwrap(),
+        )
+        .unwrap();
+        request["artifacts"]["database"]["cache_identity"] =
+            Value::String("fixture-runtime-v1".to_owned());
+        let request_path = temporary_root.join("request.json");
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let options = RuntimeOptions {
+            timings: true,
+            cache_dir: Some(cache_dir),
+        };
+
+        let mut cold = analyze_bridge_request_with_options(&request_path, &options).unwrap();
+        let mut warm = analyze_bridge_request_with_options(&request_path, &options).unwrap();
+        assert_eq!(cold.performance.as_ref().unwrap().database_cache, "miss");
+        assert_eq!(warm.performance.as_ref().unwrap().database_cache, "hit");
+        assert!(cold
+            .performance
+            .as_ref()
+            .unwrap()
+            .stages
+            .iter()
+            .any(|stage| stage.stage == "library_decode"));
+        assert!(!warm
+            .performance
+            .as_ref()
+            .unwrap()
+            .stages
+            .iter()
+            .any(|stage| stage.stage == "library_decode"));
+        cold.performance = None;
+        warm.performance = None;
+        assert_eq!(
+            serde_json::to_string(&cold).unwrap(),
+            serde_json::to_string(&warm).unwrap()
+        );
+
+        let _ = fs::remove_dir_all(temporary_root);
+        std::env::set_current_dir(original).unwrap();
     }
 
     #[test]
@@ -1902,16 +2438,23 @@ mod tests {
             });
 
         let conflict_path = Path::new("fixtures/synthetic/preserve-automatic-request.json");
-        let conflict_validation = validate_request(conflict_path).unwrap();
-        let mut conflict_request = decode_request(conflict_path).unwrap();
+        let mut conflict_timings = StageTimings::default();
+        let conflict = prepare_runtime_request(
+            conflict_path,
+            &RuntimeOptions::disabled(),
+            &mut conflict_timings,
+        )
+        .unwrap();
+        let mut conflict_request = conflict.request;
         let first_artist = conflict_request.source_tracks[0].artist.clone();
         conflict_request.source_tracks[1].artist = first_artist;
-        let conflict_semantic_bundle =
-            load_semantic_bundle(&conflict_request.semantic_evidence).unwrap();
         let preserve_repeat_conflict = analyze_bridge_validated(
-            conflict_validation,
+            conflict.summary,
             conflict_request,
-            conflict_semantic_bundle,
+            conflict.semantic_bundle,
+            conflict.learned_matrix.unwrap(),
+            conflict.library.unwrap(),
+            &mut conflict_timings,
         )
         .unwrap_err();
 

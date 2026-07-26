@@ -69,6 +69,7 @@
       "type": "array",
       "items": { "$ref": "#/$defs/provider_state" }
     },
+    "performance": { "$ref": "#/$defs/performance" },
     "gaps": {
       "type": "array",
       "minItems": 1,
@@ -200,6 +201,28 @@
         { "required": ["raw_rank"] },
         { "required": ["raw_score"] }
       ]
+    },
+    "performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_ms", "database_cache", "stages"],
+      "properties": {
+        "total_ms": { "type": "integer", "minimum": 0 },
+        "database_cache": { "enum": ["disabled", "miss", "hit"] },
+        "stages": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/stage_timing" }
+        }
+      }
+    },
+    "stage_timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "elapsed_ms"],
+      "properties": {
+        "stage": { "type": "string", "minLength": 1 },
+        "elapsed_ms": { "type": "integer", "minimum": 0 }
+      }
     },
     "automatic_selection_preview": {
       "type": "object",

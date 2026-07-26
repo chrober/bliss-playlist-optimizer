@@ -22,6 +22,31 @@ cargo run -- bridge --request fixtures/synthetic/preserve-multi-track-gap-reques
 cargo run -- bridge --request fixtures/synthetic/preserve-endpoint-slots-request.json
 ```
 
+Production callers can request structured native stage timings and an
+identity-bound decoded-library cache:
+
+```text
+bliss-playlist-optimizer bridge --request request.json --timings --cache-dir cache
+```
+
+The request's database artifact must include `cache_identity` for cache reuse.
+Lyrion supplies its `device:inode:size:mtime` identity and independently rejects
+a result if that identity changes while the job is running. A cold job streams
+the database SHA-256, runs `quick_check`, reads every usable track with one bulk
+query, and atomically replaces the versioned cache. A warm job reuses the hash,
+integrity result, and decoded library only when the path and identity match.
+Cache corruption or an identity change is a safe miss.
+
+Run a repeatable cold-then-warm benchmark with the server's Perl runtime:
+
+```text
+perl scripts/benchmark-request.pl --binary ./bliss-playlist-optimizer --command bridge --request request.json --iterations 3
+```
+
+Each JSON line reports external wall time, native total time, cache state, and
+the individual native stages. The temporary benchmark cache is removed when the
+script exits unless `--cache-dir` is supplied.
+
 `validate` checks both JSON schemas, declared artifact hashes, SQLite integrity
 and `TracksV2` compatibility, the optional learned matrix, semantic evidence,
 and exact usable Bliss identities for every unique source track. Relative

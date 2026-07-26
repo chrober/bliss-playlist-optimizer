@@ -212,7 +212,8 @@
       "properties": {
         "path": { "type": "string", "minLength": 1 },
         "sha256": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
-        "schema_identity": { "type": "string" }
+        "schema_identity": { "type": "string" },
+        "cache_identity": { "type": "string", "minLength": 1, "maxLength": 256 }
       }
     },
     "trackIdentity": {
