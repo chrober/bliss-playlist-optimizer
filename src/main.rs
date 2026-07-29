@@ -10,6 +10,7 @@ use bincode::Options;
 use bliss_mixer_core::database::{BlissDatabase, SUPPORTED_SCHEMA_IDENTITY};
 use bliss_mixer_core::scoring::score_adaptive_sequence;
 use ndarray::Array2;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,6 +37,8 @@ struct Request {
     artifacts: Artifacts,
     source_tracks: Vec<SourceTrack>,
     scoring: Scoring,
+    #[serde(default)]
+    selection: SelectionSettings,
     route: RouteSettings,
     repeat_windows: RepeatWindows,
     extension: ExtensionSettings,
@@ -86,6 +89,23 @@ struct Scoring {
 struct AdaptiveSettings {
     seed_limit: usize,
     learned_percent: u16,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct SelectionSettings {
+    variation_percent: u8,
+    generation_seed: u64,
+    lastfm_artist_probability: u8,
+}
+
+impl Default for SelectionSettings {
+    fn default() -> Self {
+        Self {
+            variation_percent: 0,
+            generation_seed: 20_260_721,
+            lastfm_artist_probability: 0,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -393,6 +413,17 @@ struct SeedGrowthResult {
     additions: Vec<(usize, f64)>,
     selected_strategy: &'static str,
     route_metrics: route::RouteMetrics,
+}
+
+struct SeedGrowthContext<'a> {
+    semantic_candidates: &'a [semantic::CandidateIdentity],
+    source_semantic_identities: &'a [semantic::TrackIdentity],
+    semantic_bundle: &'a semantic::EvidenceBundle,
+    tracks: &'a [route::RouteTrack],
+    learned_matrix: &'a Array2<f32>,
+    route_config: &'a route::SearchConfig,
+    selection: SelectionSettings,
+    shortlist_limit: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1460,10 +1491,18 @@ fn select_seed_growth(
     source_library_indices: &[usize],
     selected_library_route: &[usize],
     eligible_candidates: &[usize],
-    tracks: &[route::RouteTrack],
-    learned_matrix: &Array2<f32>,
-    route_config: &route::SearchConfig,
+    context: SeedGrowthContext<'_>,
 ) -> Result<SeedGrowthResult, CommandFailure> {
+    let SeedGrowthContext {
+        semantic_candidates,
+        source_semantic_identities,
+        semantic_bundle,
+        tracks,
+        learned_matrix,
+        route_config,
+        selection,
+        shortlist_limit,
+    } = context;
     if target_track_count <= source_library_indices.len() {
         return Err(CommandFailure::new(
             "SEED_GROWTH_TARGET_INVALID",
@@ -1511,6 +1550,112 @@ fn select_seed_growth(
             .then_with(|| left.0.cmp(&right.0))
     });
 
+    // Variation is deliberately downstream of the scoring strategy. Any
+    // current or future strategy only needs to provide a scalar relevance
+    // ordering; this selector owns reproducible membership diversity.
+    let semantic_endorsements = semantic::select_collection_candidates(
+        semantic_bundle,
+        source_semantic_identities,
+        semantic_candidates,
+    )
+    .into_iter()
+    .filter(|candidate| {
+        candidate
+            .evidence
+            .iter()
+            .any(|evidence| evidence.provider.eq_ignore_ascii_case("last.fm"))
+    })
+    .map(|candidate| candidate.candidate)
+    .collect::<HashSet<_>>();
+
+    let pool_limit =
+        if selection.variation_percent == 0 && selection.lastfm_artist_probability == 0 {
+            requested
+        } else {
+            requested.saturating_mul(10).max(requested)
+        }
+        .min(shortlist_limit)
+        .min(ranked.len());
+    let mut selection_order = ranked[..pool_limit].to_vec();
+    if selection.variation_percent > 0 {
+        let variation = f64::from(selection.variation_percent) / 100.0;
+        let temperature = (requested.max(1) as f64 * (0.25 + 9.75 * variation)).max(1.0);
+        let endorsed_count = selection_order
+            .iter()
+            .filter(|(candidate, _)| semantic_endorsements.contains(candidate))
+            .count();
+        let rest_count = selection_order.len().saturating_sub(endorsed_count);
+        let target = f64::from(selection.lastfm_artist_probability) / 100.0;
+        let endorsed_weight = if endorsed_count == 0 || rest_count == 0 || target == 0.0 {
+            1.0
+        } else if target >= 1.0 {
+            1_000_000.0
+        } else {
+            ((target * rest_count as f64) / ((1.0 - target) * endorsed_count as f64)).max(0.000_001)
+        };
+        let mut rng = StdRng::seed_from_u64(selection.generation_seed);
+        let mut sampled = selection_order
+            .into_iter()
+            .enumerate()
+            .map(|(rank, entry)| {
+                let acoustic_weight = (-(rank as f64) / temperature).exp().max(1e-12);
+                let semantic_weight = if semantic_endorsements.contains(&entry.0) {
+                    endorsed_weight
+                } else {
+                    1.0
+                };
+                let uniform = rng.gen::<f64>().max(f64::MIN_POSITIVE);
+                let key = -uniform.ln() / (acoustic_weight * semantic_weight);
+                (key, rank, entry)
+            })
+            .collect::<Vec<_>>();
+        sampled.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        selection_order = sampled.into_iter().map(|(_, _, entry)| entry).collect();
+    } else if selection.lastfm_artist_probability > 0 && !semantic_endorsements.is_empty() {
+        // At zero variation the run remains deterministic while still
+        // honoring the configured Last.fm target as closely as availability
+        // permits.
+        let desired = ((requested * usize::from(selection.lastfm_artist_probability)) + 50) / 100;
+        let mut endorsed = selection_order
+            .iter()
+            .copied()
+            .filter(|(candidate, _)| semantic_endorsements.contains(candidate))
+            .take(desired)
+            .collect::<Vec<_>>();
+        let mut bliss_only = selection_order
+            .iter()
+            .copied()
+            .filter(|(candidate, _)| !semantic_endorsements.contains(candidate))
+            .take(requested.saturating_sub(endorsed.len()))
+            .collect::<Vec<_>>();
+        endorsed.append(&mut bliss_only);
+        let selected = endorsed.iter().map(|entry| entry.0).collect::<HashSet<_>>();
+        endorsed.extend(
+            selection_order
+                .iter()
+                .copied()
+                .filter(|entry| !selected.contains(&entry.0)),
+        );
+        selection_order = endorsed;
+    }
+    // Candidates outside the quality-controlled pool remain a deterministic
+    // feasibility fallback. They can satisfy repeat capacity but never replace
+    // an available selection from the varied acoustic pool.
+    let in_pool = selection_order
+        .iter()
+        .map(|entry| entry.0)
+        .collect::<HashSet<_>>();
+    selection_order.extend(
+        ranked
+            .iter()
+            .copied()
+            .filter(|entry| !in_pool.contains(&entry.0)),
+    );
+
     // Membership selection follows relevance order while applying the
     // necessary per-key capacity implied by each repeat window. Routing then
     // optimizes the complete fixed membership, allowing added tracks to make a
@@ -1542,7 +1687,7 @@ fn select_seed_growth(
 
     let mut membership = selected_library_route.to_vec();
     let mut additions = Vec::with_capacity(requested);
-    for (candidate, distance) in ranked {
+    for (candidate, distance) in selection_order {
         let artist = tracks[candidate].artist_key.as_str();
         let album = tracks[candidate].album_key.as_str();
         if artist_counts.get(artist).copied().unwrap_or(0) >= artist_capacity
@@ -2427,9 +2572,16 @@ fn analyze_bridge_validated(
                 &source_library_indices,
                 &selected_library_route,
                 &eligible_candidates,
-                &bridge_tracks,
-                &learned_matrix,
-                &route_config,
+                SeedGrowthContext {
+                    semantic_candidates: &semantic_candidates,
+                    source_semantic_identities: &source_semantic_identities,
+                    semantic_bundle: &semantic_bundle,
+                    tracks: &bridge_tracks,
+                    learned_matrix: &learned_matrix,
+                    route_config: &route_config,
+                    selection: request.selection,
+                    shortlist_limit,
+                },
             )?;
             selected_strategy = growth.selected_strategy;
             selected_route_objective = growth.route_metrics.objective;
@@ -2806,14 +2958,55 @@ mod tests {
             album_window: 10,
         };
         let candidates = (2..tracks.len()).collect::<Vec<_>>();
+        let source_semantic_identities = [
+            semantic::TrackIdentity {
+                recording_id: "seed-0".to_owned(),
+                recording_mbid: None,
+                artist_ids: vec![semantic::canonical_artist_id("artist-0")],
+                artist_name: "artist-0".to_owned(),
+            },
+            semantic::TrackIdentity {
+                recording_id: "seed-1".to_owned(),
+                recording_mbid: None,
+                artist_ids: vec![semantic::canonical_artist_id("artist-1")],
+                artist_name: "artist-1".to_owned(),
+            },
+        ];
+        let semantic_candidates = candidates
+            .iter()
+            .map(|candidate| semantic::CandidateIdentity {
+                candidate: *candidate,
+                track: semantic::TrackIdentity {
+                    recording_id: format!("candidate-{candidate}"),
+                    recording_mbid: None,
+                    artist_ids: vec![semantic::canonical_artist_id(&format!(
+                        "artist-{candidate}"
+                    ))],
+                    artist_name: format!("artist-{candidate}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        let semantic_bundle = semantic::EvidenceBundle {
+            schema_version: 1,
+            frozen_at: "1970-01-01T00:00:00Z".to_owned(),
+            providers: Vec::new(),
+            edges: Vec::new(),
+        };
         let growth = select_seed_growth(
             25,
             &[0, 1],
             &[0, 1],
             &candidates,
-            &tracks,
-            &Array2::eye(23),
-            &config,
+            SeedGrowthContext {
+                semantic_candidates: &semantic_candidates,
+                source_semantic_identities: &source_semantic_identities,
+                semantic_bundle: &semantic_bundle,
+                tracks: &tracks,
+                learned_matrix: &Array2::eye(23),
+                route_config: &config,
+                selection: SelectionSettings::default(),
+                shortlist_limit: 256,
+            },
         )
         .unwrap();
         assert_eq!(growth.final_route.len(), 25);
@@ -2829,6 +3022,42 @@ mod tests {
             vec![0, 1]
         );
         assert!(route::repeat_violations(&growth.final_route, &tracks, &config).is_empty());
+
+        let varied = |seed| {
+            select_seed_growth(
+                25,
+                &[0, 1],
+                &[0, 1],
+                &candidates,
+                SeedGrowthContext {
+                    semantic_candidates: &semantic_candidates,
+                    source_semantic_identities: &source_semantic_identities,
+                    semantic_bundle: &semantic_bundle,
+                    tracks: &tracks,
+                    learned_matrix: &Array2::eye(23),
+                    route_config: &config,
+                    selection: SelectionSettings {
+                        variation_percent: 100,
+                        generation_seed: seed,
+                        lastfm_artist_probability: 0,
+                    },
+                    shortlist_limit: 256,
+                },
+            )
+            .unwrap()
+            .additions
+        };
+        assert_eq!(varied(101), varied(101));
+        assert_ne!(
+            varied(101)
+                .iter()
+                .map(|entry| entry.0)
+                .collect::<HashSet<_>>(),
+            varied(202)
+                .iter()
+                .map(|entry| entry.0)
+                .collect::<HashSet<_>>()
+        );
     }
 
     #[test]

@@ -69,6 +69,30 @@
         }
       ]
     },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["variation_percent", "generation_seed", "lastfm_artist_probability"],
+      "properties": {
+        "variation_percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Strategy-neutral amount of seeded membership and route variation. Zero preserves strict best-match selection."
+        },
+        "generation_seed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Reproducible per-job seed used by every scoring strategy and selection workflow."
+        },
+        "lastfm_artist_probability": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Target percentage for Last.fm-endorsed artists when usable evidence and both candidate groups exist; zero disables the bias."
+        }
+      }
+    },
     "route": {
       "type": "object",
       "additionalProperties": false,

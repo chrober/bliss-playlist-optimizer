@@ -483,6 +483,17 @@ pub fn select_endpoint_candidates(
     }
 }
 
+pub fn select_collection_candidates(
+    bundle: &EvidenceBundle,
+    collection_sources: &[TrackIdentity],
+    candidates: &[CandidateIdentity],
+) -> Vec<CandidateSemantics> {
+    candidates
+        .par_iter()
+        .filter_map(|candidate| collection_candidate(bundle, collection_sources, candidate))
+        .collect()
+}
+
 pub fn select_gap_candidates(
     bundle: &EvidenceBundle,
     left: &TrackIdentity,
