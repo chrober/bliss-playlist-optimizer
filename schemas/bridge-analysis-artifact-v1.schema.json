@@ -264,7 +264,8 @@
         "mode", "processing_order", "target_track_count",
         "requested_added_tracks", "feasible", "added_track_count",
         "original_subsequence_preserved", "unique_membership",
-        "relevance_reference_track_count", "final_sequence",
+        "relevance_reference_track_count", "relevance_summary",
+        "route_summary", "acceptance_proofs", "final_sequence",
         "selected_additions"
       ],
       "properties": {
@@ -279,6 +280,50 @@
         "original_subsequence_preserved": { "type": "boolean" },
         "unique_membership": { "const": true },
         "relevance_reference_track_count": { "type": "integer", "minimum": 2 },
+        "relevance_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minimum_distance", "mean_distance", "maximum_distance"],
+          "properties": {
+            "minimum_distance": { "type": "number", "minimum": 0 },
+            "mean_distance": { "type": "number", "minimum": 0 },
+            "maximum_distance": { "type": "number", "minimum": 0 }
+          }
+        },
+        "route_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "strategy", "transition_sum", "worst_transition", "objective",
+            "arc_error"
+          ],
+          "properties": {
+            "strategy": { "enum": ["adaptive", "adaptive-arc"] },
+            "transition_sum": { "type": "number", "minimum": 0 },
+            "worst_transition": { "type": "number", "minimum": 0 },
+            "objective": { "type": "number", "minimum": 0 },
+            "arc_error": { "type": "number", "minimum": 0 }
+          }
+        },
+        "acceptance_proofs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "exact_target_satisfied", "all_source_tracks_retained_once",
+            "all_additions_from_local_inventory", "unique_membership",
+            "artist_repeat_window_satisfied", "album_repeat_window_satisfied",
+            "track_repeat_window_satisfied_by_unique_membership"
+          ],
+          "properties": {
+            "exact_target_satisfied": { "const": true },
+            "all_source_tracks_retained_once": { "const": true },
+            "all_additions_from_local_inventory": { "const": true },
+            "unique_membership": { "const": true },
+            "artist_repeat_window_satisfied": { "const": true },
+            "album_repeat_window_satisfied": { "const": true },
+            "track_repeat_window_satisfied_by_unique_membership": { "const": true }
+          }
+        },
         "final_sequence": {
           "type": "array",
           "minItems": 3,

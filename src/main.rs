@@ -348,8 +348,38 @@ struct SeedGrowthSelectionArtifact {
     original_subsequence_preserved: bool,
     unique_membership: bool,
     relevance_reference_track_count: usize,
+    relevance_summary: SeedGrowthRelevanceSummaryArtifact,
+    route_summary: SeedGrowthRouteSummaryArtifact,
+    acceptance_proofs: SeedGrowthAcceptanceProofsArtifact,
     final_sequence: Vec<PreviewSequenceEntryArtifact>,
     selected_additions: Vec<SeedGrowthAdditionArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct SeedGrowthRelevanceSummaryArtifact {
+    minimum_distance: f64,
+    mean_distance: f64,
+    maximum_distance: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct SeedGrowthRouteSummaryArtifact {
+    strategy: &'static str,
+    transition_sum: f64,
+    worst_transition: f64,
+    objective: f64,
+    arc_error: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct SeedGrowthAcceptanceProofsArtifact {
+    exact_target_satisfied: bool,
+    all_source_tracks_retained_once: bool,
+    all_additions_from_local_inventory: bool,
+    unique_membership: bool,
+    artist_repeat_window_satisfied: bool,
+    album_repeat_window_satisfied: bool,
+    track_repeat_window_satisfied_by_unique_membership: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -362,7 +392,7 @@ struct SeedGrowthResult {
     final_route: Vec<usize>,
     additions: Vec<(usize, f64)>,
     selected_strategy: &'static str,
-    selected_objective: f64,
+    route_metrics: route::RouteMetrics,
 }
 
 #[derive(Debug, Serialize)]
@@ -1544,7 +1574,7 @@ fn select_seed_growth(
     let result = route::optimize_adaptive_route(&route_tracks, learned_matrix, route_config)
         .map_err(|error| CommandFailure::new("SEED_GROWTH_ROUTE_FAILED", error.to_string()))?;
     let selected_strategy = result.selected.strategy;
-    let selected_objective = result.selected.metrics.objective;
+    let route_metrics = result.selected.metrics;
     let final_route = result
         .selected
         .route
@@ -1555,7 +1585,7 @@ fn select_seed_growth(
         final_route,
         additions,
         selected_strategy,
-        selected_objective,
+        route_metrics,
     })
 }
 
@@ -2402,7 +2432,7 @@ fn analyze_bridge_validated(
                 &route_config,
             )?;
             selected_strategy = growth.selected_strategy;
-            selected_route_objective = growth.selected_objective;
+            selected_route_objective = growth.route_metrics.objective;
             let requested_added_tracks = target_track_count - source_library_indices.len();
             let original_subsequence_preserved = growth
                 .final_route
@@ -2411,6 +2441,46 @@ fn analyze_bridge_validated(
                 .eq(selected_library_route.iter());
             let unique_membership =
                 growth.final_route.iter().collect::<HashSet<_>>().len() == growth.final_route.len();
+            let all_source_tracks_retained_once = source_library_indices.iter().all(|source| {
+                growth
+                    .final_route
+                    .iter()
+                    .filter(|index| *index == source)
+                    .count()
+                    == 1
+            });
+            let eligible_candidate_set =
+                eligible_candidates.iter().copied().collect::<HashSet<_>>();
+            let all_additions_from_local_inventory = growth
+                .additions
+                .iter()
+                .all(|(candidate, _)| eligible_candidate_set.contains(candidate));
+            let repeat_violations =
+                route::repeat_violations(&growth.final_route, &bridge_tracks, &route_config);
+            let artist_repeat_window_satisfied = repeat_violations
+                .iter()
+                .all(|violation| violation.kind != "artist");
+            let album_repeat_window_satisfied = repeat_violations
+                .iter()
+                .all(|violation| violation.kind != "album");
+            let relevance_minimum = growth
+                .additions
+                .iter()
+                .map(|(_, distance)| *distance)
+                .min_by(f64::total_cmp)
+                .unwrap_or(0.0);
+            let relevance_maximum = growth
+                .additions
+                .iter()
+                .map(|(_, distance)| *distance)
+                .max_by(f64::total_cmp)
+                .unwrap_or(0.0);
+            let relevance_mean = growth
+                .additions
+                .iter()
+                .map(|(_, distance)| *distance)
+                .sum::<f64>()
+                / growth.additions.len().max(1) as f64;
             SelectionPreviewArtifact::SeedGrowth(SeedGrowthSelectionArtifact {
                 mode: "seed_growth",
                 processing_order: "full-seed-relevance-then-complete-membership-route",
@@ -2421,6 +2491,27 @@ fn analyze_bridge_validated(
                 original_subsequence_preserved,
                 unique_membership,
                 relevance_reference_track_count: source_library_indices.len(),
+                relevance_summary: SeedGrowthRelevanceSummaryArtifact {
+                    minimum_distance: relevance_minimum,
+                    mean_distance: relevance_mean,
+                    maximum_distance: relevance_maximum,
+                },
+                route_summary: SeedGrowthRouteSummaryArtifact {
+                    strategy: growth.selected_strategy,
+                    transition_sum: growth.route_metrics.transition_sum,
+                    worst_transition: growth.route_metrics.worst_transition,
+                    objective: growth.route_metrics.objective,
+                    arc_error: growth.route_metrics.arc_error,
+                },
+                acceptance_proofs: SeedGrowthAcceptanceProofsArtifact {
+                    exact_target_satisfied: growth.final_route.len() == target_track_count,
+                    all_source_tracks_retained_once,
+                    all_additions_from_local_inventory,
+                    unique_membership,
+                    artist_repeat_window_satisfied,
+                    album_repeat_window_satisfied,
+                    track_repeat_window_satisfied_by_unique_membership: unique_membership,
+                },
                 final_sequence: sequence_artifact(&growth.final_route),
                 selected_additions: growth
                     .additions
