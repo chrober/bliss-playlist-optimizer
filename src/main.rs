@@ -358,6 +358,13 @@ struct SeedGrowthAdditionArtifact {
     relevance_distance: f64,
 }
 
+struct SeedGrowthResult {
+    final_route: Vec<usize>,
+    additions: Vec<(usize, f64)>,
+    selected_strategy: &'static str,
+    selected_objective: f64,
+}
+
 #[derive(Debug, Serialize)]
 struct ExactSelectionArtifact {
     mode: &'static str,
@@ -1426,7 +1433,7 @@ fn select_seed_growth(
     tracks: &[route::RouteTrack],
     learned_matrix: &Array2<f32>,
     route_config: &route::SearchConfig,
-) -> Result<(Vec<usize>, Vec<(usize, f64)>, &'static str, f64), CommandFailure> {
+) -> Result<SeedGrowthResult, CommandFailure> {
     if target_track_count <= source_library_indices.len() {
         return Err(CommandFailure::new(
             "SEED_GROWTH_TARGET_INVALID",
@@ -1544,12 +1551,12 @@ fn select_seed_growth(
         .iter()
         .map(|index| membership[*index])
         .collect::<Vec<_>>();
-    Ok((
+    Ok(SeedGrowthResult {
         final_route,
         additions,
         selected_strategy,
         selected_objective,
-    ))
+    })
 }
 
 #[cfg(test)]
@@ -2385,7 +2392,7 @@ fn analyze_bridge_validated(
                     "seed_growth extension requires extension.target_track_count",
                 )
             })?;
-            let (final_route, additions, growth_strategy, growth_objective) = select_seed_growth(
+            let growth = select_seed_growth(
                 target_track_count,
                 &source_library_indices,
                 &selected_library_route,
@@ -2394,27 +2401,29 @@ fn analyze_bridge_validated(
                 &learned_matrix,
                 &route_config,
             )?;
-            selected_strategy = growth_strategy;
-            selected_route_objective = growth_objective;
+            selected_strategy = growth.selected_strategy;
+            selected_route_objective = growth.selected_objective;
             let requested_added_tracks = target_track_count - source_library_indices.len();
-            let original_subsequence_preserved = final_route
+            let original_subsequence_preserved = growth
+                .final_route
                 .iter()
                 .filter(|index| original_ids_by_library.contains_key(index))
                 .eq(selected_library_route.iter());
             let unique_membership =
-                final_route.iter().collect::<HashSet<_>>().len() == final_route.len();
+                growth.final_route.iter().collect::<HashSet<_>>().len() == growth.final_route.len();
             SelectionPreviewArtifact::SeedGrowth(SeedGrowthSelectionArtifact {
                 mode: "seed_growth",
                 processing_order: "full-seed-relevance-then-complete-membership-route",
                 target_track_count,
                 requested_added_tracks,
                 feasible: true,
-                added_track_count: additions.len(),
+                added_track_count: growth.additions.len(),
                 original_subsequence_preserved,
                 unique_membership,
                 relevance_reference_track_count: source_library_indices.len(),
-                final_sequence: sequence_artifact(&final_route),
-                selected_additions: additions
+                final_sequence: sequence_artifact(&growth.final_route),
+                selected_additions: growth
+                    .additions
                     .into_iter()
                     .map(
                         |(candidate, relevance_distance)| SeedGrowthAdditionArtifact {
@@ -2706,7 +2715,7 @@ mod tests {
             album_window: 10,
         };
         let candidates = (2..tracks.len()).collect::<Vec<_>>();
-        let (grown, additions, _, _) = select_seed_growth(
+        let growth = select_seed_growth(
             25,
             &[0, 1],
             &[0, 1],
@@ -2716,18 +2725,19 @@ mod tests {
             &config,
         )
         .unwrap();
-        assert_eq!(grown.len(), 25);
-        assert_eq!(additions.len(), 23);
-        assert_eq!(grown.iter().collect::<HashSet<_>>().len(), 25);
+        assert_eq!(growth.final_route.len(), 25);
+        assert_eq!(growth.additions.len(), 23);
+        assert_eq!(growth.final_route.iter().collect::<HashSet<_>>().len(), 25);
         assert_eq!(
-            grown
+            growth
+                .final_route
                 .iter()
                 .filter(|index| **index == 0 || **index == 1)
                 .copied()
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
-        assert!(route::repeat_violations(&grown, &tracks, &config).is_empty());
+        assert!(route::repeat_violations(&growth.final_route, &tracks, &config).is_empty());
     }
 
     #[test]
