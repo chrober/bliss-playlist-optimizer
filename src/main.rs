@@ -10,6 +10,7 @@ use bincode::Options;
 use bliss_mixer_core::database::{BlissDatabase, SUPPORTED_SCHEMA_IDENTITY};
 use bliss_mixer_core::scoring::score_adaptive_sequence;
 use ndarray::Array2;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -114,6 +115,7 @@ struct RepeatWindows {
 struct ExtensionSettings {
     mode: String,
     additional_track_count: Option<usize>,
+    target_track_count: Option<usize>,
     allow_opening_track: Option<bool>,
     allow_closing_track: Option<bool>,
     candidate_limit: Option<usize>,
@@ -332,6 +334,28 @@ struct AutomaticSelectionArtifact {
 enum SelectionPreviewArtifact {
     Automatic(AutomaticSelectionArtifact),
     Exact(ExactSelectionArtifact),
+    SeedGrowth(SeedGrowthSelectionArtifact),
+}
+
+#[derive(Debug, Serialize)]
+struct SeedGrowthSelectionArtifact {
+    mode: &'static str,
+    processing_order: &'static str,
+    target_track_count: usize,
+    requested_added_tracks: usize,
+    feasible: bool,
+    added_track_count: usize,
+    original_subsequence_preserved: bool,
+    unique_membership: bool,
+    relevance_reference_track_count: usize,
+    final_sequence: Vec<PreviewSequenceEntryArtifact>,
+    selected_additions: Vec<SeedGrowthAdditionArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct SeedGrowthAdditionArtifact {
+    candidate_id: String,
+    relevance_distance: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1394,6 +1418,140 @@ fn endpoint_candidate_artifact(
     }
 }
 
+fn select_seed_growth(
+    target_track_count: usize,
+    source_library_indices: &[usize],
+    selected_library_route: &[usize],
+    eligible_candidates: &[usize],
+    tracks: &[route::RouteTrack],
+    learned_matrix: &Array2<f32>,
+    route_config: &route::SearchConfig,
+) -> Result<(Vec<usize>, Vec<(usize, f64)>, &'static str, f64), CommandFailure> {
+    if target_track_count <= source_library_indices.len() {
+        return Err(CommandFailure::new(
+            "SEED_GROWTH_TARGET_INVALID",
+            format!(
+                "seed-growth target {target_track_count} must exceed the {} source tracks",
+                source_library_indices.len()
+            ),
+        ));
+    }
+    let requested = target_track_count - source_library_indices.len();
+    if requested > eligible_candidates.len() {
+        return Err(CommandFailure::new(
+            "SEED_GROWTH_INFEASIBLE",
+            format!(
+                "seed growth needs {requested} additions but only {} local analyzed candidates are eligible",
+                eligible_candidates.len()
+            ),
+        ));
+    }
+
+    // The complete, immutable source set defines relevance. Newly selected
+    // tracks never enter this context, which prevents iterative taste drift.
+    let seed_features = source_library_indices
+        .iter()
+        .map(|index| tracks[*index].features)
+        .collect::<Vec<_>>();
+    let relevance = bliss_playlist_optimizer::contextual::prepare_adaptive_context(
+        &seed_features,
+        learned_matrix,
+        route_config.learned_percent,
+    )
+    .map_err(|error| CommandFailure::new("SEED_GROWTH_SCORING_FAILED", error.to_string()))?;
+    let mut ranked = eligible_candidates
+        .par_iter()
+        .map(|candidate| {
+            (
+                *candidate,
+                relevance.distance_to(&tracks[*candidate].features),
+            )
+        })
+        .collect::<Vec<_>>();
+    ranked.par_sort_unstable_by(|left, right| {
+        left.1
+            .total_cmp(&right.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    // Membership selection follows relevance order while applying the
+    // necessary per-key capacity implied by each repeat window. Routing then
+    // optimizes the complete fixed membership, allowing added tracks to make a
+    // repeated-artist or repeated-album seed set feasible.
+    let artist_capacity = if route_config.artist_window == 0 {
+        usize::MAX
+    } else {
+        target_track_count.div_ceil(route_config.artist_window + 1)
+    };
+    let album_capacity = if route_config.album_window == 0 {
+        usize::MAX
+    } else {
+        target_track_count.div_ceil(route_config.album_window + 1)
+    };
+    let mut artist_counts = HashMap::<&str, usize>::new();
+    let mut album_counts = HashMap::<&str, usize>::new();
+    for index in source_library_indices {
+        *artist_counts.entry(&tracks[*index].artist_key).or_default() += 1;
+        *album_counts.entry(&tracks[*index].album_key).or_default() += 1;
+    }
+    if artist_counts.values().any(|count| *count > artist_capacity)
+        || album_counts.values().any(|count| *count > album_capacity)
+    {
+        return Err(CommandFailure::new(
+            "SEED_GROWTH_INFEASIBLE",
+            "the source membership exceeds the requested target's repeat-window capacity",
+        ));
+    }
+
+    let mut membership = selected_library_route.to_vec();
+    let mut additions = Vec::with_capacity(requested);
+    for (candidate, distance) in ranked {
+        let artist = tracks[candidate].artist_key.as_str();
+        let album = tracks[candidate].album_key.as_str();
+        if artist_counts.get(artist).copied().unwrap_or(0) >= artist_capacity
+            || album_counts.get(album).copied().unwrap_or(0) >= album_capacity
+        {
+            continue;
+        }
+        membership.push(candidate);
+        additions.push((candidate, distance));
+        *artist_counts.entry(artist).or_default() += 1;
+        *album_counts.entry(album).or_default() += 1;
+        if additions.len() == requested {
+            break;
+        }
+    }
+    if additions.len() != requested {
+        return Err(CommandFailure::new(
+            "SEED_GROWTH_INFEASIBLE",
+            format!(
+                "repeat-safe membership selection found {} of {requested} required additions",
+                additions.len()
+            ),
+        ));
+    }
+    let route_tracks = membership
+        .iter()
+        .map(|index| tracks[*index].clone())
+        .collect::<Vec<_>>();
+    let result = route::optimize_adaptive_route(&route_tracks, learned_matrix, route_config)
+        .map_err(|error| CommandFailure::new("SEED_GROWTH_ROUTE_FAILED", error.to_string()))?;
+    let selected_strategy = result.selected.strategy;
+    let selected_objective = result.selected.metrics.objective;
+    let final_route = result
+        .selected
+        .route
+        .iter()
+        .map(|index| membership[*index])
+        .collect::<Vec<_>>();
+    Ok((
+        final_route,
+        additions,
+        selected_strategy,
+        selected_objective,
+    ))
+}
+
 #[cfg(test)]
 fn optimize_route_request(path: &Path) -> Result<RouteArtifact, CommandFailure> {
     optimize_route_request_with_options(path, &RuntimeOptions::disabled())
@@ -1624,6 +1782,7 @@ fn analyze_bridge_validated(
                     )
                 })?),
             ),
+            "seed_growth" => (None, None, None),
             _ => unreachable!("bridge mode is checked before analysis"),
         };
     let started = Instant::now();
@@ -1694,55 +1853,68 @@ fn analyze_bridge_validated(
         artist_window: request.repeat_windows.artist,
         album_window: request.repeat_windows.album,
     };
+    let base_route_config = if request.extension.mode == "seed_growth" {
+        route::SearchConfig {
+            artist_window: 0,
+            album_window: 0,
+            ..route_config.clone()
+        }
+    } else {
+        route_config.clone()
+    };
     let started = Instant::now();
-    let (selected_local_route, selected_strategy, selected_route_objective, parallel_execution) =
-        match request.route.ordering_policy.as_str() {
-            "optimize_order" => {
-                let result = route::optimize_adaptive_route(
-                    &source_route_tracks,
-                    &learned_matrix,
-                    &route_config,
-                )
-                .map_err(|error| CommandFailure::new("ROUTE_SEARCH_FAILED", error.to_string()))?;
-                (
-                    result.selected.route,
-                    result.selected.strategy,
-                    result.selected.metrics.objective,
-                    "rayon-route-restarts-and-candidates-indexed",
-                )
+    let (
+        selected_local_route,
+        mut selected_strategy,
+        mut selected_route_objective,
+        parallel_execution,
+    ) = match request.route.ordering_policy.as_str() {
+        "optimize_order" => {
+            let result = route::optimize_adaptive_route(
+                &source_route_tracks,
+                &learned_matrix,
+                &base_route_config,
+            )
+            .map_err(|error| CommandFailure::new("ROUTE_SEARCH_FAILED", error.to_string()))?;
+            (
+                result.selected.route,
+                result.selected.strategy,
+                result.selected.metrics.objective,
+                "rayon-route-restarts-and-candidates-indexed",
+            )
+        }
+        "preserve_order" => {
+            let preserved = (0..source_route_tracks.len()).collect::<Vec<_>>();
+            let violations =
+                route::repeat_violations(&preserved, &source_route_tracks, &base_route_config);
+            if !violations.is_empty() {
+                return Err(CommandFailure::new(
+                    "PRESERVED_ANCHOR_REPEAT_CONFLICT",
+                    format!(
+                        "the immutable source order has {} repeat-window violation(s)",
+                        violations.len()
+                    ),
+                ));
             }
-            "preserve_order" => {
-                let preserved = (0..source_route_tracks.len()).collect::<Vec<_>>();
-                let violations =
-                    route::repeat_violations(&preserved, &source_route_tracks, &route_config);
-                if !violations.is_empty() {
-                    return Err(CommandFailure::new(
-                        "PRESERVED_ANCHOR_REPEAT_CONFLICT",
-                        format!(
-                            "the immutable source order has {} repeat-window violation(s)",
-                            violations.len()
-                        ),
-                    ));
-                }
-                let metrics = route::evaluate_adaptive_sequence(
-                    &preserved,
-                    &source_route_tracks,
-                    &learned_matrix,
-                    seed_limit,
-                    learned_percent,
-                )
-                .map_err(|error| {
-                    CommandFailure::new("PRESERVED_ROUTE_SCORING_FAILED", error.to_string())
-                })?;
-                (
-                    preserved,
-                    "preserve-order",
-                    metrics.objective,
-                    "rayon-candidates-indexed",
-                )
-            }
-            _ => unreachable!("bridge route policy is checked before analysis"),
-        };
+            let metrics = route::evaluate_adaptive_sequence(
+                &preserved,
+                &source_route_tracks,
+                &learned_matrix,
+                seed_limit,
+                learned_percent,
+            )
+            .map_err(|error| {
+                CommandFailure::new("PRESERVED_ROUTE_SCORING_FAILED", error.to_string())
+            })?;
+            (
+                preserved,
+                "preserve-order",
+                metrics.objective,
+                "rayon-candidates-indexed",
+            )
+        }
+        _ => unreachable!("bridge route policy is checked before analysis"),
+    };
     timings.record("route_search", started.elapsed());
     let selected_library_route = selected_local_route
         .iter()
@@ -1796,7 +1968,12 @@ fn analyze_bridge_validated(
     let mut gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut preview_gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut semantic_assisted = false;
-    for position in 1..selected_library_route.len() {
+    let first_gap = if request.extension.mode == "seed_growth" {
+        selected_library_route.len()
+    } else {
+        1
+    };
+    for position in first_gap..selected_library_route.len() {
         let gap = bridge::evaluate_gap(
             &selected_library_route,
             position,
@@ -2201,6 +2378,53 @@ fn analyze_bridge_validated(
                 infeasibility,
             })
         }
+        "seed_growth" => {
+            let target_track_count = request.extension.target_track_count.ok_or_else(|| {
+                CommandFailure::new(
+                    "SEED_GROWTH_TARGET_REQUIRED",
+                    "seed_growth extension requires extension.target_track_count",
+                )
+            })?;
+            let (final_route, additions, growth_strategy, growth_objective) = select_seed_growth(
+                target_track_count,
+                &source_library_indices,
+                &selected_library_route,
+                &eligible_candidates,
+                &bridge_tracks,
+                &learned_matrix,
+                &route_config,
+            )?;
+            selected_strategy = growth_strategy;
+            selected_route_objective = growth_objective;
+            let requested_added_tracks = target_track_count - source_library_indices.len();
+            let original_subsequence_preserved = final_route
+                .iter()
+                .filter(|index| original_ids_by_library.contains_key(index))
+                .eq(selected_library_route.iter());
+            let unique_membership =
+                final_route.iter().collect::<HashSet<_>>().len() == final_route.len();
+            SelectionPreviewArtifact::SeedGrowth(SeedGrowthSelectionArtifact {
+                mode: "seed_growth",
+                processing_order: "full-seed-relevance-then-complete-membership-route",
+                target_track_count,
+                requested_added_tracks,
+                feasible: true,
+                added_track_count: additions.len(),
+                original_subsequence_preserved,
+                unique_membership,
+                relevance_reference_track_count: source_library_indices.len(),
+                final_sequence: sequence_artifact(&final_route),
+                selected_additions: additions
+                    .into_iter()
+                    .map(
+                        |(candidate, relevance_distance)| SeedGrowthAdditionArtifact {
+                            candidate_id: bridge_candidate_id(library[candidate].row_id),
+                            relevance_distance,
+                        },
+                    )
+                    .collect(),
+            })
+        }
         _ => unreachable!("bridge mode is checked before analysis"),
     };
     timings.record("bridge_selection", started.elapsed());
@@ -2322,11 +2546,14 @@ fn analyze_bridge_request_with_options(
             "time-budget termination is not deterministic and is not implemented yet",
         ));
     }
-    if !matches!(request.extension.mode.as_str(), "automatic" | "exact_count") {
+    if !matches!(
+        request.extension.mode.as_str(),
+        "automatic" | "exact_count" | "seed_growth"
+    ) {
         return Err(CommandFailure::new(
             "EXTENSION_MODE_UNSUPPORTED",
             format!(
-                "the bridge command currently analyzes automatic or exact_count extension, not '{}'",
+                "the bridge command currently analyzes automatic, exact_count, or seed_growth extension, not '{}'",
                 request.extension.mode
             ),
         ));
@@ -2457,6 +2684,50 @@ mod tests {
         assert_eq!(default_parallel_workers(1), 1);
         assert_eq!(default_parallel_workers(2), 1);
         assert_eq!(default_parallel_workers(4), 3);
+    }
+
+    #[test]
+    fn seed_growth_reaches_exact_target_without_relevance_drift() {
+        let tracks = (0..32)
+            .map(|index| route::RouteTrack {
+                features: std::array::from_fn(|feature| {
+                    index as f32 / 100.0 + feature as f32 / 1000.0
+                }),
+                artist_key: format!("artist-{index}"),
+                album_key: format!("album-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let config = route::SearchConfig {
+            seed_limit: 3,
+            learned_percent: 20,
+            deterministic_seed: 20260721,
+            restart_count: 0,
+            artist_window: 5,
+            album_window: 10,
+        };
+        let candidates = (2..tracks.len()).collect::<Vec<_>>();
+        let (grown, additions, _, _) = select_seed_growth(
+            25,
+            &[0, 1],
+            &[0, 1],
+            &candidates,
+            &tracks,
+            &Array2::eye(23),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(grown.len(), 25);
+        assert_eq!(additions.len(), 23);
+        assert_eq!(grown.iter().collect::<HashSet<_>>().len(), 25);
+        assert_eq!(
+            grown
+                .iter()
+                .filter(|index| **index == 0 || **index == 1)
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(route::repeat_violations(&grown, &tracks, &config).is_empty());
     }
 
     #[test]
@@ -2620,7 +2891,9 @@ mod tests {
             SelectionPreviewArtifact::Automatic(preview) => {
                 assert_eq!(preview.added_track_count, 0)
             }
-            SelectionPreviewArtifact::Exact(_) => panic!("expected automatic preview"),
+            SelectionPreviewArtifact::Exact(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+                panic!("expected automatic preview")
+            }
         }
 
         let _ = fs::remove_dir_all(temporary_root);
@@ -2958,7 +3231,9 @@ mod tests {
         );
         let automatic = match &preview_artifact.selection_preview {
             SelectionPreviewArtifact::Automatic(automatic) => automatic,
-            SelectionPreviewArtifact::Exact(_) => panic!("expected automatic preview"),
+            SelectionPreviewArtifact::Exact(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+                panic!("expected automatic preview")
+            }
         };
         assert_eq!(automatic.max_added_tracks, 1);
         assert_eq!(automatic.added_track_count, 1);
@@ -2997,7 +3272,9 @@ mod tests {
         );
         let exact = match &exact_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_) => panic!("expected exact-count preview"),
+            SelectionPreviewArtifact::Automatic(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+                panic!("expected exact-count preview")
+            }
         };
         assert!(exact.feasible);
         assert_eq!(exact.requested_added_tracks, 2);
@@ -3028,7 +3305,9 @@ mod tests {
         );
         let infeasible = match &infeasible_exact_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_) => panic!("expected exact-count preview"),
+            SelectionPreviewArtifact::Automatic(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+                panic!("expected exact-count preview")
+            }
         };
         assert!(!infeasible.feasible);
         assert_eq!(infeasible.added_track_count, 0);
@@ -3076,7 +3355,9 @@ mod tests {
         );
         let preserve_automatic = match &preserve_automatic_artifact.selection_preview {
             SelectionPreviewArtifact::Automatic(automatic) => automatic,
-            SelectionPreviewArtifact::Exact(_) => panic!("expected automatic preview"),
+            SelectionPreviewArtifact::Exact(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+                panic!("expected automatic preview")
+            }
         };
         assert_eq!(preserve_automatic.added_track_count, 1);
         assert_eq!(
@@ -3122,7 +3403,9 @@ mod tests {
         );
         let preserve_exact = match &preserve_exact_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_) => panic!("expected exact-count preview"),
+            SelectionPreviewArtifact::Automatic(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+                panic!("expected exact-count preview")
+            }
         };
         assert!(preserve_exact.feasible);
         assert_eq!(preserve_exact.added_track_count, 2);
@@ -3170,7 +3453,9 @@ mod tests {
         );
         let preserve_multi_track = match &preserve_multi_track_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_) => panic!("expected exact-count preview"),
+            SelectionPreviewArtifact::Automatic(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+                panic!("expected exact-count preview")
+            }
         };
         assert!(preserve_multi_track.feasible);
         assert_eq!(preserve_multi_track.requested_added_tracks, 4);
@@ -3241,7 +3526,9 @@ mod tests {
 
         let exact = match &artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_) => panic!("expected exact-count preview"),
+            SelectionPreviewArtifact::Automatic(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+                panic!("expected exact-count preview")
+            }
         };
         assert!(exact.feasible);
         assert_eq!(exact.requested_added_tracks, 4);

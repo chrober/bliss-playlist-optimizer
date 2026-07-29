@@ -81,7 +81,8 @@
     "selection_preview": {
       "oneOf": [
         { "$ref": "#/$defs/automatic_selection_preview" },
-        { "$ref": "#/$defs/exact_selection_preview" }
+        { "$ref": "#/$defs/exact_selection_preview" },
+        { "$ref": "#/$defs/seed_growth_selection_preview" }
       ]
     }
   },
@@ -253,6 +254,48 @@
           "type": "array",
           "minItems": 1,
           "items": { "$ref": "#/$defs/preview_decision" }
+        }
+      }
+    },
+    "seed_growth_selection_preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode", "processing_order", "target_track_count",
+        "requested_added_tracks", "feasible", "added_track_count",
+        "original_subsequence_preserved", "unique_membership",
+        "relevance_reference_track_count", "final_sequence",
+        "selected_additions"
+      ],
+      "properties": {
+        "mode": { "const": "seed_growth" },
+        "processing_order": {
+          "const": "full-seed-relevance-then-complete-membership-route"
+        },
+        "target_track_count": { "type": "integer", "minimum": 3 },
+        "requested_added_tracks": { "type": "integer", "minimum": 1 },
+        "feasible": { "const": true },
+        "added_track_count": { "type": "integer", "minimum": 1 },
+        "original_subsequence_preserved": { "type": "boolean" },
+        "unique_membership": { "const": true },
+        "relevance_reference_track_count": { "type": "integer", "minimum": 2 },
+        "final_sequence": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "$ref": "#/$defs/preview_sequence_entry" }
+        },
+        "selected_additions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["candidate_id", "relevance_distance"],
+            "properties": {
+              "candidate_id": { "type": "string", "pattern": "^bliss-row-[1-9][0-9]*$" },
+              "relevance_distance": { "type": "number", "minimum": 0 }
+            }
+          }
         }
       }
     },

@@ -111,7 +111,7 @@
       "required": ["mode"],
       "properties": {
         "mode": {
-          "enum": ["none", "automatic", "exact_count", "one_per_transition", "target_length"]
+          "enum": ["none", "automatic", "exact_count", "seed_growth", "one_per_transition", "target_length"]
         },
         "additional_track_count": { "type": "integer", "minimum": 0 },
         "allow_opening_track": { "type": "boolean" },
@@ -135,6 +135,12 @@
             "properties": { "mode": { "const": "exact_count" } }
           },
           "then": { "required": ["additional_track_count"] }
+        },
+        {
+          "if": {
+            "properties": { "mode": { "const": "seed_growth" } }
+          },
+          "then": { "required": ["target_track_count"] }
         }
       ]
     },
