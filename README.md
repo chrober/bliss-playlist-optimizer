@@ -1,9 +1,24 @@
 # bliss-playlist-optimizer
 
-`bliss-playlist-optimizer` is the native orchestration layer for deterministic,
-auditable playlist optimization. It consumes the shared `bliss-mixer-core`,
-Lyrion metadata, repeat-window settings, and optional semantic evidence without
-requiring Python on the server.
+**bliss-playlist-optimizer** is the network-free Rust engine behind the Lyrion
+plugin [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss).
+It turns a frozen playlist request, Bliss feature database, learned similarity
+matrix, repeat rules, and optional semantic evidence into an auditable proposed
+route. It can reorder fixed membership, analyze and select bridge tracks,
+preserve source anchors, or grow a seed set to an exact target.
+
+The native engine is needed because scoring tens of thousands of analyzed
+tracks and searching many contextual routes is computational work that does not
+belong in the Lyrion plugin's Perl process. It shares Bliss database and
+Adaptive similarity behavior with `bliss-mixer` through
+`bliss-mixer-core`, uses deterministic parallel Rust search where useful,
+and requires neither Python nor network access on the server.
+
+This program deliberately does not call Last.fm, modify `bliss.db`, write
+audio metadata, or create Lyrion playlists. Better Call Bliss owns provider
+access, LMS identities, user interaction, Preview, and playlist persistence;
+this repository owns the versioned native request/result contracts, validation,
+scoring, selection, routing, and diagnostic artifacts.
 
 The current read-only contract slice exposes:
 
