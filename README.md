@@ -70,6 +70,19 @@ primary objective remains within 8% and its arc error improves by at least 10%.
 The JSON artifact records both candidates, the selected strategy, hashes,
 settings, and repeat validation.
 
+Requests may include the strategy-neutral `selection` block with
+`variation_percent`, `generation_seed`, and `lastfm_artist_probability`.
+Variation zero preserves the strict deterministic route and best-match
+seed-growth membership. Higher values seed route search; seed growth also
+performs reproducible weighted sampling inside a bounded top acoustic pool.
+The same seed and inputs reproduce membership across worker counts. Selection
+is downstream of scoring rather than nested under Adaptive, so Static and
+Forest can reuse it when those strategies are connected. Last.fm artist
+evidence guides semantic bridge ranking, while seed growth uses the configured
+target percentage. Neither path bypasses local-inventory, acoustic, uniqueness,
+or repeat-capacity gates. Omitting the block retains the legacy deterministic
+defaults.
+
 Adaptive transition scores are cached privately within each restart. Independent
 restarts run through indexed Rayon iteration and are reduced with stable
 tie-breaking, so results are byte-identical across worker counts. By default the
