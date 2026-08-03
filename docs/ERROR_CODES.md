@@ -9,7 +9,7 @@ human-readable messages may improve without a schema-version change.
 | `UNSUPPORTED_SCHEMA` | An input contract or database schema is unsupported. |
 | `ARTIFACT_HASH_MISMATCH` | A frozen artifact differs from its declared digest. |
 | `TRACK_NOT_ANALYZED` | A requested track cannot be resolved to an analyzed database row. |
-| `MATRIX_REQUIRED` | The captured algorithm requires a learned matrix that is absent or invalid. |
+| `MATRIX_REQUIRED` | The requested optimizer mode currently requires `artifacts.learned_matrix`; Adaptive routing and bridge scoring still need the matrix for one-track context fallback. |
 | `INFEASIBLE_REPEAT_WINDOWS` | No route satisfies the captured repeat constraints. |
 | `INFEASIBLE_EXTENSION_COUNT` | The exact requested bridge count cannot be achieved safely. |
 | `BRIDGE_SHORTLIST_FAILED` | Deterministic bridge-candidate shortlisting could not be completed. |

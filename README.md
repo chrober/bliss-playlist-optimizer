@@ -2,10 +2,10 @@
 
 **bliss-playlist-optimizer** is the network-free Rust engine behind the Lyrion
 plugin [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss).
-It turns a frozen playlist request, Bliss feature database, learned similarity
-matrix, repeat rules, and optional semantic evidence into an auditable proposed
-route. It can reorder fixed membership, analyze and select bridge tracks,
-preserve source anchors, or grow a seed set to an exact target.
+It turns a frozen playlist request, Bliss feature database, repeat rules, the
+current learned similarity matrix, and optional semantic evidence into an
+auditable proposed route. It can reorder fixed membership, analyze and select
+bridge tracks, preserve source anchors, or grow a seed set to an exact target.
 
 The native engine is needed because scoring tens of thousands of analyzed
 tracks and searching many contextual routes is computational work that does not
@@ -18,7 +18,9 @@ This program deliberately does not call Last.fm, modify `bliss.db`, write
 audio metadata, or create Lyrion playlists. Better Call Bliss owns provider
 access, LMS identities, user interaction, Preview, and playlist persistence;
 this repository owns the versioned native request/result contracts, validation,
-scoring, selection, routing, and diagnostic artifacts.
+scoring, selection, routing, and diagnostic artifacts. The user-facing playlist
+modes and options are described in the plugin's
+[strategy guide](https://github.com/chrober/lms-better-call-bliss/blob/main/ALGORITHMS.md).
 
 The current read-only contract slice exposes:
 
@@ -63,17 +65,21 @@ the individual native stages. The temporary benchmark cache is removed when the
 script exits unless `--cache-dir` is supplied.
 
 `validate` checks both JSON schemas, declared artifact hashes, SQLite integrity
-and `TracksV2` compatibility, the optional learned matrix, semantic evidence,
-and exact usable Bliss identities for every unique source track. Relative
-artifact paths are resolved against the process working directory; production
-callers should pass absolute paths.
+and `TracksV2` compatibility, the learned matrix when supplied, semantic
+evidence, and exact usable Bliss identities for every unique source track.
+Relative artifact paths are resolved against the process working directory;
+production callers should pass absolute paths.
 
 `score` emits a versioned contextual scoring artifact for the request's existing
 order. Its adaptive behavior comes from the same shared core as the learned-
 matrix-enabled `bliss-mixer` fork: one seed uses the learned matrix, while two or
 more seeds dynamically blend the learned matrix with seed variance according to
-`learned_percent`. The result is a sequence of contextual transition legs, not a
-static pairwise matrix.
+`learned_percent`. Although `bliss-mixer-core` can build multi-seed Adaptive
+variance without a learned matrix, this optimizer currently requires
+`artifacts.learned_matrix` for Adaptive jobs because route, bridge, endpoint,
+and seed-growth scoring all need a defined one-track context fallback. The
+result is a sequence of contextual transition legs, not a static pairwise
+matrix.
 
 `route` performs fixed-set sequencing without writing a playlist. Every source
 track appears exactly once. Artist and album look-back windows are hard
@@ -218,14 +224,13 @@ that already violates an artist or album look-back window fails with
 bounded gap search as capable of repairing several interacting anchor
 conflicts. Automatic mode remains limited to one bridge per gap.
 
-This remains analysis-only. Applying a preview and playlist writing are future
-slices.
+This remains analysis-only by design. Better Call Bliss applies accepted
+previews and writes Lyrion playlists from the returned opaque track identities.
 
 Success is written as one JSON object to stdout. Validation or search failures
 are written as one JSON object to stderr and exit with status 1; invalid CLI
-usage exits with status 2. Playlist extension and playlist-file writing remain
-future slices. The schemas in `schemas/` are the versioned compatibility
-boundary.
+usage exits with status 2. The schemas in `schemas/` are the versioned
+compatibility boundary.
 
 The Python one-shot implementation remains the behavioral oracle until every
 planned native mode has dedicated parity coverage.
