@@ -140,6 +140,7 @@ pub enum CacheState {
 pub struct TrackIdentity {
     pub recording_id: String,
     pub recording_mbid: Option<String>,
+    pub title_name: String,
     pub artist_ids: Vec<String>,
     pub artist_name: String,
 }
@@ -229,6 +230,99 @@ impl CandidateSemantics {
             .filter_map(|evidence| evidence.raw_rank)
             .min()
     }
+
+    fn evidence_strength(evidence: &MatchedEvidence) -> f64 {
+        evidence
+            .raw_score
+            .map(|score| score.clamp(0.0, 1.0))
+            .or_else(|| {
+                evidence
+                    .raw_rank
+                    .map(|rank| 1.0 / (1.0 + (rank.saturating_sub(1) as f64 / 10.0)))
+            })
+            .unwrap_or(0.5)
+            * evidence.identity_confidence.clamp(0.0, 1.0)
+    }
+
+    pub fn track_support(&self) -> f64 {
+        let left = self
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.provider.eq_ignore_ascii_case("last.fm")
+                    && evidence.kind == EntityKind::Recording
+                    && evidence.source_endpoint == SourceEndpoint::Left
+            })
+            .map(Self::evidence_strength)
+            .max_by(f64::total_cmp);
+        let right = self
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.provider.eq_ignore_ascii_case("last.fm")
+                    && evidence.kind == EntityKind::Recording
+                    && evidence.source_endpoint == SourceEndpoint::Right
+            })
+            .map(Self::evidence_strength)
+            .max_by(f64::total_cmp);
+        match (left, right) {
+            (Some(left), Some(right)) => (left + right) / 2.0,
+            (Some(value), None) | (None, Some(value)) => value * 0.65,
+            (None, None) => 0.0,
+        }
+    }
+
+    pub fn artist_support(&self) -> f64 {
+        self.evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.provider.eq_ignore_ascii_case("last.fm")
+                    && evidence.kind == EntityKind::Artist
+            })
+            .map(|evidence| {
+                let scope_factor = if evidence.scope == EvidenceScope::CollectionFallback {
+                    0.5
+                } else {
+                    1.0
+                };
+                Self::evidence_strength(evidence) * scope_factor
+            })
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0)
+    }
+
+    pub fn guidance_score(&self, track_percent: u8, artist_percent: u8) -> f64 {
+        ((f64::from(track_percent) / 100.0) * self.track_support()
+            + (f64::from(artist_percent) / 100.0) * self.artist_support())
+        .min(1.0)
+    }
+
+    pub fn seed_guidance_score(&self, track_percent: u8, artist_percent: u8) -> f64 {
+        let recording_support = self
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.provider.eq_ignore_ascii_case("last.fm")
+                    && evidence.kind == EntityKind::Recording
+            })
+            .map(Self::evidence_strength)
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0);
+        ((f64::from(track_percent) / 100.0) * recording_support
+            + (f64::from(artist_percent) / 100.0) * self.artist_support())
+        .min(1.0)
+    }
+
+    pub fn adjusted_percentile(
+        &self,
+        acoustic_percentile: f64,
+        track_percent: u8,
+        artist_percent: u8,
+    ) -> f64 {
+        const MAX_GUIDANCE_ADJUSTMENT: f64 = 0.10;
+        acoustic_percentile
+            - MAX_GUIDANCE_ADJUSTMENT * self.guidance_score(track_percent, artist_percent)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -265,7 +359,14 @@ fn recording_matches(entity: &Entity, track: &TrackIdentity) -> bool {
                 .mbid
                 .as_ref()
                 .zip(track.recording_mbid.as_ref())
-                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right)))
+                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+            || entity.title.as_deref().is_some_and(|title| {
+                normalize_identity(title) == track.title_name
+                    && entity
+                        .name
+                        .as_deref()
+                        .is_some_and(|artist| normalize_identity(artist) == track.artist_name)
+            }))
 }
 
 fn artist_matches(entity: &Entity, track: &TrackIdentity) -> bool {
@@ -453,9 +554,25 @@ pub fn select_endpoint_candidates(
         .filter_map(|candidate| endpoint_candidate(bundle, anchor, source_endpoint, candidate))
         .collect::<Vec<_>>();
     if !local.is_empty() {
+        let local = local
+            .into_iter()
+            .map(|candidate| (candidate.candidate, candidate))
+            .collect::<std::collections::HashMap<_, _>>();
         return GapEvidence {
             pool: SemanticPool::EndpointLocal,
-            candidates: local,
+            candidates: candidates
+                .par_iter()
+                .map(|candidate| {
+                    local
+                        .get(&candidate.candidate)
+                        .cloned()
+                        .unwrap_or_else(|| CandidateSemantics {
+                            candidate: candidate.candidate,
+                            tier: SemanticTier::BlissOnly,
+                            evidence: Vec::new(),
+                        })
+                })
+                .collect(),
         };
     }
 
@@ -464,9 +581,25 @@ pub fn select_endpoint_candidates(
         .filter_map(|candidate| collection_candidate(bundle, collection_sources, candidate))
         .collect::<Vec<_>>();
     if !collection.is_empty() {
+        let collection = collection
+            .into_iter()
+            .map(|candidate| (candidate.candidate, candidate))
+            .collect::<std::collections::HashMap<_, _>>();
         return GapEvidence {
             pool: SemanticPool::CollectionFallback,
-            candidates: collection,
+            candidates: candidates
+                .par_iter()
+                .map(|candidate| {
+                    collection
+                        .get(&candidate.candidate)
+                        .cloned()
+                        .unwrap_or_else(|| CandidateSemantics {
+                            candidate: candidate.candidate,
+                            tier: SemanticTier::BlissOnly,
+                            evidence: Vec::new(),
+                        })
+                })
+                .collect(),
         };
     }
 
@@ -494,6 +627,60 @@ pub fn select_collection_candidates(
         .collect()
 }
 
+pub fn select_seed_candidates(
+    bundle: &EvidenceBundle,
+    collection_sources: &[TrackIdentity],
+    candidates: &[CandidateIdentity],
+) -> Vec<CandidateSemantics> {
+    candidates
+        .par_iter()
+        .filter_map(|candidate| {
+            let mut evidence = bundle
+                .edges
+                .iter()
+                .filter(|edge| {
+                    candidate_matches(edge, &candidate.track)
+                        && collection_sources
+                            .iter()
+                            .any(|source| source_matches(edge, source))
+                })
+                .map(|edge| {
+                    matched_evidence(
+                        edge,
+                        if edge.scope == EvidenceScope::CollectionFallback {
+                            SourceEndpoint::Collection
+                        } else {
+                            SourceEndpoint::Left
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            if evidence.is_empty() {
+                return None;
+            }
+            sort_evidence(&mut evidence);
+            let tier = if evidence
+                .iter()
+                .any(|evidence| evidence.kind == EntityKind::Recording)
+            {
+                SemanticTier::RecordingOne
+            } else if evidence
+                .iter()
+                .any(|evidence| evidence.scope == EvidenceScope::EndpointLocal)
+            {
+                SemanticTier::ArtistLocal
+            } else {
+                SemanticTier::ArtistCollection
+            };
+            Some(CandidateSemantics {
+                candidate: candidate.candidate,
+                tier,
+                evidence,
+            })
+        })
+        .collect()
+}
+
 pub fn select_gap_candidates(
     bundle: &EvidenceBundle,
     left: &TrackIdentity,
@@ -506,9 +693,25 @@ pub fn select_gap_candidates(
         .filter_map(|candidate| local_candidate(bundle, left, right, candidate))
         .collect::<Vec<_>>();
     if !local.is_empty() {
+        let local = local
+            .into_iter()
+            .map(|candidate| (candidate.candidate, candidate))
+            .collect::<std::collections::HashMap<_, _>>();
         return GapEvidence {
             pool: SemanticPool::EndpointLocal,
-            candidates: local,
+            candidates: candidates
+                .par_iter()
+                .map(|candidate| {
+                    local
+                        .get(&candidate.candidate)
+                        .cloned()
+                        .unwrap_or_else(|| CandidateSemantics {
+                            candidate: candidate.candidate,
+                            tier: SemanticTier::BlissOnly,
+                            evidence: Vec::new(),
+                        })
+                })
+                .collect(),
         };
     }
 
@@ -517,9 +720,25 @@ pub fn select_gap_candidates(
         .filter_map(|candidate| collection_candidate(bundle, collection_sources, candidate))
         .collect::<Vec<_>>();
     if !collection.is_empty() {
+        let collection = collection
+            .into_iter()
+            .map(|candidate| (candidate.candidate, candidate))
+            .collect::<std::collections::HashMap<_, _>>();
         return GapEvidence {
             pool: SemanticPool::CollectionFallback,
-            candidates: collection,
+            candidates: candidates
+                .par_iter()
+                .map(|candidate| {
+                    collection
+                        .get(&candidate.candidate)
+                        .cloned()
+                        .unwrap_or_else(|| CandidateSemantics {
+                            candidate: candidate.candidate,
+                            tier: SemanticTier::BlissOnly,
+                            evidence: Vec::new(),
+                        })
+                })
+                .collect(),
         };
     }
 
@@ -544,6 +763,7 @@ mod tests {
         TrackIdentity {
             recording_id: recording_id.to_owned(),
             recording_mbid: None,
+            title_name: normalize_identity(recording_id),
             artist_ids: vec![canonical_artist_id(artist)],
             artist_name: normalize_identity(artist),
         }
@@ -655,9 +875,10 @@ mod tests {
         assert_eq!(one, four);
         let selected = one;
         assert_eq!(selected.pool, SemanticPool::EndpointLocal);
-        assert_eq!(selected.candidates.len(), 2);
+        assert_eq!(selected.candidates.len(), 3);
         assert_eq!(selected.candidates[0].tier, SemanticTier::RecordingBoth);
         assert_eq!(selected.candidates[1].tier, SemanticTier::ArtistLocal);
+        assert_eq!(selected.candidates[2].tier, SemanticTier::BlissOnly);
         assert_eq!(
             selected.candidates[0].compare_priority(&selected.candidates[1]),
             Ordering::Less
@@ -757,6 +978,61 @@ mod tests {
         );
         assert_eq!(selected.pool, SemanticPool::BlissOnly);
         assert_eq!(selected.candidates[0].tier, SemanticTier::BlissOnly);
+    }
+
+    #[test]
+    fn lastfm_recording_metadata_matches_and_guidance_is_bounded() {
+        let left = track("source", "Source Artist");
+        let right = track("right", "Right Artist");
+        let mut local_track = track("bliss-row-10", "Similar Artist");
+        local_track.title_name = normalize_identity("Similar Song");
+        let candidate = CandidateIdentity {
+            candidate: 10,
+            track: local_track,
+        };
+        let bliss_only = CandidateIdentity {
+            candidate: 11,
+            track: track("bliss-row-11", "Other Artist"),
+        };
+        let mut recording_edge = edge(
+            EntityKind::Recording,
+            "source",
+            EntityKind::Recording,
+            "lastfm-result",
+            EvidenceScope::EndpointLocal,
+            1,
+        );
+        recording_edge.provider = "last.fm".to_owned();
+        recording_edge.dataset_or_algorithm = Some("track.getSimilar".to_owned());
+        recording_edge.candidate.name = Some("Similar Artist".to_owned());
+        recording_edge.candidate.title = Some("Similar Song".to_owned());
+        recording_edge.raw_score = Some(0.9);
+        let bundle = EvidenceBundle {
+            schema_version: 1,
+            frozen_at: "2026-08-04T00:00:00Z".to_owned(),
+            providers: Vec::new(),
+            edges: vec![recording_edge],
+        };
+        let selected = select_gap_candidates(
+            &bundle,
+            &left,
+            &right,
+            &[left.clone(), right.clone()],
+            &[candidate, bliss_only],
+        );
+        assert_eq!(selected.candidates.len(), 2);
+        let guided = selected
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate == 10)
+            .unwrap();
+        assert_eq!(guided.tier, SemanticTier::RecordingOne);
+        assert!(guided.track_support() > 0.0);
+        assert_eq!(guided.artist_support(), 0.0);
+        assert_eq!(guided.adjusted_percentile(0.5, 0, 100), 0.5);
+        let fully_guided = guided.adjusted_percentile(0.5, 100, 100);
+        assert!(fully_guided < 0.5);
+        assert!(fully_guided >= 0.4);
     }
 
     #[test]

@@ -92,17 +92,23 @@ The JSON artifact records both candidates, the selected strategy, hashes,
 settings, and repeat validation.
 
 Requests may include the strategy-neutral `selection` block with
-`variation_percent`, `generation_seed`, and `lastfm_artist_probability`.
+`variation_percent`, `generation_seed`, `lastfm_track_guidance_percent`, and
+`lastfm_artist_guidance_percent`.
 Variation zero preserves the strict deterministic route and best-match
 seed-growth membership. Higher values seed route search; seed growth also
 performs reproducible weighted sampling inside a bounded top acoustic pool.
 The same seed and inputs reproduce membership across worker counts. Selection
 is downstream of scoring rather than nested under Adaptive, so Static and
-Forest can reuse it when those strategies are connected. Last.fm artist
-evidence guides semantic bridge ranking, while seed growth uses the configured
-target percentage. Neither path bypasses local-inventory, acoustic, uniqueness,
-or repeat-capacity gates. Omitting the block retains the legacy deterministic
-defaults.
+Forest can reuse it when those strategies are connected. The two Last.fm values
+independently scale recording and artist evidence after local-inventory,
+acoustic, uniqueness, and repeat-capacity qualification. Zero ignores that
+evidence type. Bridge ranking caps the combined adjustment at ten percentile
+points. Deterministic seed growth caps semantic movement at 20% of its bounded
+Bliss relevance pool; varied growth uses a bounded evidence multiplier. These
+are guidance strengths, not quotas, and even 100 cannot rescue an acoustically
+rejected candidate. The deprecated `lastfm_artist_probability` spelling remains
+an input alias for artist guidance. Omitting the block retains deterministic
+zero-guidance defaults.
 
 Adaptive transition scores are cached privately within each restart. Independent
 restarts run through indexed Rayon iteration and are reduced with stable
@@ -135,17 +141,17 @@ evaluation; the LMS plugin currently uses a conservative limit of 256.
 
 The bridge command consumes a frozen provider-neutral evidence graph. Recording
 support for both or one endpoint precedes endpoint-local artist support. When
-any usable endpoint-local evidence exists, collection and Bliss-only candidates
-are excluded for that gap; collection-artist fallback is considered only when
-the local pool is empty, followed by Bliss-only operation when no usable edge
-remains. Provider states and every matched assertion retain provenance, rank or
-score, identity confidence, observation time, and cache state. Raw scores from
-different providers are reported but never compared. Disabled, unavailable,
-partial, or failed providers are non-fatal and may coexist with cached evidence.
-Within one evidence tier, candidates are ordered by identity confidence, then
-the best provider-local ordinal rank when present, then acoustic worst-leg and
-detour percentiles and stable row identity. Semantic candidate resolution and
-acoustic candidate evaluation both use deterministic parallel iteration.
+any usable endpoint-local evidence exists, collection-artist evidence is not
+used for that gap; it is considered only when the local evidence set is empty.
+Candidates without a matching edge always remain in the Bliss pool. Provider
+states and every matched assertion retain provenance, rank or score, identity
+confidence, observation time, and cache state. Recording entities match by
+optimizer identity, shared MBID, or normalized artist and title. Disabled,
+unavailable, partial, or failed providers are non-fatal and may coexist with
+cached evidence. Final acceptance is always acoustic and repeat-safe; configured
+Last.fm guidance only applies the bounded post-qualification rank adjustment.
+Semantic candidate resolution and acoustic candidate evaluation both use
+deterministic parallel iteration.
 
 The same artifact now includes a read-only automatic selection preview. The
 request declares both the severe-gap percentile and maximum added-track budget.

@@ -95,7 +95,10 @@ struct AdaptiveSettings {
 struct SelectionSettings {
     variation_percent: u8,
     generation_seed: u64,
-    lastfm_artist_probability: u8,
+    #[serde(default)]
+    lastfm_track_guidance_percent: u8,
+    #[serde(default, alias = "lastfm_artist_probability")]
+    lastfm_artist_guidance_percent: u8,
 }
 
 impl Default for SelectionSettings {
@@ -103,7 +106,8 @@ impl Default for SelectionSettings {
         Self {
             variation_percent: 0,
             generation_seed: 20_260_721,
-            lastfm_artist_probability: 0,
+            lastfm_track_guidance_percent: 0,
+            lastfm_artist_guidance_percent: 0,
         }
     }
 }
@@ -1435,6 +1439,11 @@ fn source_semantic_identity(
     semantic::TrackIdentity {
         recording_id: source.id.clone(),
         recording_mbid: source.recording_mbid.clone(),
+        title_name: source
+            .title
+            .as_deref()
+            .map(semantic::normalize_identity)
+            .unwrap_or_else(|| library_track.title_key.clone()),
         artist_ids,
         artist_name,
     }
@@ -1449,6 +1458,7 @@ fn candidate_semantic_identity(
         track: semantic::TrackIdentity {
             recording_id: bridge_candidate_id(library_track.row_id),
             recording_mbid: None,
+            title_name: library_track.title_key.clone(),
             artist_ids: vec![semantic::canonical_artist_id(&library_track.artist_key)],
             artist_name: library_track.artist_key.clone(),
         },
@@ -1553,57 +1563,44 @@ fn select_seed_growth(
     // Variation is deliberately downstream of the scoring strategy. Any
     // current or future strategy only needs to provide a scalar relevance
     // ordering; this selector owns reproducible membership diversity.
-    let semantic_endorsements = semantic::select_collection_candidates(
+    let semantic_candidates_by_id = semantic::select_seed_candidates(
         semantic_bundle,
         source_semantic_identities,
         semantic_candidates,
     )
     .into_iter()
-    .filter(|candidate| {
-        candidate
-            .evidence
-            .iter()
-            .any(|evidence| evidence.provider.eq_ignore_ascii_case("last.fm"))
-    })
-    .map(|candidate| candidate.candidate)
-    .collect::<HashSet<_>>();
+    .map(|candidate| (candidate.candidate, candidate))
+    .collect::<HashMap<_, _>>();
 
-    let pool_limit =
-        if selection.variation_percent == 0 && selection.lastfm_artist_probability == 0 {
-            requested
-        } else {
-            requested.saturating_mul(10).max(requested)
-        }
-        .min(shortlist_limit)
-        .min(ranked.len());
+    let guidance_enabled =
+        selection.lastfm_track_guidance_percent > 0 || selection.lastfm_artist_guidance_percent > 0;
+    let pool_limit = if selection.variation_percent == 0 && !guidance_enabled {
+        requested
+    } else {
+        requested.saturating_mul(10).max(requested)
+    }
+    .min(shortlist_limit)
+    .min(ranked.len());
     let mut selection_order = ranked[..pool_limit].to_vec();
     if selection.variation_percent > 0 {
         let variation = f64::from(selection.variation_percent) / 100.0;
         let temperature = (requested.max(1) as f64 * (0.25 + 9.75 * variation)).max(1.0);
-        let endorsed_count = selection_order
-            .iter()
-            .filter(|(candidate, _)| semantic_endorsements.contains(candidate))
-            .count();
-        let rest_count = selection_order.len().saturating_sub(endorsed_count);
-        let target = f64::from(selection.lastfm_artist_probability) / 100.0;
-        let endorsed_weight = if endorsed_count == 0 || rest_count == 0 || target == 0.0 {
-            1.0
-        } else if target >= 1.0 {
-            1_000_000.0
-        } else {
-            ((target * rest_count as f64) / ((1.0 - target) * endorsed_count as f64)).max(0.000_001)
-        };
         let mut rng = StdRng::seed_from_u64(selection.generation_seed);
         let mut sampled = selection_order
             .into_iter()
             .enumerate()
             .map(|(rank, entry)| {
                 let acoustic_weight = (-(rank as f64) / temperature).exp().max(1e-12);
-                let semantic_weight = if semantic_endorsements.contains(&entry.0) {
-                    endorsed_weight
-                } else {
-                    1.0
-                };
+                let guidance = semantic_candidates_by_id
+                    .get(&entry.0)
+                    .map(|candidate| {
+                        candidate.seed_guidance_score(
+                            selection.lastfm_track_guidance_percent,
+                            selection.lastfm_artist_guidance_percent,
+                        )
+                    })
+                    .unwrap_or(0.0);
+                let semantic_weight = (2.0 * guidance).exp();
                 let uniform = rng.gen::<f64>().max(f64::MIN_POSITIVE);
                 let key = -uniform.ln() / (acoustic_weight * semantic_weight);
                 (key, rank, entry)
@@ -1615,32 +1612,33 @@ fn select_seed_growth(
                 .then_with(|| left.1.cmp(&right.1))
         });
         selection_order = sampled.into_iter().map(|(_, _, entry)| entry).collect();
-    } else if selection.lastfm_artist_probability > 0 && !semantic_endorsements.is_empty() {
-        // At zero variation the run remains deterministic while still
-        // honoring the configured Last.fm target as closely as availability
-        // permits.
-        let desired = ((requested * usize::from(selection.lastfm_artist_probability)) + 50) / 100;
-        let mut endorsed = selection_order
-            .iter()
-            .copied()
-            .filter(|(candidate, _)| semantic_endorsements.contains(candidate))
-            .take(desired)
+    } else if guidance_enabled && !semantic_candidates_by_id.is_empty() {
+        // With zero Variation the result stays deterministic. Guidance may
+        // move an endorsed track up by at most 20% of this Bliss-qualified
+        // pool; it cannot import or rescue a candidate outside the pool.
+        let maximum_shift = selection_order.len() as f64 * 0.20;
+        let mut guided = selection_order
+            .into_iter()
+            .enumerate()
+            .map(|(rank, entry)| {
+                let guidance = semantic_candidates_by_id
+                    .get(&entry.0)
+                    .map(|candidate| {
+                        candidate.seed_guidance_score(
+                            selection.lastfm_track_guidance_percent,
+                            selection.lastfm_artist_guidance_percent,
+                        )
+                    })
+                    .unwrap_or(0.0);
+                (rank as f64 - maximum_shift * guidance, rank, entry)
+            })
             .collect::<Vec<_>>();
-        let mut bliss_only = selection_order
-            .iter()
-            .copied()
-            .filter(|(candidate, _)| !semantic_endorsements.contains(candidate))
-            .take(requested.saturating_sub(endorsed.len()))
-            .collect::<Vec<_>>();
-        endorsed.append(&mut bliss_only);
-        let selected = endorsed.iter().map(|entry| entry.0).collect::<HashSet<_>>();
-        endorsed.extend(
-            selection_order
-                .iter()
-                .copied()
-                .filter(|entry| !selected.contains(&entry.0)),
-        );
-        selection_order = endorsed;
+        guided.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        selection_order = guided.into_iter().map(|(_, _, entry)| entry).collect();
     }
     // Candidates outside the quality-controlled pool remain a deterministic
     // feasibility fallback. They can satisfy repeat capacity but never replace
@@ -2254,7 +2252,33 @@ fn analyze_bridge_validated(
                 .cmp(&left.accepted)
                 .then_with(|| {
                     semantics_by_candidate[&left.candidate]
-                        .compare_priority(semantics_by_candidate[&right.candidate])
+                        .adjusted_percentile(
+                            left.max_percentile,
+                            request.selection.lastfm_track_guidance_percent,
+                            request.selection.lastfm_artist_guidance_percent,
+                        )
+                        .total_cmp(
+                            &semantics_by_candidate[&right.candidate].adjusted_percentile(
+                                right.max_percentile,
+                                request.selection.lastfm_track_guidance_percent,
+                                request.selection.lastfm_artist_guidance_percent,
+                            ),
+                        )
+                })
+                .then_with(|| {
+                    semantics_by_candidate[&left.candidate]
+                        .adjusted_percentile(
+                            left.detour_percentile,
+                            request.selection.lastfm_track_guidance_percent,
+                            request.selection.lastfm_artist_guidance_percent,
+                        )
+                        .total_cmp(
+                            &semantics_by_candidate[&right.candidate].adjusted_percentile(
+                                right.detour_percentile,
+                                request.selection.lastfm_track_guidance_percent,
+                                request.selection.lastfm_artist_guidance_percent,
+                            ),
+                        )
                 })
                 .then_with(|| left.max_percentile.total_cmp(&right.max_percentile))
                 .then_with(|| left.detour_percentile.total_cmp(&right.detour_percentile))
@@ -2351,6 +2375,8 @@ fn analyze_bridge_validated(
                 &preview::AutomaticSelectionConfig {
                     max_added_tracks,
                     trigger_percentile,
+                    track_guidance_percent: request.selection.lastfm_track_guidance_percent,
+                    artist_guidance_percent: request.selection.lastfm_artist_guidance_percent,
                 },
                 &bridge_tracks,
                 &learned_matrix,
@@ -2449,6 +2475,8 @@ fn analyze_bridge_validated(
                     candidate_limit: retained_candidate_limit,
                     beam_width: EXACT_COUNT_BEAM_WIDTH,
                     max_tracks_per_gap,
+                    track_guidance_percent: request.selection.lastfm_track_guidance_percent,
+                    artist_guidance_percent: request.selection.lastfm_artist_guidance_percent,
                 },
                 &endpoint_slots,
                 preview::ExactScoringContext {
@@ -2962,12 +2990,14 @@ mod tests {
             semantic::TrackIdentity {
                 recording_id: "seed-0".to_owned(),
                 recording_mbid: None,
+                title_name: "seed-0".to_owned(),
                 artist_ids: vec![semantic::canonical_artist_id("artist-0")],
                 artist_name: "artist-0".to_owned(),
             },
             semantic::TrackIdentity {
                 recording_id: "seed-1".to_owned(),
                 recording_mbid: None,
+                title_name: "seed-1".to_owned(),
                 artist_ids: vec![semantic::canonical_artist_id("artist-1")],
                 artist_name: "artist-1".to_owned(),
             },
@@ -2979,6 +3009,7 @@ mod tests {
                 track: semantic::TrackIdentity {
                     recording_id: format!("candidate-{candidate}"),
                     recording_mbid: None,
+                    title_name: format!("candidate-{candidate}"),
                     artist_ids: vec![semantic::canonical_artist_id(&format!(
                         "artist-{candidate}"
                     ))],
@@ -3039,7 +3070,8 @@ mod tests {
                     selection: SelectionSettings {
                         variation_percent: 100,
                         generation_seed: seed,
-                        lastfm_artist_probability: 0,
+                        lastfm_track_guidance_percent: 0,
+                        lastfm_artist_guidance_percent: 0,
                     },
                     shortlist_limit: 256,
                 },
@@ -3539,18 +3571,18 @@ mod tests {
                 semantic::SemanticTier::ArtistLocal,
             ]
         );
-        assert_eq!(
-            semantic_bridge_artifact.gaps[9].accepted_candidates[0].semantic_tier,
-            semantic::SemanticTier::RecordingOne
-        );
+        assert!(semantic_bridge_artifact.gaps[9]
+            .accepted_candidates
+            .iter()
+            .any(|candidate| candidate.semantic_tier == semantic::SemanticTier::RecordingOne));
         assert_eq!(
             semantic_bridge_artifact.gaps[10].semantic_pool,
             semantic::SemanticPool::CollectionFallback
         );
-        assert_eq!(
-            semantic_bridge_artifact.gaps[10].accepted_candidates[0].semantic_tier,
-            semantic::SemanticTier::ArtistCollection
-        );
+        assert!(semantic_bridge_artifact.gaps[10]
+            .accepted_candidates
+            .iter()
+            .any(|candidate| candidate.semantic_tier == semantic::SemanticTier::ArtistCollection));
 
         let preview_artifact = preview_artifact.unwrap();
         let preview_expected =

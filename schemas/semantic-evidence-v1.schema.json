@@ -27,7 +27,7 @@
         "id": {
           "type": "string",
           "minLength": 1,
-          "description": "Optimizer-local identity: a request track ID or bliss-row-N recording ID, or a canonical artist identity; MBIDs may additionally bind the entity"
+          "description": "Optimizer-local identity: a request track ID or bliss-row-N recording ID, or a canonical artist identity; recording MBIDs or normalized recording title plus artist name may additionally bind an entity"
         },
         "mbid": { "type": "string", "format": "uuid" },
         "name": { "type": "string" },

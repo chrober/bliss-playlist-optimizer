@@ -30,6 +30,8 @@ pub struct AutomaticGap {
 pub struct AutomaticSelectionConfig {
     pub max_added_tracks: usize,
     pub trigger_percentile: f64,
+    pub track_guidance_percent: u8,
+    pub artist_guidance_percent: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +40,32 @@ pub struct ExactSelectionConfig {
     pub candidate_limit: usize,
     pub beam_width: usize,
     pub max_tracks_per_gap: usize,
+    pub track_guidance_percent: u8,
+    pub artist_guidance_percent: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GuidanceConfig {
+    track_percent: u8,
+    artist_percent: u8,
+}
+
+impl AutomaticSelectionConfig {
+    fn guidance(self) -> GuidanceConfig {
+        GuidanceConfig {
+            track_percent: self.track_guidance_percent,
+            artist_percent: self.artist_guidance_percent,
+        }
+    }
+}
+
+impl ExactSelectionConfig {
+    fn guidance(self) -> GuidanceConfig {
+        GuidanceConfig {
+            track_percent: self.track_guidance_percent,
+            artist_percent: self.artist_guidance_percent,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -190,11 +218,15 @@ fn rank_for_evolving_route(
     route: &[usize],
     position: usize,
     semantics: &[CandidateSemantics],
-    tracks: &[RouteTrack],
-    learned_matrix: &Array2<f32>,
-    config: &BridgeConfig,
-    reference: &FrozenReference,
+    scoring: ExactScoringContext<'_>,
+    guidance: GuidanceConfig,
 ) -> Result<Vec<BridgeCandidateEvaluation>, PreviewError> {
+    let ExactScoringContext {
+        tracks,
+        learned_matrix,
+        config,
+        reference,
+    } = scoring;
     let semantics_by_candidate = semantics
         .iter()
         .map(|candidate| (candidate.candidate, candidate))
@@ -219,7 +251,33 @@ fn rank_for_evolving_route(
             .cmp(&left.accepted)
             .then_with(|| {
                 semantics_by_candidate[&left.candidate]
-                    .compare_priority(semantics_by_candidate[&right.candidate])
+                    .adjusted_percentile(
+                        left.max_percentile,
+                        guidance.track_percent,
+                        guidance.artist_percent,
+                    )
+                    .total_cmp(
+                        &semantics_by_candidate[&right.candidate].adjusted_percentile(
+                            right.max_percentile,
+                            guidance.track_percent,
+                            guidance.artist_percent,
+                        ),
+                    )
+            })
+            .then_with(|| {
+                semantics_by_candidate[&left.candidate]
+                    .adjusted_percentile(
+                        left.detour_percentile,
+                        guidance.track_percent,
+                        guidance.artist_percent,
+                    )
+                    .total_cmp(
+                        &semantics_by_candidate[&right.candidate].adjusted_percentile(
+                            right.detour_percentile,
+                            guidance.track_percent,
+                            guidance.artist_percent,
+                        ),
+                    )
             })
             .then_with(|| left.max_percentile.total_cmp(&right.max_percentile))
             .then_with(|| left.detour_percentile.total_cmp(&right.detour_percentile))
@@ -269,10 +327,13 @@ pub fn select_automatic_bridges(
                 &final_route,
                 position,
                 &gap.semantics.candidates,
-                tracks,
-                learned_matrix,
-                config,
-                reference,
+                ExactScoringContext {
+                    tracks,
+                    learned_matrix,
+                    config,
+                    reference,
+                },
+                selection_config.guidance(),
             )?;
             if let Some(evaluation) = evaluations.iter().find(|candidate| {
                 let inserted = local_objective(
@@ -383,11 +444,15 @@ fn final_exact_decisions(
     final_route: &[usize],
     gaps: &[AutomaticGap],
     gap_selections: &[Vec<usize>],
-    tracks: &[RouteTrack],
-    learned_matrix: &Array2<f32>,
-    config: &BridgeConfig,
-    reference: &FrozenReference,
+    scoring: ExactScoringContext<'_>,
+    selection_config: &ExactSelectionConfig,
 ) -> Result<Vec<GapDecision>, PreviewError> {
+    let ExactScoringContext {
+        tracks,
+        learned_matrix,
+        config,
+        reference,
+    } = scoring;
     if gaps.len() != gap_selections.len() {
         return Err(PreviewError::FinalRouteInvalid(
             "gap selection count does not match the original gap count",
@@ -429,10 +494,13 @@ fn final_exact_decisions(
                 &route_without_candidate,
                 position,
                 std::slice::from_ref(&semantics),
-                tracks,
-                learned_matrix,
-                config,
-                reference,
+                ExactScoringContext {
+                    tracks,
+                    learned_matrix,
+                    config,
+                    reference,
+                },
+                selection_config.guidance(),
             )?
             .into_iter()
             .next()
@@ -525,10 +593,13 @@ fn select_exact_count_multi_gap_bridges(
                             &variant.route,
                             position,
                             &gap.semantics.candidates,
-                            tracks,
-                            learned_matrix,
-                            config,
-                            reference,
+                            ExactScoringContext {
+                                tracks,
+                                learned_matrix,
+                                config,
+                                reference,
+                            },
+                            selection_config.guidance(),
                         )?;
                         for evaluation in evaluations
                             .into_iter()
@@ -610,10 +681,13 @@ fn select_exact_count_multi_gap_bridges(
             &state.route,
             &ordered_gaps,
             &state.gap_selections,
-            tracks,
-            learned_matrix,
-            config,
-            reference,
+            ExactScoringContext {
+                tracks,
+                learned_matrix,
+                config,
+                reference,
+            },
+            selection_config,
         )?;
         (Some(state.route), decisions)
     } else {
@@ -692,6 +766,8 @@ fn rank_endpoint_for_route(
     slot: EndpointSlot,
     endpoint: &ExactEndpointSlot,
     candidate_limit: usize,
+    track_guidance_percent: u8,
+    artist_guidance_percent: u8,
     scoring: ExactScoringContext<'_>,
 ) -> Result<Vec<SelectedEndpoint>, PreviewError> {
     let ExactScoringContext {
@@ -728,7 +804,18 @@ fn rank_endpoint_for_route(
             .cmp(&left.accepted)
             .then_with(|| {
                 semantics_by_candidate[&left.candidate]
-                    .compare_priority(semantics_by_candidate[&right.candidate])
+                    .adjusted_percentile(
+                        left.percentile,
+                        track_guidance_percent,
+                        artist_guidance_percent,
+                    )
+                    .total_cmp(
+                        &semantics_by_candidate[&right.candidate].adjusted_percentile(
+                            right.percentile,
+                            track_guidance_percent,
+                            artist_guidance_percent,
+                        ),
+                    )
             })
             .then_with(|| left.percentile.total_cmp(&right.percentile))
             .then_with(|| left.candidate.cmp(&right.candidate))
@@ -833,6 +920,8 @@ pub fn select_exact_count_bridges_with_endpoints(
                     EndpointSlot::Opening,
                     endpoints.opening.as_ref().expect("opening slot is enabled"),
                     selection_config.candidate_limit,
+                    selection_config.track_guidance_percent,
+                    selection_config.artist_guidance_percent,
                     scoring,
                 )?
                 .into_iter()
@@ -867,6 +956,8 @@ pub fn select_exact_count_bridges_with_endpoints(
                         EndpointSlot::Closing,
                         endpoints.closing.as_ref().expect("closing slot is enabled"),
                         selection_config.candidate_limit,
+                        selection_config.track_guidance_percent,
+                        selection_config.artist_guidance_percent,
                         scoring,
                     )?
                     .into_iter()
@@ -924,10 +1015,8 @@ pub fn select_exact_count_bridges_with_endpoints(
                         &route,
                         &ordered_gaps,
                         &gap_selections,
-                        tracks,
-                        learned_matrix,
-                        config,
-                        reference,
+                        scoring,
+                        selection_config,
                     ) {
                         Ok(decisions) => decisions,
                         Err(PreviewError::FinalRouteInvalid(_)) => continue,
@@ -1070,10 +1159,13 @@ fn select_exact_count_single_gap_bridges(
                         &state.route,
                         position,
                         &gap.semantics.candidates,
-                        tracks,
-                        learned_matrix,
-                        config,
-                        reference,
+                        ExactScoringContext {
+                            tracks,
+                            learned_matrix,
+                            config,
+                            reference,
+                        },
+                        selection_config.guidance(),
                     )?;
                     for evaluation in evaluations
                         .into_iter()
@@ -1238,6 +1330,8 @@ mod tests {
         let selection_config = AutomaticSelectionConfig {
             max_added_tracks: 1,
             trigger_percentile: 0.70,
+            track_guidance_percent: 0,
+            artist_guidance_percent: 0,
         };
         let one = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -1305,6 +1399,8 @@ mod tests {
         let selection_config = AutomaticSelectionConfig {
             max_added_tracks: 1,
             trigger_percentile: 0.70,
+            track_guidance_percent: 0,
+            artist_guidance_percent: 0,
         };
         let selected = select_automatic_bridges(
             &route,
@@ -1346,6 +1442,8 @@ mod tests {
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 1,
+            track_guidance_percent: 0,
+            artist_guidance_percent: 0,
         };
         let one = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -1432,6 +1530,8 @@ mod tests {
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 2,
+            track_guidance_percent: 0,
+            artist_guidance_percent: 0,
         };
         let one = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -1523,6 +1623,8 @@ mod tests {
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 1,
+            track_guidance_percent: 0,
+            artist_guidance_percent: 0,
         };
         let without_endpoints =
             select_exact_count_bridges(&route, &[], &exact, &tracks, &matrix, &config, &reference)

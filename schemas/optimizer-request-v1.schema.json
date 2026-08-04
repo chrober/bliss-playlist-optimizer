@@ -72,7 +72,7 @@
     "selection": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["variation_percent", "generation_seed", "lastfm_artist_probability"],
+      "required": ["variation_percent", "generation_seed"],
       "properties": {
         "variation_percent": {
           "type": "integer",
@@ -85,11 +85,24 @@
           "minimum": 0,
           "description": "Reproducible per-job seed used by every scoring strategy and selection workflow."
         },
+        "lastfm_track_guidance_percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Bounded influence of Last.fm recording-level evidence after acoustic qualification; zero ignores recording evidence."
+        },
+        "lastfm_artist_guidance_percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Bounded influence of Last.fm artist-level evidence after acoustic qualification; zero ignores artist evidence."
+        },
         "lastfm_artist_probability": {
           "type": "integer",
           "minimum": 0,
           "maximum": 100,
-          "description": "Target percentage for Last.fm-endorsed artists when usable evidence and both candidate groups exist; zero disables the bias."
+          "deprecated": true,
+          "description": "Legacy alias for lastfm_artist_guidance_percent."
         }
       }
     },
