@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use rayon::prelude::*;
@@ -331,6 +331,69 @@ pub struct GapEvidence {
     pub candidates: Vec<CandidateSemantics>,
 }
 
+#[derive(Clone, Debug)]
+pub struct CandidateLookup {
+    recording: HashMap<String, Vec<usize>>,
+    artist: HashMap<String, Vec<usize>>,
+}
+
+#[derive(Default)]
+struct CandidateAccumulator {
+    evidence: Vec<MatchedEvidence>,
+    recording_left: bool,
+    recording_right: bool,
+    artist_local: bool,
+}
+
+impl CandidateLookup {
+    pub fn new(candidates: &[CandidateIdentity]) -> Self {
+        let mut lookup = Self {
+            recording: HashMap::new(),
+            artist: HashMap::new(),
+        };
+        for candidate in candidates {
+            for key in recording_keys_for_track(&candidate.track) {
+                lookup
+                    .recording
+                    .entry(key)
+                    .or_default()
+                    .push(candidate.candidate);
+            }
+            for key in artist_keys_for_track(&candidate.track) {
+                lookup
+                    .artist
+                    .entry(key)
+                    .or_default()
+                    .push(candidate.candidate);
+            }
+        }
+        lookup
+    }
+
+    fn candidates_for_entity(&self, entity: &Entity) -> Vec<usize> {
+        let keys = match entity.kind {
+            EntityKind::Recording => recording_keys_for_entity(entity),
+            EntityKind::Artist => artist_keys_for_entity(entity),
+        };
+        let map = match entity.kind {
+            EntityKind::Recording => &self.recording,
+            EntityKind::Artist => &self.artist,
+        };
+        let mut seen = HashSet::new();
+        let mut matches = Vec::new();
+        for key in keys {
+            if let Some(candidates) = map.get(&key) {
+                for candidate in candidates {
+                    if seen.insert(*candidate) {
+                        matches.push(*candidate);
+                    }
+                }
+            }
+        }
+        matches
+    }
+}
+
 fn compare_optional_rank(left: Option<u64>, right: Option<u64>) -> Ordering {
     match (left, right) {
         (Some(left), Some(right)) => left.cmp(&right),
@@ -338,6 +401,68 @@ fn compare_optional_rank(left: Option<u64>, right: Option<u64>) -> Ordering {
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
     }
+}
+
+fn recording_title_artist_key(title: &str, artist: &str) -> String {
+    format!(
+        "title_artist:{}\u{0}{}",
+        normalize_identity(title),
+        normalize_identity(artist)
+    )
+}
+
+fn artist_name_key(name: &str) -> String {
+    format!("artist_name:{}", normalize_identity(name))
+}
+
+fn recording_keys_for_track(track: &TrackIdentity) -> Vec<String> {
+    let mut keys = vec![track.recording_id.clone()];
+    if let Some(mbid) = &track.recording_mbid {
+        keys.push(mbid.to_ascii_lowercase());
+    }
+    keys.push(recording_title_artist_key(
+        &track.title_name,
+        &track.artist_name,
+    ));
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn artist_keys_for_track(track: &TrackIdentity) -> Vec<String> {
+    let mut keys = track.artist_ids.clone();
+    keys.push(artist_name_key(&track.artist_name));
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn recording_keys_for_entity(entity: &Entity) -> Vec<String> {
+    let mut keys = Vec::new();
+    keys.push(entity.id.clone());
+    if let Some(mbid) = &entity.mbid {
+        keys.push(mbid.to_ascii_lowercase());
+    }
+    if let (Some(title), Some(artist)) = (entity.title.as_deref(), entity.name.as_deref()) {
+        keys.push(recording_title_artist_key(title, artist));
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn artist_keys_for_entity(entity: &Entity) -> Vec<String> {
+    let mut keys = Vec::new();
+    keys.push(entity.id.clone());
+    if let Some(mbid) = &entity.mbid {
+        keys.push(mbid.to_ascii_lowercase());
+    }
+    if let Some(name) = entity.name.as_deref() {
+        keys.push(artist_name_key(name));
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 pub fn normalize_identity(value: &str) -> String {
@@ -755,6 +880,111 @@ pub fn select_gap_candidates(
     }
 }
 
+fn semantics_from_accumulator(
+    candidate: usize,
+    mut accumulator: CandidateAccumulator,
+) -> CandidateSemantics {
+    let tier = if accumulator.recording_left && accumulator.recording_right {
+        SemanticTier::RecordingBoth
+    } else if accumulator.recording_left || accumulator.recording_right {
+        SemanticTier::RecordingOne
+    } else if accumulator.artist_local {
+        SemanticTier::ArtistLocal
+    } else {
+        SemanticTier::ArtistCollection
+    };
+    sort_evidence(&mut accumulator.evidence);
+    CandidateSemantics {
+        candidate,
+        tier,
+        evidence: accumulator.evidence,
+    }
+}
+
+pub fn select_gap_candidate_matches(
+    bundle: &EvidenceBundle,
+    left: &TrackIdentity,
+    right: &TrackIdentity,
+    collection_sources: &[TrackIdentity],
+    lookup: &CandidateLookup,
+) -> GapEvidence {
+    let mut local = HashMap::<usize, CandidateAccumulator>::new();
+    for edge in &bundle.edges {
+        if edge.scope != EvidenceScope::EndpointLocal || edge.source.kind != edge.candidate.kind {
+            continue;
+        }
+        let left_match = source_matches(edge, left);
+        let right_match = source_matches(edge, right);
+        if !left_match && !right_match {
+            continue;
+        }
+        for candidate in lookup.candidates_for_entity(&edge.candidate) {
+            let accumulator = local.entry(candidate).or_default();
+            if left_match {
+                accumulator.recording_left |= edge.source.kind == EntityKind::Recording;
+                accumulator.artist_local |= edge.source.kind == EntityKind::Artist;
+                accumulator
+                    .evidence
+                    .push(matched_evidence(edge, SourceEndpoint::Left));
+            }
+            if right_match {
+                accumulator.recording_right |= edge.source.kind == EntityKind::Recording;
+                accumulator.artist_local |= edge.source.kind == EntityKind::Artist;
+                accumulator
+                    .evidence
+                    .push(matched_evidence(edge, SourceEndpoint::Right));
+            }
+        }
+    }
+    if !local.is_empty() {
+        let mut candidates = local
+            .into_iter()
+            .map(|(candidate, accumulator)| semantics_from_accumulator(candidate, accumulator))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| candidate.candidate);
+        return GapEvidence {
+            pool: SemanticPool::EndpointLocal,
+            candidates,
+        };
+    }
+
+    let mut collection = HashMap::<usize, CandidateAccumulator>::new();
+    for edge in &bundle.edges {
+        if edge.scope != EvidenceScope::CollectionFallback
+            || edge.source.kind != EntityKind::Artist
+            || edge.candidate.kind != EntityKind::Artist
+            || !collection_sources
+                .iter()
+                .any(|source| artist_matches(&edge.source, source))
+        {
+            continue;
+        }
+        for candidate in lookup.candidates_for_entity(&edge.candidate) {
+            collection
+                .entry(candidate)
+                .or_default()
+                .evidence
+                .push(matched_evidence(edge, SourceEndpoint::Collection));
+        }
+    }
+    if !collection.is_empty() {
+        let mut candidates = collection
+            .into_iter()
+            .map(|(candidate, accumulator)| semantics_from_accumulator(candidate, accumulator))
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| candidate.candidate);
+        return GapEvidence {
+            pool: SemanticPool::CollectionFallback,
+            candidates,
+        };
+    }
+
+    GapEvidence {
+        pool: SemanticPool::BlissOnly,
+        candidates: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,6 +1029,59 @@ mod tests {
             observed_at: Some("2026-07-20T00:00:00Z".to_owned()),
             cache_state: Some(CacheState::Cached),
         }
+    }
+
+    #[test]
+    fn indexed_gap_matches_legacy_semantics_without_bliss_placeholders() {
+        let left = track("left", "Artist Left");
+        let right = track("right", "Artist Right");
+        let candidates = vec![
+            CandidateIdentity {
+                candidate: 10,
+                track: track("Polly", "Nirvana"),
+            },
+            CandidateIdentity {
+                candidate: 11,
+                track: track("Unrelated", "Other Artist"),
+            },
+        ];
+        let mut recording_edge = edge(
+            EntityKind::Recording,
+            "left",
+            EntityKind::Recording,
+            "recording:nirvana|polly",
+            EvidenceScope::EndpointLocal,
+            1,
+        );
+        recording_edge.candidate.name = Some("Nirvana".to_owned());
+        recording_edge.candidate.title = Some("Polly".to_owned());
+        let bundle = EvidenceBundle {
+            schema_version: 1,
+            frozen_at: "2026-07-20T00:00:00Z".to_owned(),
+            providers: Vec::new(),
+            edges: vec![recording_edge],
+        };
+        let legacy = select_gap_candidates(
+            &bundle,
+            &left,
+            &right,
+            &[left.clone(), right.clone()],
+            &candidates,
+        );
+        let indexed = select_gap_candidate_matches(
+            &bundle,
+            &left,
+            &right,
+            &[left.clone(), right.clone()],
+            &CandidateLookup::new(&candidates),
+        );
+        let legacy_supported = legacy
+            .candidates
+            .into_iter()
+            .filter(|candidate| candidate.tier != SemanticTier::BlissOnly)
+            .collect::<Vec<_>>();
+        assert_eq!(indexed.pool, SemanticPool::EndpointLocal);
+        assert_eq!(indexed.candidates, legacy_supported);
     }
 
     #[test]

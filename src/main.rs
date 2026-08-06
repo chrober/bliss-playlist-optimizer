@@ -2119,6 +2119,7 @@ fn analyze_bridge_validated(
         .iter()
         .map(|index| candidate_semantic_identity(*index, &library[*index]))
         .collect::<Vec<_>>();
+    let semantic_candidate_lookup = semantic::CandidateLookup::new(&semantic_candidates);
     let bridge_tracks = library
         .iter()
         .map(|track| track.route_track.clone())
@@ -2144,6 +2145,7 @@ fn analyze_bridge_validated(
     timings.record("frozen_reference", started.elapsed());
 
     let mut shortlist_elapsed = Duration::ZERO;
+    let mut semantic_selection_elapsed = Duration::ZERO;
     let mut strict_scoring_elapsed = Duration::ZERO;
     let mut gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut preview_gaps = Vec::with_capacity(selected_library_route.len() - 1);
@@ -2165,22 +2167,20 @@ fn analyze_bridge_validated(
         .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
         let left_source_index = selected_local_route[position - 1];
         let right_source_index = selected_local_route[position];
-        let mut gap_semantics = semantic::select_gap_candidates(
+        let semantic_started = Instant::now();
+        let mut gap_semantics = semantic::select_gap_candidate_matches(
             &semantic_bundle,
             &source_semantic_identities[left_source_index],
             &source_semantic_identities[right_source_index],
             &source_semantic_identities,
-            &semantic_candidates,
+            &semantic_candidate_lookup,
         );
+        semantic_selection_elapsed += semantic_started.elapsed();
         semantic_assisted |= gap_semantics.pool != semantic::SemanticPool::BlissOnly;
-        let semantic_candidate_count = gap_semantics.candidates.len();
+        let semantic_candidate_count = eligible_candidates.len();
         let shortlist_started = Instant::now();
-        if gap_semantics.candidates.len() > shortlist_limit {
-            let mut reserved = gap_semantics
-                .candidates
-                .iter()
-                .filter(|candidate| candidate.tier != semantic::SemanticTier::BlissOnly)
-                .collect::<Vec<_>>();
+        if !eligible_candidates.is_empty() {
+            let mut reserved = gap_semantics.candidates.iter().collect::<Vec<_>>();
             reserved.sort_by(|left, right| {
                 left.compare_priority(right)
                     .then_with(|| left.candidate.cmp(&right.candidate))
@@ -2190,17 +2190,21 @@ fn analyze_bridge_validated(
                 .iter()
                 .map(|candidate| candidate.candidate)
                 .collect::<HashSet<_>>();
-            let remaining = gap_semantics
-                .candidates
+            let remaining = eligible_candidates
                 .iter()
-                .map(|candidate| candidate.candidate)
+                .copied()
                 .filter(|candidate| !selected.contains(candidate))
                 .collect::<Vec<_>>();
+            let acoustic_limit = if eligible_candidates.len() > shortlist_limit {
+                shortlist_limit.saturating_sub(selected.len())
+            } else {
+                remaining.len()
+            };
             let acoustic = bridge::shortlist_candidates(
                 &selected_library_route,
                 position,
                 &remaining,
-                shortlist_limit.saturating_sub(selected.len()),
+                acoustic_limit,
                 bridge::ShortlistScoringContext {
                     tracks: &bridge_tracks,
                     learned_matrix: &learned_matrix,
@@ -2213,6 +2217,20 @@ fn analyze_bridge_validated(
             gap_semantics
                 .candidates
                 .retain(|candidate| selected.contains(&candidate.candidate));
+            let semantic_selected = gap_semantics
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate)
+                .collect::<HashSet<_>>();
+            for candidate in selected {
+                if !semantic_selected.contains(&candidate) {
+                    gap_semantics.candidates.push(semantic::CandidateSemantics {
+                        candidate,
+                        tier: semantic::SemanticTier::BlissOnly,
+                        evidence: Vec::new(),
+                    });
+                }
+            }
         }
         shortlist_elapsed += shortlist_started.elapsed();
         let shortlisted_candidate_count = gap_semantics.candidates.len();
@@ -2328,6 +2346,7 @@ fn analyze_bridge_validated(
             accepted_candidates,
         });
     }
+    timings.record("gap_semantic_selection", semantic_selection_elapsed);
     timings.record("gap_candidate_shortlisting", shortlist_elapsed);
     timings.record("gap_candidate_scoring", strict_scoring_elapsed);
 
