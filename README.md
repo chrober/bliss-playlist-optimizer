@@ -241,6 +241,24 @@ compatibility boundary.
 The Python one-shot implementation remains the behavioral oracle until every
 planned native mode has dedicated parity coverage.
 
+## Release artifacts
+
+The optimizer repository owns native binary builds and their test gate. The
+`.github/workflows/release.yml` workflow runs formatting, Clippy, and tests,
+then builds release binaries for the platform folders consumed by
+[Better Call Bliss](https://github.com/chrober/lms-better-call-bliss):
+
+- `bliss-playlist-optimizer-aarch64-linux`
+- `bliss-playlist-optimizer-armhf-linux`
+- `bliss-playlist-optimizer-x86_64-linux`
+- `bliss-playlist-optimizer-mac`
+- `bliss-playlist-optimizer-windows.exe`
+
+Each asset is published with a `.sha256` file. Normal plugin publishing should
+consume a pinned optimizer GitHub release instead of rebuilding optimizer source
+inside the LMS plugin workflow. Workflow artifacts are still produced for dry
+runs and development inspection.
+
 ## Development
 
 Rust is pinned by `rust-toolchain.toml`. Open the repository in a Dev Container

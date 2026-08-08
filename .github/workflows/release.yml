@@ -1,0 +1,193 @@
+﻿name: Publish optimizer binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optimizer release version. Empty reads Cargo.toml package.version."
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the GitHub release as prerelease."
+        type: boolean
+        required: true
+        default: false
+      dry_run:
+        description: "Build and upload workflow artifacts only; do not create a GitHub release."
+        type: boolean
+        required: true
+        default: false
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: bliss-playlist-optimizer-x86_64-linux
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: bliss-playlist-optimizer
+            apt: ""
+          - asset: bliss-playlist-optimizer-aarch64-linux
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary: bliss-playlist-optimizer
+            apt: gcc-aarch64-linux-gnu
+          - asset: bliss-playlist-optimizer-armhf-linux
+            runner: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            binary: bliss-playlist-optimizer
+            apt: gcc-arm-linux-gnueabihf
+          - asset: bliss-playlist-optimizer-mac
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            binary: bliss-playlist-optimizer
+            apt: ""
+          - asset: bliss-playlist-optimizer-windows.exe
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: bliss-playlist-optimizer.exe
+            apt: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux cross linker
+        if: ${{ runner.os == 'Linux' && matrix.apt != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ${{ matrix.apt }}
+
+      - name: Build release binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            aarch64-unknown-linux-gnu)
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+              ;;
+            armv7-unknown-linux-gnueabihf)
+              export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+              ;;
+          esac
+          cargo build --release --locked --target "$TARGET"
+
+      - name: Stage release asset
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/$TARGET/release/$BINARY" "dist/$ASSET"
+          if [[ "$ASSET" != *.exe ]]; then
+            chmod 0755 "dist/$ASSET"
+          fi
+          (cd dist && sha256sum "$ASSET" > "$ASSET.sha256")
+          ls -l dist
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive release metadata
+        id: meta
+        env:
+          VERSION_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          set -euo pipefail
+          version="$VERSION_INPUT"
+          if [ -z "$version" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+              version="${GITHUB_REF_NAME#v}"
+            else
+              version="$(python - <<'PY'
+import tomllib
+from pathlib import Path
+print(tomllib.loads(Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version'])
+PY
+)"
+            fi
+          fi
+          if [ -z "$version" ]; then
+            echo "Could not determine optimizer version" >&2
+            exit 1
+          fi
+          tag="v${version#v}"
+          echo "version=${version#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bliss-playlist-optimizer-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+        run: |
+          set -euo pipefail
+          notes="release-notes.md"
+          {
+            echo "# bliss-playlist-optimizer $VERSION"
+            echo
+            echo "Native binaries for Better Call Bliss and other playlist-optimization consumers."
+            echo
+            echo "Built from commit $GITHUB_SHA after fmt, clippy, and test gates."
+          } > "$notes"
+
+          prerelease_flag=()
+          if [ "$PRERELEASE" = "true" ]; then
+            prerelease_flag=(--prerelease)
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* \
+              --title "bliss-playlist-optimizer $VERSION" \
+              --notes-file "$notes" \
+              "${prerelease_flag[@]}"
+          fi
