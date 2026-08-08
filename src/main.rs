@@ -1976,6 +1976,7 @@ fn optimize_route_request_with_options(
     Ok(artifact)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_bridge_validated(
     validation: ValidationSummary,
     request: Request,
