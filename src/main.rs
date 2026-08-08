@@ -1083,10 +1083,7 @@ fn prepare_runtime_request(
                 .map_err(|error| CommandFailure::new("MATRIX_INVALID", error.to_string()))?;
             (Some(parsed), Some(hash))
         } else {
-            if matches!(
-                request.scoring.algorithm.as_str(),
-                "learned_matrix"
-            ) {
+            if matches!(request.scoring.algorithm.as_str(), "learned_matrix") {
                 return Err(CommandFailure::new(
                     "MATRIX_REQUIRED",
                     format!(
@@ -1246,10 +1243,7 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
             .map_err(|error| CommandFailure::new("MATRIX_INVALID", error.to_string()))?;
         Some(hash)
     } else {
-        if matches!(
-            request.scoring.algorithm.as_str(),
-            "learned_matrix"
-        ) {
+        if matches!(request.scoring.algorithm.as_str(), "learned_matrix") {
             return Err(CommandFailure::new(
                 "MATRIX_REQUIRED",
                 format!(
@@ -1364,11 +1358,12 @@ fn score_request(path: &Path) -> Result<ScoringArtifact, CommandFailure> {
     } else {
         None
     };
-    let (scoring_matrix, scoring_matrix_sha256, effective_learned_percent) = effective_adaptive_matrix(
-        &request,
-        learned_matrix.as_ref(),
-        validation.learned_matrix_sha256.as_ref(),
-    )?;
+    let (scoring_matrix, scoring_matrix_sha256, effective_learned_percent) =
+        effective_adaptive_matrix(
+            &request,
+            learned_matrix.as_ref(),
+            validation.learned_matrix_sha256.as_ref(),
+        )?;
     let database = BlissDatabase::open_read_only(&request.artifacts.database.path)
         .map_err(|error| CommandFailure::new("DATABASE_INVALID", error.to_string()))?;
 
