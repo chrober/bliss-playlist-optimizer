@@ -71,15 +71,15 @@ Relative artifact paths are resolved against the process working directory;
 production callers should pass absolute paths.
 
 `score` emits a versioned contextual scoring artifact for the request's existing
-order. Its adaptive behavior comes from the same shared core as the learned-
-matrix-enabled `bliss-mixer` fork: one seed uses the learned matrix, while two or
-more seeds dynamically blend the learned matrix with seed variance according to
-`learned_percent`. Although `bliss-mixer-core` can build multi-seed Adaptive
-variance without a learned matrix, this optimizer currently requires
-`artifacts.learned_matrix` for Adaptive jobs because route, bridge, endpoint,
-and seed-growth scoring all need a defined one-track context fallback. The
-result is a sequence of contextual transition legs, not a static pairwise
-matrix.
+order. Adaptive behavior comes from the same shared core as the learned-matrix-
+enabled `bliss-mixer` fork: one-track contexts use the learned matrix when it is
+supplied, while two or more seed tracks dynamically blend the learned matrix
+with seed variance according to `learned_percent`. If no learned matrix is
+supplied, multi-track Adaptive contexts use variance alone and one-track
+contexts fall back to `scoring.feature_weights`. Explicit `static` scoring also
+uses `scoring.feature_weights` for every context by converting the 23 feature
+weights into a fixed diagonal matrix. The result is a sequence of contextual
+transition legs, not a static pairwise matrix.
 
 `route` performs fixed-set sequencing without writing a playlist. Every source
 track appears exactly once. Artist and album look-back windows are hard

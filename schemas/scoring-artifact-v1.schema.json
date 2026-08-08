@@ -36,7 +36,7 @@
     "database_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "learned_matrix_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "semantic_evidence_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-    "algorithm_requested": { "const": "adaptive" },
+    "algorithm_requested": { "enum": ["adaptive", "static"] },
     "learned_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
     "seed_limit": { "type": "integer", "minimum": 1 },
     "parallel_execution": { "const": "rayon-indexed" },

@@ -23,7 +23,7 @@
     "database_sha256": { "$ref": "#/$defs/sha256" },
     "learned_matrix_sha256": { "$ref": "#/$defs/sha256" },
     "semantic_evidence_sha256": { "$ref": "#/$defs/sha256" },
-    "algorithm_requested": { "const": "adaptive" },
+    "algorithm_requested": { "enum": ["adaptive", "static"] },
     "learned_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
     "seed_limit": { "type": "integer", "minimum": 1 },
     "deterministic_seed": { "type": "integer", "minimum": 0 },

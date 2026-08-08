@@ -29,7 +29,7 @@
     "learned_matrix_sha256": { "$ref": "#/$defs/sha256" },
     "local_candidate_inventory_sha256": { "$ref": "#/$defs/sha256" },
     "semantic_evidence_sha256": { "$ref": "#/$defs/sha256" },
-    "algorithm_requested": { "const": "adaptive" },
+    "algorithm_requested": { "enum": ["adaptive", "static"] },
     "ordering_policy": { "enum": ["optimize_order", "preserve_order"] },
     "learned_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
     "seed_limit": { "type": "integer", "minimum": 1 },

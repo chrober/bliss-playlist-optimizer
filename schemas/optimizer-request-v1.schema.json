@@ -40,7 +40,7 @@
       "required": ["algorithm"],
       "properties": {
         "algorithm": {
-          "enum": ["euclidean", "weighted_euclidean", "learned_matrix", "adaptive"]
+          "enum": ["euclidean", "weighted_euclidean", "learned_matrix", "adaptive", "static"]
         },
         "feature_weights": {
           "type": "array",
@@ -64,7 +64,7 @@
       },
       "allOf": [
         {
-          "if": { "properties": { "algorithm": { "const": "adaptive" } } },
+          "if": { "properties": { "algorithm": { "enum": ["adaptive", "static"] } } },
           "then": { "required": ["adaptive"] }
         }
       ]

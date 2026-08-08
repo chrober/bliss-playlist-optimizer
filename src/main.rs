@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use bincode::Options;
 use bliss_mixer_core::database::{BlissDatabase, SUPPORTED_SCHEMA_IDENTITY};
-use bliss_mixer_core::scoring::score_adaptive_sequence;
+use bliss_mixer_core::{scoring::score_adaptive_sequence, FEATURE_COUNT};
 use ndarray::Array2;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -83,6 +83,7 @@ struct SourceTrack {
 struct Scoring {
     algorithm: String,
     adaptive: Option<AdaptiveSettings>,
+    feature_weights: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -615,6 +616,72 @@ impl CommandFailure {
     }
 }
 
+fn static_weight_matrix(request: &Request) -> Result<(Array2<f32>, String), CommandFailure> {
+    let weights = request
+        .scoring
+        .feature_weights
+        .clone()
+        .unwrap_or_else(|| vec![1.0; FEATURE_COUNT]);
+    if weights.len() != FEATURE_COUNT {
+        return Err(CommandFailure::new(
+            "STATIC_WEIGHTS_INVALID",
+            format!(
+                "scoring.feature_weights must contain {FEATURE_COUNT} values, got {}",
+                weights.len()
+            ),
+        ));
+    }
+    if weights
+        .iter()
+        .any(|weight| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err(CommandFailure::new(
+            "STATIC_WEIGHTS_INVALID",
+            "scoring.feature_weights must be finite non-negative numbers",
+        ));
+    }
+    let mut matrix = Array2::<f32>::zeros((FEATURE_COUNT, FEATURE_COUNT));
+    for (index, weight) in weights.iter().enumerate() {
+        matrix[(index, index)] = weight * weight;
+    }
+    let canonical = serde_json::to_vec(&weights).map_err(|error| {
+        CommandFailure::new(
+            "STATIC_WEIGHTS_INVALID",
+            format!("failed to canonicalize static weights: {error}"),
+        )
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(b"static-feature-weights-v1\n");
+    digest.update(&canonical);
+    Ok((matrix, format!("{:x}", digest.finalize())))
+}
+
+fn effective_adaptive_matrix(
+    request: &Request,
+    learned_matrix: Option<&Array2<f32>>,
+    learned_matrix_sha256: Option<&String>,
+) -> Result<(Array2<f32>, String, u16), CommandFailure> {
+    if request.scoring.algorithm == "static" {
+        let (matrix, hash) = static_weight_matrix(request)?;
+        return Ok((matrix, hash, 100));
+    }
+    if let Some(matrix) = learned_matrix {
+        return Ok((
+            matrix.clone(),
+            learned_matrix_sha256
+                .cloned()
+                .expect("loaded learned matrix must have a hash"),
+            request
+                .scoring
+                .adaptive
+                .as_ref()
+                .map(|settings| settings.learned_percent)
+                .unwrap_or(0),
+        ));
+    }
+    let (matrix, hash) = static_weight_matrix(request)?;
+    Ok((matrix, hash, 0))
+}
 fn usage() -> &'static str {
     "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>\n  bliss-playlist-optimizer route --request <request.json> [--timings] [--cache-dir <directory>]\n  bliss-playlist-optimizer bridge --request <request.json> [--timings] [--cache-dir <directory>]"
 }
@@ -1018,7 +1085,7 @@ fn prepare_runtime_request(
         } else {
             if matches!(
                 request.scoring.algorithm.as_str(),
-                "learned_matrix" | "adaptive"
+                "learned_matrix"
             ) {
                 return Err(CommandFailure::new(
                     "MATRIX_REQUIRED",
@@ -1181,7 +1248,7 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
     } else {
         if matches!(
             request.scoring.algorithm.as_str(),
-            "learned_matrix" | "adaptive"
+            "learned_matrix"
         ) {
             return Err(CommandFailure::new(
                 "MATRIX_REQUIRED",
@@ -1274,11 +1341,11 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
 fn score_request(path: &Path) -> Result<ScoringArtifact, CommandFailure> {
     let validation = validate_request(path)?;
     let request = decode_request(path)?;
-    if request.scoring.algorithm != "adaptive" {
+    if !matches!(request.scoring.algorithm.as_str(), "adaptive" | "static") {
         return Err(CommandFailure::new(
             "SCORING_ALGORITHM_UNSUPPORTED",
             format!(
-                "the score command currently supports adaptive scoring, not '{}'",
+                "the score command currently supports adaptive/static scoring, not '{}'",
                 request.scoring.algorithm
             ),
         ));
@@ -1289,14 +1356,19 @@ fn score_request(path: &Path) -> Result<ScoringArtifact, CommandFailure> {
             "adaptive scoring requires scoring.adaptive settings",
         )
     })?;
-    let matrix_artifact = request.artifacts.learned_matrix.as_ref().ok_or_else(|| {
-        CommandFailure::new(
-            "MATRIX_REQUIRED",
-            "adaptive scoring requires artifacts.learned_matrix",
+    let learned_matrix = if let Some(matrix_artifact) = request.artifacts.learned_matrix.as_ref() {
+        Some(
+            bliss_mixer_core::matrix::load_learned_matrix(&matrix_artifact.path)
+                .map_err(|error| CommandFailure::new("MATRIX_INVALID", error.to_string()))?,
         )
-    })?;
-    let learned_matrix = bliss_mixer_core::matrix::load_learned_matrix(&matrix_artifact.path)
-        .map_err(|error| CommandFailure::new("MATRIX_INVALID", error.to_string()))?;
+    } else {
+        None
+    };
+    let (scoring_matrix, scoring_matrix_sha256, effective_learned_percent) = effective_adaptive_matrix(
+        &request,
+        learned_matrix.as_ref(),
+        validation.learned_matrix_sha256.as_ref(),
+    )?;
     let database = BlissDatabase::open_read_only(&request.artifacts.database.path)
         .map_err(|error| CommandFailure::new("DATABASE_INVALID", error.to_string()))?;
 
@@ -1334,8 +1406,8 @@ fn score_request(path: &Path) -> Result<ScoringArtifact, CommandFailure> {
 
     let scored = score_adaptive_sequence(
         &features,
-        Some(&learned_matrix),
-        settings.learned_percent,
+        Some(&scoring_matrix),
+        effective_learned_percent,
         settings.seed_limit,
     )
     .map_err(|error| CommandFailure::new("ADAPTIVE_SCORING_FAILED", error.to_string()))?;
@@ -1372,12 +1444,10 @@ fn score_request(path: &Path) -> Result<ScoringArtifact, CommandFailure> {
         job_id: request.job_id,
         request_sha256: validation.request_sha256,
         database_sha256: validation.database_sha256,
-        learned_matrix_sha256: validation
-            .learned_matrix_sha256
-            .expect("adaptive validation requires a learned matrix"),
+        learned_matrix_sha256: scoring_matrix_sha256,
         semantic_evidence_sha256: validation.semantic_evidence_sha256,
         algorithm_requested: request.scoring.algorithm,
-        learned_percent: settings.learned_percent,
+        learned_percent: effective_learned_percent,
         seed_limit: settings.seed_limit,
         parallel_execution: "rayon-indexed",
         source_track_ids: request
@@ -1753,11 +1823,11 @@ fn optimize_route_request_with_options(
         local_candidate_rows: _,
         database_cache,
     } = validated;
-    if request.scoring.algorithm != "adaptive" {
+    if !matches!(request.scoring.algorithm.as_str(), "adaptive" | "static") {
         return Err(CommandFailure::new(
             "SCORING_ALGORITHM_UNSUPPORTED",
             format!(
-                "the route command currently supports adaptive scoring, not '{}'",
+                "the route command currently supports adaptive/static scoring, not '{}'",
                 request.scoring.algorithm
             ),
         ));
@@ -1806,11 +1876,13 @@ fn optimize_route_request_with_options(
         )
     })?;
     let seed_limit = adaptive.seed_limit;
-    let learned_percent = adaptive.learned_percent;
     let deterministic_seed = request.route.search.deterministic_seed;
     let restart_count = request.route.search.restart_count;
-    let learned_matrix =
-        learned_matrix.expect("adaptive runtime validation requires a learned matrix");
+    let (learned_matrix, scoring_matrix_sha256, learned_percent) = effective_adaptive_matrix(
+        &request,
+        learned_matrix.as_ref(),
+        validation.learned_matrix_sha256.as_ref(),
+    )?;
     let library = library.expect("runtime validation always provides a decoded library");
     let file_to_track = library
         .iter()
@@ -1885,9 +1957,7 @@ fn optimize_route_request_with_options(
         job_id: request.job_id,
         request_sha256: validation.request_sha256,
         database_sha256: validation.database_sha256,
-        learned_matrix_sha256: validation
-            .learned_matrix_sha256
-            .expect("adaptive validation requires a learned matrix"),
+        learned_matrix_sha256: scoring_matrix_sha256,
         semantic_evidence_sha256: validation.semantic_evidence_sha256,
         algorithm_requested: request.scoring.algorithm,
         learned_percent,
@@ -1916,6 +1986,8 @@ fn analyze_bridge_validated(
     request: Request,
     semantic_bundle: semantic::EvidenceBundle,
     learned_matrix: Array2<f32>,
+    scoring_matrix_sha256: String,
+    learned_percent: u16,
     library: Vec<LibraryTrack>,
     local_candidate_rows: Option<HashSet<u64>>,
     timings: &mut StageTimings,
@@ -1927,7 +1999,6 @@ fn analyze_bridge_validated(
         )
     })?;
     let seed_limit = adaptive.seed_limit;
-    let learned_percent = adaptive.learned_percent;
     let deterministic_seed = request.route.search.deterministic_seed;
     let restart_count = request.route.search.restart_count;
     let retained_candidate_limit = request
@@ -2737,9 +2808,7 @@ fn analyze_bridge_validated(
         job_id: request.job_id,
         request_sha256: validation.request_sha256,
         database_sha256: validation.database_sha256,
-        learned_matrix_sha256: validation
-            .learned_matrix_sha256
-            .expect("adaptive validation requires a learned matrix"),
+        learned_matrix_sha256: scoring_matrix_sha256,
         local_candidate_inventory_sha256: validation.local_candidate_inventory_sha256,
         semantic_evidence_sha256: validation.semantic_evidence_sha256,
         algorithm_requested: request.scoring.algorithm,
@@ -2803,11 +2872,11 @@ fn analyze_bridge_request_with_options(
         local_candidate_rows,
         database_cache,
     } = validated;
-    if request.scoring.algorithm != "adaptive" {
+    if !matches!(request.scoring.algorithm.as_str(), "adaptive" | "static") {
         return Err(CommandFailure::new(
             "SCORING_ALGORITHM_UNSUPPORTED",
             format!(
-                "the bridge command currently supports adaptive scoring, not '{}'",
+                "the bridge command currently supports adaptive/static scoring, not '{}'",
                 request.scoring.algorithm
             ),
         ));
@@ -2880,11 +2949,18 @@ fn analyze_bridge_request_with_options(
             "more than one bridge per gap currently requires preserve_order",
         ));
     }
+    let (learned_matrix, scoring_matrix_sha256, learned_percent) = effective_adaptive_matrix(
+        &request,
+        learned_matrix.as_ref(),
+        validation.learned_matrix_sha256.as_ref(),
+    )?;
     let mut artifact = analyze_bridge_validated(
         validation,
         request,
         semantic_bundle,
-        learned_matrix.expect("adaptive runtime validation requires a learned matrix"),
+        learned_matrix,
+        scoring_matrix_sha256,
+        learned_percent,
         library.expect("runtime validation always provides a decoded library"),
         local_candidate_rows,
         &mut timings,
@@ -3472,11 +3548,24 @@ mod tests {
         let mut conflict_request = conflict.request;
         let first_artist = conflict_request.source_tracks[0].artist.clone();
         conflict_request.source_tracks[1].artist = first_artist;
+        let conflict_matrix_sha256 = conflict
+            .summary
+            .learned_matrix_sha256
+            .clone()
+            .expect("synthetic fixture has a learned matrix");
+        let conflict_learned_percent = conflict_request
+            .scoring
+            .adaptive
+            .as_ref()
+            .expect("synthetic fixture uses adaptive settings")
+            .learned_percent;
         let preserve_repeat_conflict = analyze_bridge_validated(
             conflict.summary,
             conflict_request,
             conflict.semantic_bundle,
             conflict.learned_matrix.unwrap(),
+            conflict_matrix_sha256,
+            conflict_learned_percent,
             conflict.library.unwrap(),
             conflict.local_candidate_rows,
             &mut conflict_timings,
