@@ -1119,6 +1119,8 @@ fn select_exact_count_single_gap_bridges(
         .collect::<std::collections::HashSet<_>>()
         .len();
     let structural_upper_bound = ordered_gaps.len().min(unique_candidates);
+    let prune_unreachable_states =
+        selection_config.requested_added_tracks <= structural_upper_bound;
     let initial_metrics = route::evaluate_adaptive_sequence(
         original_route,
         tracks,
@@ -1134,24 +1136,32 @@ fn select_exact_count_single_gap_bridges(
     }];
     let mut evaluated_states = 1usize;
     let mut retained_states = 1usize;
+    let mut maximum_additions_seen = 0usize;
 
-    for gap in &ordered_gaps {
+    let gap_count = ordered_gaps.len();
+    for (gap_index, gap) in ordered_gaps.iter().enumerate() {
+        let remaining_after_gap = gap_count.saturating_sub(gap_index + 1);
         let batches = states
             .par_iter()
             .map(|state| {
                 let position = route_position(&state.route, gap)
                     .ok_or(PreviewError::InvalidOriginalGap(gap.original_position))?;
                 let mut expanded = Vec::new();
-                let mut skipped = state.clone();
-                skipped.decisions.push(exact_decision(
-                    gap,
-                    position,
-                    DecisionReason::NotSelected,
-                    None,
-                ));
-                expanded.push(skipped);
 
                 let added = state.route.len() - original_route.len();
+                let mut local_max_added = added;
+                if !prune_unreachable_states
+                    || added + remaining_after_gap >= selection_config.requested_added_tracks
+                {
+                    let mut skipped = state.clone();
+                    skipped.decisions.push(exact_decision(
+                        gap,
+                        position,
+                        DecisionReason::NotSelected,
+                        None,
+                    ));
+                    expanded.push(skipped);
+                }
                 if added < selection_config.requested_added_tracks
                     && !gap.semantics.candidates.is_empty()
                 {
@@ -1181,6 +1191,8 @@ fn select_exact_count_single_gap_bridges(
                             .clone();
                         let mut inserted = state.clone();
                         inserted.route.insert(position, evaluation.candidate);
+                        local_max_added =
+                            local_max_added.max(inserted.route.len() - original_route.len());
                         inserted.objective = route::evaluate_adaptive_sequence(
                             &inserted.route,
                             tracks,
@@ -1202,13 +1214,15 @@ fn select_exact_count_single_gap_bridges(
                         expanded.push(inserted);
                     }
                 }
-                Ok(expanded)
+                Ok((expanded, local_max_added))
             })
-            .collect::<Vec<Result<Vec<_>, PreviewError>>>();
+            .collect::<Vec<Result<_, PreviewError>>>();
 
         let mut buckets = BTreeMap::<usize, Vec<ExactState>>::new();
         for batch in batches {
-            for state in batch? {
+            let (expanded, local_max_added) = batch?;
+            maximum_additions_seen = maximum_additions_seen.max(local_max_added);
+            for state in expanded {
                 evaluated_states += 1;
                 let added = state.route.len() - original_route.len();
                 buckets.entry(added).or_default().push(state);
@@ -1236,7 +1250,8 @@ fn select_exact_count_single_gap_bridges(
         .iter()
         .map(|state| state.route.len() - original_route.len())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(maximum_additions_seen);
     let selected = states
         .into_iter()
         .filter(|state| {
