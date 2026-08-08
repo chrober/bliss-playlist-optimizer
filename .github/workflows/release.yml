@@ -137,12 +137,7 @@ jobs:
             if [[ "$GITHUB_REF" == refs/tags/* ]]; then
               version="${GITHUB_REF_NAME#v}"
             else
-              version="$(python - <<'PY'
-import tomllib
-from pathlib import Path
-print(tomllib.loads(Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version'])
-PY
-)"
+              version="$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')"
             fi
           fi
           if [ -z "$version" ]; then
