@@ -1,4 +1,4 @@
-﻿name: Publish optimizer binaries
+name: Publish optimizer binaries
 
 on:
   workflow_dispatch:
