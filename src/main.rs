@@ -431,6 +431,73 @@ struct SeedGrowthContext<'a> {
     shortlist_limit: usize,
 }
 
+fn place_seed_growth_additions_preserving_source_order(
+    source_route: &[usize],
+    additions: &[(usize, f64)],
+    tracks: &[route::RouteTrack],
+    learned_matrix: &Array2<f32>,
+    route_config: &route::SearchConfig,
+) -> Result<(Vec<usize>, route::RouteMetrics), CommandFailure> {
+    let mut route = source_route.to_vec();
+
+    for (candidate, _) in additions {
+        let mut best: Option<(usize, route::RouteMetrics, Vec<usize>)> = None;
+        for position in 0..=route.len() {
+            let mut proposed = route.clone();
+            proposed.insert(position, *candidate);
+            let violations = route::repeat_violations(&proposed, tracks, route_config).len();
+            let metrics = route::evaluate_adaptive_sequence(
+                &proposed,
+                tracks,
+                learned_matrix,
+                route_config.seed_limit,
+                route_config.learned_percent,
+            )
+            .map_err(|error| CommandFailure::new("SEED_GROWTH_ROUTE_FAILED", error.to_string()))?;
+            let replace =
+                best.as_ref()
+                    .is_none_or(|(best_violations, best_metrics, best_route)| {
+                        violations < *best_violations
+                            || (violations == *best_violations
+                                && (metrics.objective < best_metrics.objective
+                                    || (metrics.objective == best_metrics.objective
+                                        && proposed < *best_route)))
+                    });
+            if replace {
+                best = Some((violations, metrics, proposed));
+            }
+        }
+        let Some((_, _, next_route)) = best else {
+            return Err(CommandFailure::new(
+                "SEED_GROWTH_PRESERVE_ORDER_INFEASIBLE",
+                "no insertion slot was available for a selected seed-growth addition",
+            ));
+        };
+        route = next_route;
+    }
+
+    let violations = route::repeat_violations(&route, tracks, route_config);
+    if !violations.is_empty() {
+        return Err(CommandFailure::new(
+            "SEED_GROWTH_PRESERVE_ORDER_INFEASIBLE",
+            format!(
+                "preserving source order still leaves {} repeat-window violation(s); increase the target size or relax repeat windows",
+                violations.len()
+            ),
+        ));
+    }
+
+    let metrics = route::evaluate_adaptive_sequence(
+        &route,
+        tracks,
+        learned_matrix,
+        route_config.seed_limit,
+        route_config.learned_percent,
+    )
+    .map_err(|error| CommandFailure::new("SEED_GROWTH_ROUTE_FAILED", error.to_string()))?;
+    Ok((route, metrics))
+}
+
 #[derive(Debug, Serialize)]
 struct ExactSelectionArtifact {
     mode: &'static str,
@@ -1566,6 +1633,7 @@ fn select_seed_growth(
     source_library_indices: &[usize],
     selected_library_route: &[usize],
     eligible_candidates: &[usize],
+    preserve_source_order: bool,
     context: SeedGrowthContext<'_>,
 ) -> Result<SeedGrowthResult, CommandFailure> {
     let SeedGrowthContext {
@@ -1775,20 +1843,32 @@ fn select_seed_growth(
             ),
         ));
     }
-    let route_tracks = membership
-        .iter()
-        .map(|index| tracks[*index].clone())
-        .collect::<Vec<_>>();
-    let result = route::optimize_adaptive_route(&route_tracks, learned_matrix, route_config)
-        .map_err(|error| CommandFailure::new("SEED_GROWTH_ROUTE_FAILED", error.to_string()))?;
-    let selected_strategy = result.selected.strategy;
-    let route_metrics = result.selected.metrics;
-    let final_route = result
-        .selected
-        .route
-        .iter()
-        .map(|index| membership[*index])
-        .collect::<Vec<_>>();
+    let (final_route, selected_strategy, route_metrics) = if preserve_source_order {
+        let (route, metrics) = place_seed_growth_additions_preserving_source_order(
+            selected_library_route,
+            &additions,
+            tracks,
+            learned_matrix,
+            route_config,
+        )?;
+        (route, "seed-growth-preserve-order", metrics)
+    } else {
+        let route_tracks = membership
+            .iter()
+            .map(|index| tracks[*index].clone())
+            .collect::<Vec<_>>();
+        let result = route::optimize_adaptive_route(&route_tracks, learned_matrix, route_config)
+            .map_err(|error| CommandFailure::new("SEED_GROWTH_ROUTE_FAILED", error.to_string()))?;
+        let selected_strategy = result.selected.strategy;
+        let route_metrics = result.selected.metrics;
+        let final_route = result
+            .selected
+            .route
+            .iter()
+            .map(|index| membership[*index])
+            .collect::<Vec<_>>();
+        (final_route, selected_strategy, route_metrics)
+    };
     Ok(SeedGrowthResult {
         final_route,
         additions,
@@ -2686,6 +2766,7 @@ fn analyze_bridge_validated(
                 &source_library_indices,
                 &selected_library_route,
                 &eligible_candidates,
+                request.route.ordering_policy == "preserve_order",
                 SeedGrowthContext {
                     semantic_candidates: &semantic_candidates,
                     source_semantic_identities: &source_semantic_identities,
@@ -3119,6 +3200,7 @@ mod tests {
             &[0, 1],
             &[0, 1],
             &candidates,
+            false,
             SeedGrowthContext {
                 semantic_candidates: &semantic_candidates,
                 source_semantic_identities: &source_semantic_identities,
@@ -3145,12 +3227,44 @@ mod tests {
         );
         assert!(route::repeat_violations(&growth.final_route, &tracks, &config).is_empty());
 
+        let preserved = select_seed_growth(
+            25,
+            &[0, 1],
+            &[1, 0],
+            &candidates,
+            true,
+            SeedGrowthContext {
+                semantic_candidates: &semantic_candidates,
+                source_semantic_identities: &source_semantic_identities,
+                semantic_bundle: &semantic_bundle,
+                tracks: &tracks,
+                learned_matrix: &Array2::eye(23),
+                route_config: &config,
+                selection: SelectionSettings::default(),
+                shortlist_limit: 256,
+            },
+        )
+        .unwrap();
+        assert_eq!(preserved.selected_strategy, "seed-growth-preserve-order");
+        assert_eq!(preserved.final_route.len(), 25);
+        assert_eq!(
+            preserved
+                .final_route
+                .iter()
+                .filter(|index| **index == 0 || **index == 1)
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert!(route::repeat_violations(&preserved.final_route, &tracks, &config).is_empty());
+
         let varied = |seed| {
             select_seed_growth(
                 25,
                 &[0, 1],
                 &[0, 1],
                 &candidates,
+                false,
                 SeedGrowthContext {
                     semantic_candidates: &semantic_candidates,
                     source_semantic_identities: &source_semantic_identities,
