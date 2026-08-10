@@ -95,7 +95,7 @@ Requests may include the strategy-neutral `selection` block with
 `variation_percent`, `generation_seed`, `lastfm_track_guidance_percent`, and
 `lastfm_artist_guidance_percent`.
 Variation zero preserves the strict deterministic route and best-match
-seed-growth membership. Higher values seed route search; seed growth also
+fixed-source extension membership. Higher values seed route search; fixed-source extension also
 performs reproducible weighted sampling inside a bounded top acoustic pool.
 The same seed and inputs reproduce membership across worker counts. Selection
 is downstream of scoring rather than nested under Adaptive, so Static and
@@ -103,8 +103,8 @@ Forest can reuse it when those strategies are connected. The two Last.fm values
 independently scale recording and artist evidence after local-inventory,
 acoustic, uniqueness, and repeat-capacity qualification. Zero ignores that
 evidence type. Bridge ranking caps the combined adjustment at ten percentile
-points. Deterministic seed growth caps semantic movement at 20% of its bounded
-Bliss relevance pool; varied growth uses a bounded evidence multiplier. These
+points. Deterministic fixed-source extension caps semantic movement at 20% of its bounded
+Bliss relevance pool; varied fixed-source extension uses a bounded evidence multiplier. These
 are guidance strengths, not quotas, and even 100 cannot rescue an acoustically
 rejected candidate. The deprecated `lastfm_artist_probability` spelling remains
 an input alias for artist guidance. Omitting the block retains deterministic

@@ -359,11 +359,11 @@ struct AutomaticSelectionArtifact {
 enum SelectionPreviewArtifact {
     Automatic(AutomaticSelectionArtifact),
     Exact(ExactSelectionArtifact),
-    SeedGrowth(SeedGrowthSelectionArtifact),
+    FixedSourceExtension(FixedSourceExtensionSelectionArtifact),
 }
 
 #[derive(Debug, Serialize)]
-struct SeedGrowthSelectionArtifact {
+struct FixedSourceExtensionSelectionArtifact {
     mode: &'static str,
     processing_order: &'static str,
     target_track_count: usize,
@@ -373,22 +373,22 @@ struct SeedGrowthSelectionArtifact {
     original_subsequence_preserved: bool,
     unique_membership: bool,
     relevance_reference_track_count: usize,
-    relevance_summary: SeedGrowthRelevanceSummaryArtifact,
-    route_summary: SeedGrowthRouteSummaryArtifact,
-    acceptance_proofs: SeedGrowthAcceptanceProofsArtifact,
+    relevance_summary: FixedSourceExtensionRelevanceSummaryArtifact,
+    route_summary: FixedSourceExtensionRouteSummaryArtifact,
+    acceptance_proofs: FixedSourceExtensionAcceptanceProofsArtifact,
     final_sequence: Vec<PreviewSequenceEntryArtifact>,
-    selected_additions: Vec<SeedGrowthAdditionArtifact>,
+    selected_additions: Vec<FixedSourceExtensionAdditionArtifact>,
 }
 
 #[derive(Debug, Serialize)]
-struct SeedGrowthRelevanceSummaryArtifact {
+struct FixedSourceExtensionRelevanceSummaryArtifact {
     minimum_distance: f64,
     mean_distance: f64,
     maximum_distance: f64,
 }
 
 #[derive(Debug, Serialize)]
-struct SeedGrowthRouteSummaryArtifact {
+struct FixedSourceExtensionRouteSummaryArtifact {
     strategy: &'static str,
     transition_sum: f64,
     worst_transition: f64,
@@ -397,7 +397,7 @@ struct SeedGrowthRouteSummaryArtifact {
 }
 
 #[derive(Debug, Serialize)]
-struct SeedGrowthAcceptanceProofsArtifact {
+struct FixedSourceExtensionAcceptanceProofsArtifact {
     exact_target_satisfied: bool,
     all_source_tracks_retained_once: bool,
     all_additions_from_local_inventory: bool,
@@ -408,19 +408,19 @@ struct SeedGrowthAcceptanceProofsArtifact {
 }
 
 #[derive(Debug, Serialize)]
-struct SeedGrowthAdditionArtifact {
+struct FixedSourceExtensionAdditionArtifact {
     candidate_id: String,
     relevance_distance: f64,
 }
 
-struct SeedGrowthResult {
+struct FixedSourceExtensionResult {
     final_route: Vec<usize>,
     additions: Vec<(usize, f64)>,
     selected_strategy: &'static str,
     route_metrics: route::RouteMetrics,
 }
 
-struct SeedGrowthContext<'a> {
+struct FixedSourceExtensionContext<'a> {
     semantic_candidates: &'a [semantic::CandidateIdentity],
     source_semantic_identities: &'a [semantic::TrackIdentity],
     semantic_bundle: &'a semantic::EvidenceBundle,
@@ -431,7 +431,7 @@ struct SeedGrowthContext<'a> {
     shortlist_limit: usize,
 }
 
-fn place_seed_growth_additions_preserving_source_order(
+fn place_fixed_source_extension_additions_preserving_source_order(
     source_route: &[usize],
     additions: &[(usize, f64)],
     tracks: &[route::RouteTrack],
@@ -453,7 +453,9 @@ fn place_seed_growth_additions_preserving_source_order(
                 route_config.seed_limit,
                 route_config.learned_percent,
             )
-            .map_err(|error| CommandFailure::new("SEED_GROWTH_ROUTE_FAILED", error.to_string()))?;
+            .map_err(|error| {
+                CommandFailure::new("FIXED_SOURCE_EXTENSION_ROUTE_FAILED", error.to_string())
+            })?;
             let replace =
                 best.as_ref()
                     .is_none_or(|(best_violations, best_metrics, best_route)| {
@@ -469,8 +471,8 @@ fn place_seed_growth_additions_preserving_source_order(
         }
         let Some((_, _, next_route)) = best else {
             return Err(CommandFailure::new(
-                "SEED_GROWTH_PRESERVE_ORDER_INFEASIBLE",
-                "no insertion slot was available for a selected seed-growth addition",
+                "FIXED_SOURCE_EXTENSION_PRESERVE_ORDER_INFEASIBLE",
+                "no insertion slot was available for a selected fixed-source extension addition",
             ));
         };
         route = next_route;
@@ -479,7 +481,7 @@ fn place_seed_growth_additions_preserving_source_order(
     let violations = route::repeat_violations(&route, tracks, route_config);
     if !violations.is_empty() {
         return Err(CommandFailure::new(
-            "SEED_GROWTH_PRESERVE_ORDER_INFEASIBLE",
+            "FIXED_SOURCE_EXTENSION_PRESERVE_ORDER_INFEASIBLE",
             format!(
                 "preserving source order still leaves {} repeat-window violation(s); increase the target size or relax repeat windows",
                 violations.len()
@@ -494,7 +496,9 @@ fn place_seed_growth_additions_preserving_source_order(
         route_config.seed_limit,
         route_config.learned_percent,
     )
-    .map_err(|error| CommandFailure::new("SEED_GROWTH_ROUTE_FAILED", error.to_string()))?;
+    .map_err(|error| {
+        CommandFailure::new("FIXED_SOURCE_EXTENSION_ROUTE_FAILED", error.to_string())
+    })?;
     Ok((route, metrics))
 }
 
@@ -1628,15 +1632,15 @@ fn endpoint_candidate_artifact(
     }
 }
 
-fn select_seed_growth(
+fn select_fixed_source_extension(
     target_track_count: usize,
     source_library_indices: &[usize],
     selected_library_route: &[usize],
     eligible_candidates: &[usize],
     preserve_source_order: bool,
-    context: SeedGrowthContext<'_>,
-) -> Result<SeedGrowthResult, CommandFailure> {
-    let SeedGrowthContext {
+    context: FixedSourceExtensionContext<'_>,
+) -> Result<FixedSourceExtensionResult, CommandFailure> {
+    let FixedSourceExtensionContext {
         semantic_candidates,
         source_semantic_identities,
         semantic_bundle,
@@ -1648,9 +1652,9 @@ fn select_seed_growth(
     } = context;
     if target_track_count <= source_library_indices.len() {
         return Err(CommandFailure::new(
-            "SEED_GROWTH_TARGET_INVALID",
+            "FIXED_SOURCE_EXTENSION_TARGET_INVALID",
             format!(
-                "seed-growth target {target_track_count} must exceed the {} source tracks",
+                "fixed-source extension target {target_track_count} must exceed the {} source tracks",
                 source_library_indices.len()
             ),
         ));
@@ -1658,9 +1662,9 @@ fn select_seed_growth(
     let requested = target_track_count - source_library_indices.len();
     if requested > eligible_candidates.len() {
         return Err(CommandFailure::new(
-            "SEED_GROWTH_INFEASIBLE",
+            "FIXED_SOURCE_EXTENSION_INFEASIBLE",
             format!(
-                "seed growth needs {requested} additions but only {} local analyzed candidates are eligible",
+                "fixed-source extension needs {requested} additions but only {} local analyzed candidates are eligible",
                 eligible_candidates.len()
             ),
         ));
@@ -1677,7 +1681,9 @@ fn select_seed_growth(
         learned_matrix,
         route_config.learned_percent,
     )
-    .map_err(|error| CommandFailure::new("SEED_GROWTH_SCORING_FAILED", error.to_string()))?;
+    .map_err(|error| {
+        CommandFailure::new("FIXED_SOURCE_EXTENSION_SCORING_FAILED", error.to_string())
+    })?;
     let mut ranked = eligible_candidates
         .par_iter()
         .map(|candidate| {
@@ -1811,7 +1817,7 @@ fn select_seed_growth(
         || album_counts.values().any(|count| *count > album_capacity)
     {
         return Err(CommandFailure::new(
-            "SEED_GROWTH_INFEASIBLE",
+            "FIXED_SOURCE_EXTENSION_INFEASIBLE",
             "the source membership exceeds the requested target's repeat-window capacity",
         ));
     }
@@ -1836,7 +1842,7 @@ fn select_seed_growth(
     }
     if additions.len() != requested {
         return Err(CommandFailure::new(
-            "SEED_GROWTH_INFEASIBLE",
+            "FIXED_SOURCE_EXTENSION_INFEASIBLE",
             format!(
                 "repeat-safe membership selection found {} of {requested} required additions",
                 additions.len()
@@ -1844,21 +1850,23 @@ fn select_seed_growth(
         ));
     }
     let (final_route, selected_strategy, route_metrics) = if preserve_source_order {
-        let (route, metrics) = place_seed_growth_additions_preserving_source_order(
+        let (route, metrics) = place_fixed_source_extension_additions_preserving_source_order(
             selected_library_route,
             &additions,
             tracks,
             learned_matrix,
             route_config,
         )?;
-        (route, "seed-growth-preserve-order", metrics)
+        (route, "fixed-source-extension-preserve-order", metrics)
     } else {
         let route_tracks = membership
             .iter()
             .map(|index| tracks[*index].clone())
             .collect::<Vec<_>>();
         let result = route::optimize_adaptive_route(&route_tracks, learned_matrix, route_config)
-            .map_err(|error| CommandFailure::new("SEED_GROWTH_ROUTE_FAILED", error.to_string()))?;
+            .map_err(|error| {
+                CommandFailure::new("FIXED_SOURCE_EXTENSION_ROUTE_FAILED", error.to_string())
+            })?;
         let selected_strategy = result.selected.strategy;
         let route_metrics = result.selected.metrics;
         let final_route = result
@@ -1869,7 +1877,7 @@ fn select_seed_growth(
             .collect::<Vec<_>>();
         (final_route, selected_strategy, route_metrics)
     };
-    Ok(SeedGrowthResult {
+    Ok(FixedSourceExtensionResult {
         final_route,
         additions,
         selected_strategy,
@@ -2109,7 +2117,7 @@ fn analyze_bridge_validated(
                     )
                 })?),
             ),
-            "seed_growth" => (None, None, None),
+            "fixed_source_extension" => (None, None, None),
             _ => unreachable!("bridge mode is checked before analysis"),
         };
     let started = Instant::now();
@@ -2180,7 +2188,7 @@ fn analyze_bridge_validated(
         artist_window: request.repeat_windows.artist,
         album_window: request.repeat_windows.album,
     };
-    let base_route_config = if request.extension.mode == "seed_growth" {
+    let base_route_config = if request.extension.mode == "fixed_source_extension" {
         route::SearchConfig {
             artist_window: 0,
             album_window: 0,
@@ -2297,7 +2305,7 @@ fn analyze_bridge_validated(
     let mut gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut preview_gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut semantic_assisted = false;
-    let first_gap = if request.extension.mode == "seed_growth" {
+    let first_gap = if request.extension.mode == "fixed_source_extension" {
         selected_library_route.len()
     } else {
         1
@@ -2754,20 +2762,20 @@ fn analyze_bridge_validated(
                 infeasibility,
             })
         }
-        "seed_growth" => {
+        "fixed_source_extension" => {
             let target_track_count = request.extension.target_track_count.ok_or_else(|| {
                 CommandFailure::new(
-                    "SEED_GROWTH_TARGET_REQUIRED",
-                    "seed_growth extension requires extension.target_track_count",
+                    "FIXED_SOURCE_EXTENSION_TARGET_REQUIRED",
+                    "fixed_source_extension extension requires extension.target_track_count",
                 )
             })?;
-            let growth = select_seed_growth(
+            let extension_result = select_fixed_source_extension(
                 target_track_count,
                 &source_library_indices,
                 &selected_library_route,
                 &eligible_candidates,
                 request.route.ordering_policy == "preserve_order",
-                SeedGrowthContext {
+                FixedSourceExtensionContext {
                     semantic_candidates: &semantic_candidates,
                     source_semantic_identities: &source_semantic_identities,
                     semantic_bundle: &semantic_bundle,
@@ -2778,18 +2786,22 @@ fn analyze_bridge_validated(
                     shortlist_limit,
                 },
             )?;
-            selected_strategy = growth.selected_strategy;
-            selected_route_objective = growth.route_metrics.objective;
+            selected_strategy = extension_result.selected_strategy;
+            selected_route_objective = extension_result.route_metrics.objective;
             let requested_added_tracks = target_track_count - source_library_indices.len();
-            let original_subsequence_preserved = growth
+            let original_subsequence_preserved = extension_result
                 .final_route
                 .iter()
                 .filter(|index| original_ids_by_library.contains_key(index))
                 .eq(selected_library_route.iter());
-            let unique_membership =
-                growth.final_route.iter().collect::<HashSet<_>>().len() == growth.final_route.len();
+            let unique_membership = extension_result
+                .final_route
+                .iter()
+                .collect::<HashSet<_>>()
+                .len()
+                == extension_result.final_route.len();
             let all_source_tracks_retained_once = source_library_indices.iter().all(|source| {
-                growth
+                extension_result
                     .final_route
                     .iter()
                     .filter(|index| *index == source)
@@ -2798,60 +2810,64 @@ fn analyze_bridge_validated(
             });
             let eligible_candidate_set =
                 eligible_candidates.iter().copied().collect::<HashSet<_>>();
-            let all_additions_from_local_inventory = growth
+            let all_additions_from_local_inventory = extension_result
                 .additions
                 .iter()
                 .all(|(candidate, _)| eligible_candidate_set.contains(candidate));
-            let repeat_violations =
-                route::repeat_violations(&growth.final_route, &bridge_tracks, &route_config);
+            let repeat_violations = route::repeat_violations(
+                &extension_result.final_route,
+                &bridge_tracks,
+                &route_config,
+            );
             let artist_repeat_window_satisfied = repeat_violations
                 .iter()
                 .all(|violation| violation.kind != "artist");
             let album_repeat_window_satisfied = repeat_violations
                 .iter()
                 .all(|violation| violation.kind != "album");
-            let relevance_minimum = growth
+            let relevance_minimum = extension_result
                 .additions
                 .iter()
                 .map(|(_, distance)| *distance)
                 .min_by(f64::total_cmp)
                 .unwrap_or(0.0);
-            let relevance_maximum = growth
+            let relevance_maximum = extension_result
                 .additions
                 .iter()
                 .map(|(_, distance)| *distance)
                 .max_by(f64::total_cmp)
                 .unwrap_or(0.0);
-            let relevance_mean = growth
+            let relevance_mean = extension_result
                 .additions
                 .iter()
                 .map(|(_, distance)| *distance)
                 .sum::<f64>()
-                / growth.additions.len().max(1) as f64;
-            SelectionPreviewArtifact::SeedGrowth(SeedGrowthSelectionArtifact {
-                mode: "seed_growth",
-                processing_order: "full-seed-relevance-then-complete-membership-route",
+                / extension_result.additions.len().max(1) as f64;
+            SelectionPreviewArtifact::FixedSourceExtension(FixedSourceExtensionSelectionArtifact {
+                mode: "fixed_source_extension",
+                processing_order: "full-source-relevance-then-complete-membership-route",
                 target_track_count,
                 requested_added_tracks,
                 feasible: true,
-                added_track_count: growth.additions.len(),
+                added_track_count: extension_result.additions.len(),
                 original_subsequence_preserved,
                 unique_membership,
                 relevance_reference_track_count: source_library_indices.len(),
-                relevance_summary: SeedGrowthRelevanceSummaryArtifact {
+                relevance_summary: FixedSourceExtensionRelevanceSummaryArtifact {
                     minimum_distance: relevance_minimum,
                     mean_distance: relevance_mean,
                     maximum_distance: relevance_maximum,
                 },
-                route_summary: SeedGrowthRouteSummaryArtifact {
-                    strategy: growth.selected_strategy,
-                    transition_sum: growth.route_metrics.transition_sum,
-                    worst_transition: growth.route_metrics.worst_transition,
-                    objective: growth.route_metrics.objective,
-                    arc_error: growth.route_metrics.arc_error,
+                route_summary: FixedSourceExtensionRouteSummaryArtifact {
+                    strategy: extension_result.selected_strategy,
+                    transition_sum: extension_result.route_metrics.transition_sum,
+                    worst_transition: extension_result.route_metrics.worst_transition,
+                    objective: extension_result.route_metrics.objective,
+                    arc_error: extension_result.route_metrics.arc_error,
                 },
-                acceptance_proofs: SeedGrowthAcceptanceProofsArtifact {
-                    exact_target_satisfied: growth.final_route.len() == target_track_count,
+                acceptance_proofs: FixedSourceExtensionAcceptanceProofsArtifact {
+                    exact_target_satisfied: extension_result.final_route.len()
+                        == target_track_count,
                     all_source_tracks_retained_once,
                     all_additions_from_local_inventory,
                     unique_membership,
@@ -2859,12 +2875,12 @@ fn analyze_bridge_validated(
                     album_repeat_window_satisfied,
                     track_repeat_window_satisfied_by_unique_membership: unique_membership,
                 },
-                final_sequence: sequence_artifact(&growth.final_route),
-                selected_additions: growth
+                final_sequence: sequence_artifact(&extension_result.final_route),
+                selected_additions: extension_result
                     .additions
                     .into_iter()
                     .map(
-                        |(candidate, relevance_distance)| SeedGrowthAdditionArtifact {
+                        |(candidate, relevance_distance)| FixedSourceExtensionAdditionArtifact {
                             candidate_id: bridge_candidate_id(library[candidate].row_id),
                             relevance_distance,
                         },
@@ -2993,12 +3009,12 @@ fn analyze_bridge_request_with_options(
     }
     if !matches!(
         request.extension.mode.as_str(),
-        "automatic" | "exact_count" | "seed_growth"
+        "automatic" | "exact_count" | "fixed_source_extension"
     ) {
         return Err(CommandFailure::new(
             "EXTENSION_MODE_UNSUPPORTED",
             format!(
-                "the bridge command currently analyzes automatic, exact_count, or seed_growth extension, not '{}'",
+                "the bridge command currently analyzes automatic, exact_count, or fixed_source_extension extension, not '{}'",
                 request.extension.mode
             ),
         ));
@@ -3139,7 +3155,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_growth_reaches_exact_target_without_relevance_drift() {
+    fn fixed_source_extension_reaches_exact_target_without_relevance_drift() {
         let tracks = (0..32)
             .map(|index| route::RouteTrack {
                 features: std::array::from_fn(|feature| {
@@ -3195,13 +3211,13 @@ mod tests {
             providers: Vec::new(),
             edges: Vec::new(),
         };
-        let growth = select_seed_growth(
+        let extension_result = select_fixed_source_extension(
             25,
             &[0, 1],
             &[0, 1],
             &candidates,
             false,
-            SeedGrowthContext {
+            FixedSourceExtensionContext {
                 semantic_candidates: &semantic_candidates,
                 source_semantic_identities: &source_semantic_identities,
                 semantic_bundle: &semantic_bundle,
@@ -3213,11 +3229,18 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(growth.final_route.len(), 25);
-        assert_eq!(growth.additions.len(), 23);
-        assert_eq!(growth.final_route.iter().collect::<HashSet<_>>().len(), 25);
+        assert_eq!(extension_result.final_route.len(), 25);
+        assert_eq!(extension_result.additions.len(), 23);
         assert_eq!(
-            growth
+            extension_result
+                .final_route
+                .iter()
+                .collect::<HashSet<_>>()
+                .len(),
+            25
+        );
+        assert_eq!(
+            extension_result
                 .final_route
                 .iter()
                 .filter(|index| **index == 0 || **index == 1)
@@ -3225,15 +3248,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
-        assert!(route::repeat_violations(&growth.final_route, &tracks, &config).is_empty());
+        assert!(
+            route::repeat_violations(&extension_result.final_route, &tracks, &config).is_empty()
+        );
 
-        let preserved = select_seed_growth(
+        let preserved = select_fixed_source_extension(
             25,
             &[0, 1],
             &[1, 0],
             &candidates,
             true,
-            SeedGrowthContext {
+            FixedSourceExtensionContext {
                 semantic_candidates: &semantic_candidates,
                 source_semantic_identities: &source_semantic_identities,
                 semantic_bundle: &semantic_bundle,
@@ -3245,7 +3270,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(preserved.selected_strategy, "seed-growth-preserve-order");
+        assert_eq!(
+            preserved.selected_strategy,
+            "fixed-source-extension-preserve-order"
+        );
         assert_eq!(preserved.final_route.len(), 25);
         assert_eq!(
             preserved
@@ -3259,13 +3287,13 @@ mod tests {
         assert!(route::repeat_violations(&preserved.final_route, &tracks, &config).is_empty());
 
         let varied = |seed| {
-            select_seed_growth(
+            select_fixed_source_extension(
                 25,
                 &[0, 1],
                 &[0, 1],
                 &candidates,
                 false,
-                SeedGrowthContext {
+                FixedSourceExtensionContext {
                     semantic_candidates: &semantic_candidates,
                     source_semantic_identities: &source_semantic_identities,
                     semantic_bundle: &semantic_bundle,
@@ -3458,7 +3486,8 @@ mod tests {
             SelectionPreviewArtifact::Automatic(preview) => {
                 assert_eq!(preview.added_track_count, 0)
             }
-            SelectionPreviewArtifact::Exact(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+            SelectionPreviewArtifact::Exact(_)
+            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
                 panic!("expected automatic preview")
             }
         }
@@ -3811,7 +3840,8 @@ mod tests {
         );
         let automatic = match &preview_artifact.selection_preview {
             SelectionPreviewArtifact::Automatic(automatic) => automatic,
-            SelectionPreviewArtifact::Exact(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+            SelectionPreviewArtifact::Exact(_)
+            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
                 panic!("expected automatic preview")
             }
         };
@@ -3852,7 +3882,8 @@ mod tests {
         );
         let exact = match &exact_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+            SelectionPreviewArtifact::Automatic(_)
+            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
                 panic!("expected exact-count preview")
             }
         };
@@ -3885,7 +3916,8 @@ mod tests {
         );
         let infeasible = match &infeasible_exact_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+            SelectionPreviewArtifact::Automatic(_)
+            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
                 panic!("expected exact-count preview")
             }
         };
@@ -3935,7 +3967,8 @@ mod tests {
         );
         let preserve_automatic = match &preserve_automatic_artifact.selection_preview {
             SelectionPreviewArtifact::Automatic(automatic) => automatic,
-            SelectionPreviewArtifact::Exact(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+            SelectionPreviewArtifact::Exact(_)
+            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
                 panic!("expected automatic preview")
             }
         };
@@ -3983,7 +4016,8 @@ mod tests {
         );
         let preserve_exact = match &preserve_exact_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+            SelectionPreviewArtifact::Automatic(_)
+            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
                 panic!("expected exact-count preview")
             }
         };
@@ -4033,7 +4067,8 @@ mod tests {
         );
         let preserve_multi_track = match &preserve_multi_track_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+            SelectionPreviewArtifact::Automatic(_)
+            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
                 panic!("expected exact-count preview")
             }
         };
@@ -4106,7 +4141,8 @@ mod tests {
 
         let exact = match &artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_) | SelectionPreviewArtifact::SeedGrowth(_) => {
+            SelectionPreviewArtifact::Automatic(_)
+            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
                 panic!("expected exact-count preview")
             }
         };

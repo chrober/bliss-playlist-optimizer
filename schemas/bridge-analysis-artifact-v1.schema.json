@@ -82,7 +82,7 @@
       "oneOf": [
         { "$ref": "#/$defs/automatic_selection_preview" },
         { "$ref": "#/$defs/exact_selection_preview" },
-        { "$ref": "#/$defs/seed_growth_selection_preview" }
+        { "$ref": "#/$defs/fixed_source_extension_selection_preview" }
       ]
     }
   },
@@ -257,7 +257,7 @@
         }
       }
     },
-    "seed_growth_selection_preview": {
+    "fixed_source_extension_selection_preview": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -269,9 +269,9 @@
         "selected_additions"
       ],
       "properties": {
-        "mode": { "const": "seed_growth" },
+        "mode": { "const": "fixed_source_extension" },
         "processing_order": {
-          "const": "full-seed-relevance-then-complete-membership-route"
+          "const": "full-source-relevance-then-complete-membership-route"
         },
         "target_track_count": { "type": "integer", "minimum": 3 },
         "requested_added_tracks": { "type": "integer", "minimum": 1 },
