@@ -39,12 +39,36 @@ cargo run -- bridge --request fixtures/synthetic/preserve-multi-track-gap-reques
 cargo run -- bridge --request fixtures/synthetic/preserve-endpoint-slots-request.json
 ```
 
-Production callers can request structured native stage timings and an
-identity-bound decoded-library cache:
+Production callers can request structured native stage timings, an
+identity-bound decoded-library cache, and a live status sidecar:
 
 ```text
-bliss-playlist-optimizer bridge --request request.json --timings --cache-dir cache
+bliss-playlist-optimizer bridge --request request.json --timings --cache-dir cache --progress progress.json
 ```
+
+`--progress` atomically replaces a small JSON file while the command is running.
+It follows the same human-readable status-message idea as `bliss-analyser` and
+`bliss-learner`, but deliberately uses a local sidecar instead of LMS JSON-RPC
+push notifications.
+
+That difference is intentional. `bliss-analyser` and `bliss-learner` are
+long-running maintenance tools launched specifically by the LMS plugin; they can
+be told the LMS JSON-RPC port and periodically push `msg:` updates back to
+`lms-blissmixer`. `bliss-playlist-optimizer` is a stricter request/response
+engine: stdout is the machine-readable final artifact, stderr is reserved for a
+machine-readable failure, and the binary should stay useful outside Lyrion
+without knowing anything about LMS host names, ports, authentication, players,
+or plugin command names. If it pushed directly to LMS, the native engine would
+become coupled to one plugin deployment model and every offline, authenticated,
+or renamed-controller scenario would need extra native error handling.
+
+The sidecar keeps the same UX value with cleaner boundaries. Better Call Bliss
+owns LMS integration and polls the job-local file while the process is alive;
+other callers can do the same or ignore it entirely. The file contains `stage`,
+`msg`, elapsed seconds, and optional `current`/`total`/`percent` fields. Progress
+writes are best-effort and never fail the optimization, so status reporting
+cannot corrupt stdout, mask the real optimizer result, or turn a successful
+playlist preview into a failed one.
 
 The request's database artifact must include `cache_identity` for cache reuse.
 Lyrion supplies its `device:inode:size:mtime` identity and independently rejects

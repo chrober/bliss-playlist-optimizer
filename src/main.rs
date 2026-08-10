@@ -621,6 +621,7 @@ struct LibraryCache {
 struct RuntimeOptions {
     timings: bool,
     cache_dir: Option<PathBuf>,
+    progress_path: Option<PathBuf>,
 }
 
 impl RuntimeOptions {
@@ -628,10 +629,88 @@ impl RuntimeOptions {
         Self {
             timings: false,
             cache_dir: None,
+            progress_path: None,
         }
     }
 }
 
+#[derive(Serialize)]
+struct ProgressArtifact<'a> {
+    schema_version: u8,
+    program: &'static str,
+    version: &'static str,
+    stage: &'a str,
+    msg: &'a str,
+    elapsed_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    percent: Option<f64>,
+}
+
+struct ProgressReporter {
+    path: Option<PathBuf>,
+    started: Instant,
+}
+
+impl ProgressReporter {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            started: Instant::now(),
+        }
+    }
+
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self::new(None)
+    }
+
+    fn update(
+        &mut self,
+        stage: &'static str,
+        msg: impl AsRef<str>,
+        current: Option<usize>,
+        total: Option<usize>,
+    ) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let msg = msg.as_ref();
+        let percent = match (current, total) {
+            (Some(current), Some(total)) if total > 0 => {
+                Some((current as f64 * 100.0) / total as f64)
+            }
+            _ => None,
+        };
+        let artifact = ProgressArtifact {
+            schema_version: 1,
+            program: PROGRAM,
+            version: VERSION,
+            stage,
+            msg,
+            elapsed_seconds: self.started.elapsed().as_secs(),
+            current,
+            total,
+            percent,
+        };
+        let Ok(bytes) = serde_json::to_vec(&artifact) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        if fs::write(&temporary, bytes).is_ok() {
+            if fs::rename(&temporary, path).is_err() {
+                let _ = fs::remove_file(path);
+                let _ = fs::rename(&temporary, path);
+            }
+        }
+    }
+}
 #[derive(Default)]
 struct StageTimings {
     stages: Vec<StageTimingArtifact>,
@@ -754,7 +833,7 @@ fn effective_adaptive_matrix(
     Ok((matrix, hash, 0))
 }
 fn usage() -> &'static str {
-    "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>\n  bliss-playlist-optimizer route --request <request.json> [--timings] [--cache-dir <directory>]\n  bliss-playlist-optimizer bridge --request <request.json> [--timings] [--cache-dir <directory>]"
+    "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>\n  bliss-playlist-optimizer route --request <request.json> [--timings] [--cache-dir <directory>] [--progress <progress.json>]\n  bliss-playlist-optimizer bridge --request <request.json> [--timings] [--cache-dir <directory>] [--progress <progress.json>]"
 }
 
 fn parse_request_command(args: &[String]) -> Option<(&str, &Path, RuntimeOptions)> {
@@ -775,6 +854,10 @@ fn parse_request_command(args: &[String]) -> Option<(&str, &Path, RuntimeOptions
             }
             "--cache-dir" if options.cache_dir.is_none() && index + 1 < args.len() => {
                 options.cache_dir = Some(PathBuf::from(&args[index + 1]));
+                index += 2;
+            }
+            "--progress" if options.progress_path.is_none() && index + 1 < args.len() => {
+                options.progress_path = Some(PathBuf::from(&args[index + 1]));
                 index += 2;
             }
             _ => return None,
@@ -1060,7 +1143,14 @@ fn prepare_runtime_request(
     path: &Path,
     options: &RuntimeOptions,
     timings: &mut StageTimings,
+    progress: &mut ProgressReporter,
 ) -> Result<ValidatedRequest, CommandFailure> {
+    progress.update(
+        "request_decode",
+        "Reading and validating optimizer request",
+        None,
+        None,
+    );
     let started = Instant::now();
     let (request, request_sha256) = decode_request_once(path)?;
     timings.record("request_decode", started.elapsed());
@@ -1074,6 +1164,12 @@ fn prepare_runtime_request(
         }
     }
 
+    progress.update(
+        "database_cache_read",
+        "Checking optimizer library cache",
+        None,
+        None,
+    );
     let started = Instant::now();
     let cached = options
         .cache_dir
@@ -1084,10 +1180,17 @@ fn prepare_runtime_request(
     let (database_sha256, library, database_cache) = if let Some(cache) = cached {
         (cache.database_sha256, Some(cache.library), "hit")
     } else {
+        progress.update("database_hash", "Hashing Bliss database", None, None);
         let started = Instant::now();
         let database_sha256 = hash_artifact(&request.artifacts.database, "database")?;
         timings.record("database_hash", started.elapsed());
 
+        progress.update(
+            "database_open",
+            "Opening Bliss database and running integrity check",
+            None,
+            None,
+        );
         let started = Instant::now();
         let database = BlissDatabase::open_read_only(&request.artifacts.database.path)
             .map_err(|error| CommandFailure::new("DATABASE_INVALID", error.to_string()))?;
@@ -1096,6 +1199,12 @@ fn prepare_runtime_request(
             .map_err(|error| CommandFailure::new("DATABASE_INTEGRITY_FAILED", error.to_string()))?;
         timings.record("database_open_and_integrity", started.elapsed());
 
+        progress.update(
+            "library_decode",
+            "Loading usable Bliss rows from database",
+            None,
+            None,
+        );
         let started = Instant::now();
         let library = load_usable_library(&database)?;
         timings.record("library_decode", started.elapsed());
@@ -1127,6 +1236,12 @@ fn prepare_runtime_request(
         (database_sha256, Some(library), cache_state)
     };
 
+    progress.update(
+        "local_candidate_inventory_load",
+        "Loading LMS-local candidate inventory",
+        None,
+        None,
+    );
     let started = Instant::now();
     let (local_candidate_rows, local_candidate_inventory_sha256) =
         if let Some(inventory) = &request.artifacts.local_candidate_inventory {
@@ -1143,6 +1258,7 @@ fn prepare_runtime_request(
         };
     timings.record("local_candidate_inventory_load", started.elapsed());
 
+    progress.update("learned_matrix_load", "Loading scoring matrix", None, None);
     let started = Instant::now();
     let (learned_matrix, learned_matrix_sha256) =
         if let Some(matrix) = &request.artifacts.learned_matrix {
@@ -1175,6 +1291,12 @@ fn prepare_runtime_request(
             ));
         }
     }
+    progress.update(
+        "semantic_evidence_load",
+        "Loading optional semantic evidence",
+        None,
+        None,
+    );
     let started = Instant::now();
     let (semantic_bytes, semantic_evidence_sha256) =
         read_artifact(&request.semantic_evidence, "semantic evidence")?;
@@ -1195,6 +1317,12 @@ fn prepare_runtime_request(
     })?;
     timings.record("semantic_evidence_load", started.elapsed());
 
+    progress.update(
+        "source_resolution",
+        "Resolving source tracks against Bliss rows",
+        None,
+        None,
+    );
     let started = Instant::now();
     let library = library.expect("runtime preparation always loads the library");
     let file_to_index = library
@@ -1895,8 +2023,10 @@ fn optimize_route_request_with_options(
     options: &RuntimeOptions,
 ) -> Result<RouteArtifact, CommandFailure> {
     let overall_started = Instant::now();
+    let mut progress = ProgressReporter::new(options.progress_path.clone());
+    progress.update("starting", "Starting route optimization", None, None);
     let mut timings = StageTimings::default();
-    let validated = prepare_runtime_request(path, options, &mut timings)?;
+    let validated = prepare_runtime_request(path, options, &mut timings, &mut progress)?;
     let ValidatedRequest {
         summary: validation,
         request,
@@ -1971,6 +2101,12 @@ fn optimize_route_request_with_options(
         .iter()
         .map(|track| (track.file.as_str(), track))
         .collect::<HashMap<_, _>>();
+    progress.update(
+        "source_track_materialization",
+        "Preparing route feature vectors",
+        None,
+        None,
+    );
     let started = Instant::now();
     let mut tracks = Vec::with_capacity(request.source_tracks.len());
     for source in &request.source_tracks {
@@ -2013,10 +2149,26 @@ fn optimize_route_request_with_options(
         artist_window: request.repeat_windows.artist,
         album_window: request.repeat_windows.album,
     };
+    progress.update(
+        "route_search",
+        format!(
+            "Searching route through {} tracks with {} restarts",
+            tracks.len(),
+            restart_count
+        ),
+        Some(0),
+        Some(restart_count),
+    );
     let started = Instant::now();
     let result = route::optimize_adaptive_route(&tracks, &learned_matrix, &config)
         .map_err(|error| CommandFailure::new("ROUTE_SEARCH_FAILED", error.to_string()))?;
     timings.record("route_search", started.elapsed());
+    progress.update(
+        "route_search",
+        "Route search completed",
+        Some(restart_count),
+        Some(restart_count),
+    );
     let selected_track_ids = route_track_ids(&result.selected.route, &request.source_tracks);
     let track_window_satisfied_by_unique_membership = request.repeat_windows.track == 0
         || selected_track_ids.iter().collect::<HashSet<_>>().len() == selected_track_ids.len();
@@ -2061,6 +2213,7 @@ fn optimize_route_request_with_options(
         performance: None,
     };
     artifact.performance = timings.finish(options.timings, overall_started, database_cache);
+    progress.update("completed", "Optimization finished", None, None);
     Ok(artifact)
 }
 
@@ -2075,6 +2228,7 @@ fn analyze_bridge_validated(
     library: Vec<LibraryTrack>,
     local_candidate_rows: Option<HashSet<u64>>,
     timings: &mut StageTimings,
+    progress: &mut ProgressReporter,
 ) -> Result<BridgeAnalysisArtifact, CommandFailure> {
     let adaptive = request.scoring.adaptive.as_ref().ok_or_else(|| {
         CommandFailure::new(
@@ -2120,6 +2274,16 @@ fn analyze_bridge_validated(
             "fixed_source_extension" => (None, None, None),
             _ => unreachable!("bridge mode is checked before analysis"),
         };
+    progress.update(
+        "source_track_materialization",
+        format!(
+            "Preparing {} source tracks against {} usable Bliss rows",
+            request.source_tracks.len(),
+            library.len()
+        ),
+        None,
+        None,
+    );
     let started = Instant::now();
     let mut file_to_index = HashMap::with_capacity(library.len());
     for (index, track) in library.iter().enumerate() {
@@ -2197,6 +2361,16 @@ fn analyze_bridge_validated(
     } else {
         route_config.clone()
     };
+    progress.update(
+        "route_search",
+        format!(
+            "Preparing base route for {} source tracks with {} restarts",
+            source_route_tracks.len(),
+            restart_count
+        ),
+        Some(0),
+        Some(restart_count),
+    );
     let started = Instant::now();
     let (
         selected_local_route,
@@ -2251,12 +2425,24 @@ fn analyze_bridge_validated(
         _ => unreachable!("bridge route policy is checked before analysis"),
     };
     timings.record("route_search", started.elapsed());
+    progress.update(
+        "route_search",
+        "Base route prepared",
+        Some(restart_count),
+        Some(restart_count),
+    );
     let selected_library_route = selected_local_route
         .iter()
         .map(|index| source_library_indices[*index])
         .collect::<Vec<_>>();
     let selected_track_ids = route_track_ids(&selected_local_route, &request.source_tracks);
 
+    progress.update(
+        "candidate_preparation",
+        "Preparing bridge candidate pool",
+        None,
+        None,
+    );
     let started = Instant::now();
     let eligible_candidates = library
         .iter()
@@ -2288,6 +2474,21 @@ fn analyze_bridge_validated(
         max_detour_percentile: bridge::DEFAULT_MAX_DETOUR_PERCENTILE,
     };
     timings.record("candidate_preparation", started.elapsed());
+    progress.update(
+        "candidate_preparation",
+        format!(
+            "Prepared {} eligible bridge candidates",
+            eligible_candidates.len()
+        ),
+        Some(eligible_candidates.len()),
+        Some(library.len()),
+    );
+    progress.update(
+        "frozen_reference",
+        "Building frozen bridge reference distribution",
+        None,
+        None,
+    );
     let started = Instant::now();
     let reference = bridge::build_frozen_reference(
         &selected_library_route,
@@ -2298,6 +2499,15 @@ fn analyze_bridge_validated(
     )
     .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
     timings.record("frozen_reference", started.elapsed());
+    progress.update(
+        "frozen_reference",
+        format!(
+            "Built frozen reference with {} pairwise distances",
+            reference.len()
+        ),
+        Some(reference.len()),
+        None,
+    );
 
     let mut shortlist_elapsed = Duration::ZERO;
     let mut semantic_selection_elapsed = Duration::ZERO;
@@ -2310,6 +2520,17 @@ fn analyze_bridge_validated(
     } else {
         1
     };
+    let gap_total = selected_library_route.len().saturating_sub(first_gap);
+    progress.update(
+        "gap_candidate_scoring",
+        if gap_total == 0 {
+            "Skipping individual gap scoring for fixed-source extension".to_owned()
+        } else {
+            format!("Scoring bridge candidates for {gap_total} source transitions")
+        },
+        Some(0),
+        Some(gap_total),
+    );
     for position in first_gap..selected_library_route.len() {
         let gap = bridge::evaluate_gap(
             &selected_library_route,
@@ -2500,6 +2721,18 @@ fn analyze_bridge_validated(
             acoustic_rejected_count,
             accepted_candidates,
         });
+        progress.update(
+            "gap_candidate_scoring",
+            format!(
+                "Scored transition {}/{}: {} shortlisted, {} accepted",
+                position - first_gap + 1,
+                gap_total,
+                shortlisted_candidate_count,
+                accepted_candidate_count,
+            ),
+            Some(position - first_gap + 1),
+            Some(gap_total),
+        );
     }
     timings.record("gap_semantic_selection", semantic_selection_elapsed);
     timings.record("gap_candidate_shortlisting", shortlist_elapsed);
@@ -2539,6 +2772,15 @@ fn analyze_bridge_validated(
     let started = Instant::now();
     let selection_preview = match request.extension.mode.as_str() {
         "automatic" => {
+            progress.update(
+                "bridge_selection",
+                format!(
+                    "Selecting up to {} automatic additions",
+                    max_added_tracks.unwrap_or(0)
+                ),
+                None,
+                None,
+            );
             let max_added_tracks =
                 max_added_tracks.expect("automatic request has a validated bridge budget");
             let trigger_percentile =
@@ -2601,6 +2843,12 @@ fn analyze_bridge_validated(
         "exact_count" => {
             let requested_added_tracks =
                 requested_exact_count.expect("exact-count request has a validated count");
+            progress.update(
+                "bridge_selection",
+                format!("Searching for exactly {requested_added_tracks} additions"),
+                Some(0),
+                Some(requested_added_tracks),
+            );
             let max_tracks_per_gap = request.extension.max_tracks_per_gap.unwrap_or(1);
             let opening_enabled = request.extension.allow_opening_track.unwrap_or(false);
             let closing_enabled = request.extension.allow_closing_track.unwrap_or(false);
@@ -2769,6 +3017,15 @@ fn analyze_bridge_validated(
                     "fixed_source_extension extension requires extension.target_track_count",
                 )
             })?;
+            progress.update(
+                "bridge_selection",
+                format!(
+                    "Selecting additions to reach {target_track_count} total tracks from {} sources",
+                    source_library_indices.len()
+                ),
+                Some(source_library_indices.len()),
+                Some(target_track_count),
+            );
             let extension_result = select_fixed_source_extension(
                 target_track_count,
                 &source_library_indices,
@@ -2891,6 +3148,12 @@ fn analyze_bridge_validated(
         _ => unreachable!("bridge mode is checked before analysis"),
     };
     timings.record("bridge_selection", started.elapsed());
+    progress.update(
+        "bridge_selection",
+        "Bridge/addition selection completed",
+        None,
+        None,
+    );
 
     Ok(BridgeAnalysisArtifact {
         schema_version: 1,
@@ -2954,8 +3217,10 @@ fn analyze_bridge_request_with_options(
     options: &RuntimeOptions,
 ) -> Result<BridgeAnalysisArtifact, CommandFailure> {
     let overall_started = Instant::now();
+    let mut progress = ProgressReporter::new(options.progress_path.clone());
+    progress.update("starting", "Starting bridge/addition analysis", None, None);
     let mut timings = StageTimings::default();
-    let validated = prepare_runtime_request(path, options, &mut timings)?;
+    let validated = prepare_runtime_request(path, options, &mut timings, &mut progress)?;
     let ValidatedRequest {
         summary: validation,
         request,
@@ -3057,8 +3322,10 @@ fn analyze_bridge_request_with_options(
         library.expect("runtime validation always provides a decoded library"),
         local_candidate_rows,
         &mut timings,
+        &mut progress,
     )?;
     artifact.performance = timings.finish(options.timings, overall_started, database_cache);
+    progress.update("completed", "Optimization finished", None, None);
     Ok(artifact)
 }
 
@@ -3126,7 +3393,7 @@ fn main() {
         [command] if command == "version" => println!("{PROGRAM} {VERSION}"),
         [command, format] if command == "version" && format == "--json" => {
             println!(
-                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\"}}"
+                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true}}"
             );
         }
         _ => {
@@ -3149,11 +3416,39 @@ mod tests {
         assert!(usage().contains("bridge"));
         assert!(usage().contains("--timings"));
         assert!(usage().contains("--cache-dir"));
+        assert!(usage().contains("--progress"));
         assert_eq!(default_parallel_workers(1), 1);
         assert_eq!(default_parallel_workers(2), 1);
         assert_eq!(default_parallel_workers(4), 3);
     }
 
+    #[test]
+    fn route_command_writes_progress_sidecar() {
+        let progress_path = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-progress-{}-route.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&progress_path);
+        let options = RuntimeOptions {
+            timings: false,
+            cache_dir: None,
+            progress_path: Some(progress_path.clone()),
+        };
+
+        optimize_route_request_with_options(
+            Path::new("examples/reorder-only-request.json"),
+            &options,
+        )
+        .unwrap();
+
+        let progress: Value = serde_json::from_slice(&fs::read(&progress_path).unwrap()).unwrap();
+        assert_eq!(progress["schema_version"], 1);
+        assert_eq!(progress["program"], PROGRAM);
+        assert_eq!(progress["version"], VERSION);
+        assert_eq!(progress["stage"], "completed");
+        assert_eq!(progress["msg"], "Optimization finished");
+        let _ = fs::remove_file(progress_path);
+    }
     #[test]
     fn fixed_source_extension_reaches_exact_target_without_relevance_drift() {
         let tracks = (0..32)
@@ -3518,6 +3813,7 @@ mod tests {
         let options = RuntimeOptions {
             timings: true,
             cache_dir: Some(cache_dir),
+            progress_path: None,
         };
 
         let mut cold = analyze_bridge_request_with_options(&request_path, &options).unwrap();
@@ -3678,10 +3974,12 @@ mod tests {
 
         let conflict_path = Path::new("fixtures/synthetic/preserve-automatic-request.json");
         let mut conflict_timings = StageTimings::default();
+        let mut conflict_progress = ProgressReporter::disabled();
         let conflict = prepare_runtime_request(
             conflict_path,
             &RuntimeOptions::disabled(),
             &mut conflict_timings,
+            &mut conflict_progress,
         )
         .unwrap();
         let mut conflict_request = conflict.request;
@@ -3708,6 +4006,7 @@ mod tests {
             conflict.library.unwrap(),
             conflict.local_candidate_rows,
             &mut conflict_timings,
+            &mut conflict_progress,
         )
         .unwrap_err();
 
