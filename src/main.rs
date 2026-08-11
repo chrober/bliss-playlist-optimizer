@@ -429,6 +429,7 @@ struct FixedSourceExtensionContext<'a> {
     route_config: &'a route::SearchConfig,
     selection: SelectionSettings,
     shortlist_limit: usize,
+    progress: &'a mut ProgressReporter,
 }
 
 fn place_fixed_source_extension_additions_preserving_source_order(
@@ -1777,6 +1778,7 @@ fn select_fixed_source_extension(
         route_config,
         selection,
         shortlist_limit,
+        progress,
     } = context;
     if target_track_count <= source_library_indices.len() {
         return Err(CommandFailure::new(
@@ -1800,6 +1802,15 @@ fn select_fixed_source_extension(
 
     // The complete, immutable source set defines relevance. Newly selected
     // tracks never enter this context, which prevents iterative taste drift.
+    progress.update(
+        "extension_relevance_model",
+        format!(
+            "Building fixed-source relevance model from {} source tracks",
+            source_library_indices.len()
+        ),
+        Some(0),
+        Some(source_library_indices.len()),
+    );
     let seed_features = source_library_indices
         .iter()
         .map(|index| tracks[*index].features)
@@ -1812,15 +1823,46 @@ fn select_fixed_source_extension(
     .map_err(|error| {
         CommandFailure::new("FIXED_SOURCE_EXTENSION_SCORING_FAILED", error.to_string())
     })?;
-    let mut ranked = eligible_candidates
-        .par_iter()
-        .map(|candidate| {
-            (
-                *candidate,
-                relevance.distance_to(&tracks[*candidate].features),
-            )
-        })
-        .collect::<Vec<_>>();
+    progress.update(
+        "extension_candidate_scoring",
+        format!(
+            "Scoring {} local candidates against the fixed source set",
+            eligible_candidates.len()
+        ),
+        Some(0),
+        Some(eligible_candidates.len()),
+    );
+    const EXTENSION_PROGRESS_CHUNK: usize = 4096;
+    let mut ranked = Vec::with_capacity(eligible_candidates.len());
+    let mut scored = 0usize;
+    for chunk in eligible_candidates.chunks(EXTENSION_PROGRESS_CHUNK) {
+        let mut chunk_ranked = chunk
+            .par_iter()
+            .map(|candidate| {
+                (
+                    *candidate,
+                    relevance.distance_to(&tracks[*candidate].features),
+                )
+            })
+            .collect::<Vec<_>>();
+        scored += chunk_ranked.len();
+        ranked.append(&mut chunk_ranked);
+        progress.update(
+            "extension_candidate_scoring",
+            format!(
+                "Scored {scored}/{} local candidates against the fixed source set",
+                eligible_candidates.len()
+            ),
+            Some(scored),
+            Some(eligible_candidates.len()),
+        );
+    }
+    progress.update(
+        "extension_candidate_sorting",
+        format!("Sorting {} scored addition candidates", ranked.len()),
+        None,
+        None,
+    );
     ranked.par_sort_unstable_by(|left, right| {
         left.1
             .total_cmp(&right.1)
@@ -1830,6 +1872,12 @@ fn select_fixed_source_extension(
     // Variation is deliberately downstream of the scoring strategy. Any
     // current or future strategy only needs to provide a scalar relevance
     // ordering; this selector owns reproducible membership diversity.
+    progress.update(
+        "extension_semantic_guidance",
+        "Collecting optional Last.fm guidance for addition candidates",
+        None,
+        None,
+    );
     let semantic_candidates_by_id = semantic::select_seed_candidates(
         semantic_bundle,
         source_semantic_identities,
@@ -1848,8 +1896,25 @@ fn select_fixed_source_extension(
     }
     .min(shortlist_limit)
     .min(ranked.len());
+    progress.update(
+        "extension_selection_pool",
+        format!(
+            "Preparing quality-controlled addition pool: {pool_limit}/{} candidates",
+            ranked.len()
+        ),
+        Some(pool_limit),
+        Some(ranked.len()),
+    );
     let mut selection_order = ranked[..pool_limit].to_vec();
     if selection.variation_percent > 0 {
+        progress.update(
+            "extension_selection_pool",
+            format!(
+                "Applying variation and Last.fm guidance within {pool_limit} Bliss-qualified candidates"
+            ),
+            Some(0),
+            Some(pool_limit),
+        );
         let variation = f64::from(selection.variation_percent) / 100.0;
         let temperature = (requested.max(1) as f64 * (0.25 + 9.75 * variation)).max(1.0);
         let mut rng = StdRng::seed_from_u64(selection.generation_seed);
@@ -1880,6 +1945,14 @@ fn select_fixed_source_extension(
         });
         selection_order = sampled.into_iter().map(|(_, _, entry)| entry).collect();
     } else if guidance_enabled && !semantic_candidates_by_id.is_empty() {
+        progress.update(
+            "extension_selection_pool",
+            format!(
+                "Applying deterministic Last.fm guidance within {pool_limit} Bliss-qualified candidates"
+            ),
+            Some(0),
+            Some(pool_limit),
+        );
         // With zero Variation the result stays deterministic. Guidance may
         // move an endorsed track up by at most 20% of this Bliss-qualified
         // pool; it cannot import or rescue a candidate outside the pool.
@@ -1925,6 +1998,15 @@ fn select_fixed_source_extension(
     // necessary per-key capacity implied by each repeat window. Routing then
     // optimizes the complete fixed membership, allowing added tracks to make a
     // repeated-artist or repeated-album seed set feasible.
+    progress.update(
+        "extension_membership_selection",
+        format!(
+            "Selecting {requested} repeat-safe additions from {} ordered candidates",
+            selection_order.len()
+        ),
+        Some(0),
+        Some(requested),
+    );
     let artist_capacity = if route_config.artist_window == 0 {
         usize::MAX
     } else {
@@ -1952,18 +2034,42 @@ fn select_fixed_source_extension(
 
     let mut membership = selected_library_route.to_vec();
     let mut additions = Vec::with_capacity(requested);
+    let mut considered = 0usize;
     for (candidate, distance) in selection_order {
+        considered += 1;
         let artist = tracks[candidate].artist_key.as_str();
         let album = tracks[candidate].album_key.as_str();
         if artist_counts.get(artist).copied().unwrap_or(0) >= artist_capacity
             || album_counts.get(album).copied().unwrap_or(0) >= album_capacity
         {
+            if considered % EXTENSION_PROGRESS_CHUNK == 0 {
+                progress.update(
+                    "extension_membership_selection",
+                    format!(
+                        "Selected {}/{} additions after checking {considered} candidates",
+                        additions.len(),
+                        requested
+                    ),
+                    Some(source_library_indices.len() + additions.len()),
+                    Some(target_track_count),
+                );
+            }
             continue;
         }
         membership.push(candidate);
         additions.push((candidate, distance));
         *artist_counts.entry(artist).or_default() += 1;
         *album_counts.entry(album).or_default() += 1;
+        progress.update(
+            "extension_membership_selection",
+            format!(
+                "Selected {}/{} additions after checking {considered} candidates",
+                additions.len(),
+                requested
+            ),
+            Some(source_library_indices.len() + additions.len()),
+            Some(target_track_count),
+        );
         if additions.len() == requested {
             break;
         }
@@ -1978,6 +2084,16 @@ fn select_fixed_source_extension(
         ));
     }
     let (final_route, selected_strategy, route_metrics) = if preserve_source_order {
+        progress.update(
+            "extension_route_placement",
+            format!(
+                "Placing {} additions around {} preserved source anchors",
+                additions.len(),
+                source_library_indices.len()
+            ),
+            Some(source_library_indices.len()),
+            Some(target_track_count),
+        );
         let (route, metrics) = place_fixed_source_extension_additions_preserving_source_order(
             selected_library_route,
             &additions,
@@ -1987,6 +2103,16 @@ fn select_fixed_source_extension(
         )?;
         (route, "fixed-source-extension-preserve-order", metrics)
     } else {
+        progress.update(
+            "extension_route_search",
+            format!(
+                "Routing {} selected tracks after choosing {} additions",
+                membership.len(),
+                additions.len()
+            ),
+            Some(membership.len()),
+            Some(target_track_count),
+        );
         let route_tracks = membership
             .iter()
             .map(|index| tracks[*index].clone())
@@ -3041,6 +3167,7 @@ fn analyze_bridge_validated(
                     route_config: &route_config,
                     selection: request.selection,
                     shortlist_limit,
+                    progress,
                 },
             )?;
             selected_strategy = extension_result.selected_strategy;
@@ -3506,6 +3633,7 @@ mod tests {
             providers: Vec::new(),
             edges: Vec::new(),
         };
+        let mut progress = ProgressReporter::disabled();
         let extension_result = select_fixed_source_extension(
             25,
             &[0, 1],
@@ -3521,6 +3649,7 @@ mod tests {
                 route_config: &config,
                 selection: SelectionSettings::default(),
                 shortlist_limit: 256,
+                progress: &mut progress,
             },
         )
         .unwrap();
@@ -3547,6 +3676,7 @@ mod tests {
             route::repeat_violations(&extension_result.final_route, &tracks, &config).is_empty()
         );
 
+        let mut progress = ProgressReporter::disabled();
         let preserved = select_fixed_source_extension(
             25,
             &[0, 1],
@@ -3562,6 +3692,7 @@ mod tests {
                 route_config: &config,
                 selection: SelectionSettings::default(),
                 shortlist_limit: 256,
+                progress: &mut progress,
             },
         )
         .unwrap();
@@ -3582,6 +3713,7 @@ mod tests {
         assert!(route::repeat_violations(&preserved.final_route, &tracks, &config).is_empty());
 
         let varied = |seed| {
+            let mut progress = ProgressReporter::disabled();
             select_fixed_source_extension(
                 25,
                 &[0, 1],
@@ -3602,6 +3734,7 @@ mod tests {
                         lastfm_artist_guidance_percent: 0,
                     },
                     shortlist_limit: 256,
+                    progress: &mut progress,
                 },
             )
             .unwrap()
