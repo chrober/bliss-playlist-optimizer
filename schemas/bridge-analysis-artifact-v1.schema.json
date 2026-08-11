@@ -390,6 +390,9 @@
           "minItems": 1,
           "items": { "$ref": "#/$defs/endpoint_decision" }
         },
+        "quality_target_met": { "type": "boolean" },
+        "achieved_max_leg_percentile": { "type": "number", "minimum": 0 },
+        "best_effort": { "type": "boolean" },
         "search": { "$ref": "#/$defs/exact_search" },
         "infeasibility": {
           "anyOf": [

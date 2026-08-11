@@ -522,6 +522,12 @@ struct ExactSelectionArtifact {
     endpoint_policy: Option<EndpointPolicyArtifact>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     endpoint_decisions: Vec<EndpointDecisionArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality_target_met: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    achieved_max_leg_percentile: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_effort: Option<bool>,
     search: ExactSearchArtifact,
     infeasibility: Option<ExactInfeasibilityArtifact>,
 }
@@ -3323,7 +3329,7 @@ fn analyze_bridge_validated(
                 .iter()
                 .chain(endpoint_slots.closing.iter())
                 .any(|endpoint| endpoint.semantics.pool != semantic::SemanticPool::BlissOnly);
-            let select_count = |count: usize| {
+            let select_count = |count: usize, scoring_config: &bridge::BridgeConfig| {
                 preview::select_exact_count_bridges_with_endpoints(
                     &selected_library_route,
                     &preview_gaps,
@@ -3341,13 +3347,48 @@ fn analyze_bridge_validated(
                     preview::ExactScoringContext {
                         tracks: &bridge_tracks,
                         learned_matrix: &learned_matrix,
-                        config: &bridge_config,
+                        config: scoring_config,
                         reference: &reference,
                     },
                 )
                 .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))
             };
-            let (requested_added_tracks, selection) = if destination_automatic {
+            let selection_quality = |selection: &preview::ExactSelection,
+                                     direct_percentile: f64|
+             -> Result<(f64, f64), CommandFailure> {
+                let achieved_max_leg_percentile = selection
+                    .decisions
+                    .iter()
+                    .filter_map(|decision| decision.selected.as_ref())
+                    .map(|selected| selected.evaluation.max_percentile)
+                    .max_by(f64::total_cmp)
+                    .unwrap_or(direct_percentile);
+                let route = selection.final_route.as_ref().ok_or_else(|| {
+                    CommandFailure::new(
+                        "DESTINATION_ROUTE_NOT_FOUND",
+                        "destination search did not produce a complete route",
+                    )
+                })?;
+                let objective = route::evaluate_adaptive_sequence(
+                    route,
+                    &bridge_tracks,
+                    &learned_matrix,
+                    bridge_config.seed_limit,
+                    bridge_config.learned_percent,
+                )
+                .map_err(|error| {
+                    CommandFailure::new("DESTINATION_ROUTE_SCORING_FAILED", error.to_string())
+                })?
+                .objective;
+                Ok((achieved_max_leg_percentile, objective))
+            };
+            let (
+                requested_added_tracks,
+                selection,
+                quality_target_met,
+                achieved_max_leg_percentile,
+                best_effort,
+            ) = if destination_automatic {
                 let direct_percentile = preview_gaps
                     .first()
                     .map(|gap| gap.direct_percentile)
@@ -3355,7 +3396,13 @@ fn analyze_bridge_validated(
                 let threshold = trigger_percentile
                     .expect("automatic destination route has a validated threshold");
                 if direct_percentile <= threshold {
-                    (0, select_count(0)?)
+                    (
+                        0,
+                        select_count(0, &bridge_config)?,
+                        Some(true),
+                        Some(direct_percentile),
+                        Some(false),
+                    )
                 } else {
                     let maximum = max_added_tracks
                         .expect("automatic destination route has a validated maximum");
@@ -3367,25 +3414,77 @@ fn analyze_bridge_validated(
                             Some(count),
                             Some(maximum),
                         );
-                        let attempt = select_count(count)?;
+                        let attempt = select_count(count, &bridge_config)?;
                         if attempt.final_route.is_some() {
-                            qualifying = Some((count, attempt));
+                            let (achieved, _) = selection_quality(&attempt, direct_percentile)?;
+                            qualifying =
+                                Some((count, attempt, Some(true), Some(achieved), Some(false)));
                             break;
                         }
                     }
-                    qualifying.ok_or_else(|| {
-                        CommandFailure::new(
-                            "DESTINATION_ROUTE_NOT_FOUND",
+                    if let Some(qualifying) = qualifying {
+                        qualifying
+                    } else {
+                        progress.update(
+                            "bridge_selection",
                             format!(
-                                "no acoustically acceptable destination route was found with 1 through {maximum} intermediate tracks"
+                                "No route met the {:.0}% quality target; selecting the smoothest route within the {maximum}-track budget",
+                                threshold * 100.0
                             ),
-                        )
-                    })?
+                            Some(0),
+                            Some(maximum.saturating_add(1)),
+                        );
+                        let relaxed_config = bridge::BridgeConfig {
+                            max_leg_percentile: f64::MAX,
+                            max_detour_percentile: f64::MAX,
+                            ..bridge_config.clone()
+                        };
+                        let mut fallback = None;
+                        for count in 0..=maximum {
+                            progress.update(
+                                "bridge_selection",
+                                format!(
+                                    "Comparing best-effort destination route with {count}/{maximum} intermediate tracks"
+                                ),
+                                Some(count.saturating_add(1)),
+                                Some(maximum.saturating_add(1)),
+                            );
+                            let attempt = select_count(count, &relaxed_config)?;
+                            if attempt.final_route.is_none() {
+                                continue;
+                            }
+                            let (achieved, objective) =
+                                selection_quality(&attempt, direct_percentile)?;
+                            let replace = fallback.as_ref().is_none_or(
+                                |(best_count, _, best_achieved, best_objective)| {
+                                    achieved.total_cmp(best_achieved).is_lt()
+                                        || (achieved == *best_achieved
+                                            && (objective.total_cmp(best_objective).is_lt()
+                                                || (objective == *best_objective
+                                                    && count < *best_count)))
+                                },
+                            );
+                            if replace {
+                                fallback = Some((count, attempt, achieved, objective));
+                            }
+                        }
+                        let (count, attempt, achieved, _) = fallback.ok_or_else(|| {
+                            CommandFailure::new(
+                                "DESTINATION_ROUTE_NOT_FOUND",
+                                "no repeat-safe destination route could be constructed within the configured budget",
+                            )
+                        })?;
+                        let met = achieved <= threshold;
+                        (count, attempt, Some(met), Some(achieved), Some(!met))
+                    }
                 }
             } else {
                 (
                     requested_added_tracks,
-                    select_count(requested_added_tracks)?,
+                    select_count(requested_added_tracks, &bridge_config)?,
+                    None,
+                    None,
+                    None,
                 )
             };
             let feasible = selection.final_route.is_some();
@@ -3477,6 +3576,9 @@ fn analyze_bridge_validated(
                     maximum_closing_tracks: usize::from(closing_enabled),
                 }),
                 endpoint_decisions,
+                quality_target_met,
+                achieved_max_leg_percentile,
+                best_effort,
                 search: ExactSearchArtifact {
                     beam_width: EXACT_COUNT_BEAM_WIDTH,
                     candidate_limit: retained_candidate_limit,
@@ -4116,9 +4218,20 @@ mod tests {
 
         request["extension"]["max_added_tracks"] = Value::from(0);
         fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
-        let failure = analyze_bridge_request(&temporary).unwrap_err();
+        let direct_fallback = analyze_bridge_request(&temporary).unwrap();
         let _ = fs::remove_file(temporary);
-        assert_eq!(failure.code, "DESTINATION_ROUTE_NOT_FOUND");
+        let SelectionPreviewArtifact::Exact(direct_preview) = direct_fallback.selection_preview
+        else {
+            panic!("destination route must return an exact-selection preview");
+        };
+        assert_eq!(direct_preview.requested_added_tracks, 0);
+        assert_eq!(direct_preview.added_track_count, 0);
+        assert_eq!(direct_preview.quality_target_met, Some(false));
+        assert_eq!(direct_preview.best_effort, Some(true));
+        assert_eq!(
+            direct_preview.achieved_max_leg_percentile,
+            Some(direct_fallback.gaps[0].direct_percentile)
+        );
 
         assert!(result.frozen_reference_count > 1);
         assert_eq!(result.gaps.len(), 1);
@@ -4134,6 +4247,9 @@ mod tests {
         assert!(preview.requested_added_tracks > 0);
         assert!(preview.added_track_count > 0);
         assert!(preview.feasible);
+        assert_eq!(preview.quality_target_met, Some(true));
+        assert_eq!(preview.best_effort, Some(false));
+        assert!(preview.achieved_max_leg_percentile.unwrap() <= 0.5);
     }
 
     #[test]

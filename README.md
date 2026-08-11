@@ -229,17 +229,24 @@ Destination-route requests use `extension.mode=destination_route` together with
 `route.destination_track_id`. The final two source tracks must be the locked
 start and destination; any earlier source tracks are read-only acoustic and
 repeat context. Only the final gap is extended. `destination_mode=automatic`
-accepts a qualified direct leg or searches one through `max_added_tracks`
-intermediates, stopping at the shortest feasible count. If the direct leg is
-unacceptable and no generated route qualifies, analysis fails with
-`DESTINATION_ROUTE_NOT_FOUND`; it never silently returns the already-rejected
-direct transition. `destination_mode=exact` requires exactly
-`additional_track_count` intermediates.
-Both counts are bounded from zero through eight. Generated tracks remain unique,
-repeat-safe, and below the configured leg percentile. The chosen destination is
-immutable user intent and is therefore exempt from artist/album rejection caused
-by recent queue history. Variation and the frozen provider-neutral evidence graph
-rerank only candidates that still pass those native gates.
+first accepts a qualified direct leg or searches one through `max_added_tracks`
+intermediates, stopping at the shortest route that meets
+`trigger_percentile`. That percentile is a quality target, not a command to
+discard every result. If the target cannot be met, a second bounded pass compares
+the direct route and every permitted intermediate count, then returns the
+repeat-safe route with the lowest achieved worst-leg percentile. Route objective
+and then the smaller intermediate count break ties deterministically.
+
+The exact-selection artifact reports `quality_target_met`,
+`achieved_max_leg_percentile`, and `best_effort` for automatic destination
+routes. This makes a target miss visible without withholding a usable result.
+`destination_mode=exact` still requires exactly `additional_track_count`
+intermediates and remains all-or-nothing. Both counts are bounded from zero
+through eight. Generated tracks remain unique and repeat-safe. The chosen
+destination is immutable user intent and is therefore exempt from artist/album
+rejection caused by recent queue history. Variation and the frozen
+provider-neutral evidence graph rerank candidates without weakening those hard
+membership and repeat constraints.
 
 Exact-count requests may independently opt into
 `extension.allow_opening_track` and `extension.allow_closing_track`. Each
