@@ -4,6 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bincode::Options;
@@ -669,6 +672,38 @@ impl ProgressReporter {
         Self::new(None)
     }
 
+    fn heartbeat(
+        &self,
+        stage: &'static str,
+        msg: impl Into<String>,
+        interval: Duration,
+    ) -> ProgressHeartbeat {
+        let Some(path) = self.path.clone() else {
+            return ProgressHeartbeat::disabled();
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let done_for_thread = Arc::clone(&done);
+        let started = self.started;
+        let msg = msg.into();
+        let handle = thread::spawn(move || {
+            let mut reporter = ProgressReporter {
+                path: Some(path),
+                started,
+            };
+            while !done_for_thread.load(Ordering::Relaxed) {
+                thread::sleep(interval);
+                if done_for_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                reporter.update(stage, &msg, None, None);
+            }
+        });
+        ProgressHeartbeat {
+            done,
+            handle: Some(handle),
+        }
+    }
+
     fn update(
         &mut self,
         stage: &'static str,
@@ -709,6 +744,29 @@ impl ProgressReporter {
                 let _ = fs::remove_file(path);
                 let _ = fs::rename(&temporary, path);
             }
+        }
+    }
+}
+
+struct ProgressHeartbeat {
+    done: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ProgressHeartbeat {
+    fn disabled() -> Self {
+        Self {
+            done: Arc::new(AtomicBool::new(true)),
+            handle: None,
+        }
+    }
+}
+
+impl Drop for ProgressHeartbeat {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -2103,15 +2161,20 @@ fn select_fixed_source_extension(
         )?;
         (route, "fixed-source-extension-preserve-order", metrics)
     } else {
-        progress.update(
+        let route_message = format!(
+            "Routing {} selected tracks after choosing {} additions: fixed starts, {} restarts, reversal and relocation local search",
+            membership.len(),
+            additions.len(),
+            route_config.restart_count
+        );
+        progress.update("extension_route_search", &route_message, None, None);
+        let _heartbeat = progress.heartbeat(
             "extension_route_search",
             format!(
-                "Routing {} selected tracks after choosing {} additions",
-                membership.len(),
-                additions.len()
+                "Still routing {} selected tracks: local search is evaluating reversal and relocation neighborhoods",
+                membership.len()
             ),
-            Some(membership.len()),
-            Some(target_track_count),
+            Duration::from_secs(2),
         );
         let route_tracks = membership
             .iter()
