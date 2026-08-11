@@ -142,6 +142,7 @@ struct RepeatWindows {
 #[derive(Debug, Deserialize)]
 struct ExtensionSettings {
     mode: String,
+    destination_mode: Option<String>,
     additional_track_count: Option<usize>,
     target_track_count: Option<usize>,
     allow_opening_track: Option<bool>,
@@ -2588,6 +2589,30 @@ fn analyze_bridge_validated(
                 })?),
             ),
             "fixed_source_extension" => (None, None, None),
+            "destination_route" => (
+                Some(request.extension.max_added_tracks.ok_or_else(|| {
+                    CommandFailure::new(
+                        "DESTINATION_ROUTE_MAX_REQUIRED",
+                        "destination_route requires extension.max_added_tracks",
+                    )
+                })?),
+                Some(request.extension.trigger_percentile.ok_or_else(|| {
+                    CommandFailure::new(
+                        "DESTINATION_ROUTE_TRIGGER_REQUIRED",
+                        "destination_route requires extension.trigger_percentile",
+                    )
+                })?),
+                if request.extension.destination_mode.as_deref() == Some("exact") {
+                    Some(request.extension.additional_track_count.ok_or_else(|| {
+                        CommandFailure::new(
+                            "DESTINATION_ROUTE_COUNT_REQUIRED",
+                            "exact destination_route requires extension.additional_track_count",
+                        )
+                    })?)
+                } else {
+                    None
+                },
+            ),
             _ => unreachable!("bridge mode is checked before analysis"),
         };
     progress.update(
@@ -2743,10 +2768,13 @@ fn analyze_bridge_validated(
                 "rayon-route-restarts-and-candidates-indexed",
             )
         }
-        "preserve_order" => {
+        "preserve_order" | "queue_destination" => {
             let preserved = (0..source_route_tracks.len()).collect::<Vec<_>>();
-            let violations =
-                route::repeat_violations(&preserved, &source_route_tracks, &base_route_config);
+            let violations = if request.route.ordering_policy == "queue_destination" {
+                Vec::new()
+            } else {
+                route::repeat_violations(&preserved, &source_route_tracks, &base_route_config)
+            };
             if !violations.is_empty() {
                 return Err(CommandFailure::new(
                     "PRESERVED_ANCHOR_REPEAT_CONFLICT",
@@ -2812,16 +2840,38 @@ fn analyze_bridge_validated(
         .map(|index| candidate_semantic_identity(*index, &library[*index]))
         .collect::<Vec<_>>();
     let semantic_candidate_lookup = semantic::CandidateLookup::new(&semantic_candidates);
-    let bridge_tracks = library
+    let mut bridge_tracks = library
         .iter()
         .map(|track| track.route_track.clone())
         .collect::<Vec<_>>();
+    if request.extension.mode == "destination_route" {
+        let destination_id = request
+            .route
+            .destination_track_id
+            .as_deref()
+            .expect("destination route validation requires a destination track id");
+        let destination_source_index = request
+            .source_tracks
+            .iter()
+            .position(|track| track.id == destination_id)
+            .expect("validated destination must be a source track");
+        let destination_library_index = source_library_indices[destination_source_index];
+        // The explicitly selected destination is immutable user intent. Generated
+        // intermediates remain repeat-safe, while the destination itself is allowed
+        // even when its artist or album is already present in recent queue history.
+        bridge_tracks[destination_library_index].artist_key.clear();
+        bridge_tracks[destination_library_index].album_key.clear();
+    }
     let bridge_config = bridge::BridgeConfig {
         seed_limit,
         learned_percent,
         artist_window: request.repeat_windows.artist,
         album_window: request.repeat_windows.album,
-        max_leg_percentile: bridge::DEFAULT_MAX_LEG_PERCENTILE,
+        max_leg_percentile: if request.extension.mode == "destination_route" {
+            trigger_percentile.unwrap_or(bridge::DEFAULT_MAX_LEG_PERCENTILE)
+        } else {
+            bridge::DEFAULT_MAX_LEG_PERCENTILE
+        },
         max_detour_percentile: bridge::DEFAULT_MAX_DETOUR_PERCENTILE,
     };
     timings.record("candidate_preparation", started.elapsed());
@@ -2868,6 +2918,8 @@ fn analyze_bridge_validated(
     let mut semantic_assisted = false;
     let first_gap = if request.extension.mode == "fixed_source_extension" {
         selected_library_route.len()
+    } else if request.extension.mode == "destination_route" {
+        selected_library_route.len().saturating_sub(1)
     } else {
         1
     };
@@ -3144,6 +3196,8 @@ fn analyze_bridge_validated(
                     trigger_percentile,
                     track_guidance_percent: request.selection.lastfm_track_guidance_percent,
                     artist_guidance_percent: request.selection.lastfm_artist_guidance_percent,
+                    variation_percent: request.selection.variation_percent,
+                    generation_seed: request.selection.generation_seed,
                 },
                 &bridge_tracks,
                 &learned_matrix,
@@ -3191,16 +3245,26 @@ fn analyze_bridge_validated(
                 decisions: preview_decisions,
             })
         }
-        "exact_count" => {
-            let requested_added_tracks =
-                requested_exact_count.expect("exact-count request has a validated count");
+        "exact_count" | "destination_route" => {
+            let destination_route = request.extension.mode == "destination_route";
+            let destination_automatic = destination_route
+                && request.extension.destination_mode.as_deref() == Some("automatic");
+            let requested_added_tracks = if destination_automatic {
+                0
+            } else {
+                requested_exact_count.expect("exact-count request has a validated count")
+            };
             progress.update(
                 "bridge_selection",
                 format!("Searching for exactly {requested_added_tracks} additions"),
                 Some(0),
                 Some(requested_added_tracks),
             );
-            let max_tracks_per_gap = request.extension.max_tracks_per_gap.unwrap_or(1);
+            let max_tracks_per_gap = if destination_route {
+                max_added_tracks.unwrap_or(0).max(1)
+            } else {
+                request.extension.max_tracks_per_gap.unwrap_or(1)
+            };
             let opening_enabled = request.extension.allow_opening_track.unwrap_or(false);
             let closing_enabled = request.extension.allow_closing_track.unwrap_or(false);
             let endpoint_slots = preview::ExactEndpointSlots {
@@ -3240,26 +3304,64 @@ fn analyze_bridge_validated(
                 .iter()
                 .chain(endpoint_slots.closing.iter())
                 .any(|endpoint| endpoint.semantics.pool != semantic::SemanticPool::BlissOnly);
-            let selection = preview::select_exact_count_bridges_with_endpoints(
-                &selected_library_route,
-                &preview_gaps,
-                &preview::ExactSelectionConfig {
+            let select_count = |count: usize| {
+                preview::select_exact_count_bridges_with_endpoints(
+                    &selected_library_route,
+                    &preview_gaps,
+                    &preview::ExactSelectionConfig {
+                        requested_added_tracks: count,
+                        candidate_limit: retained_candidate_limit,
+                        beam_width: EXACT_COUNT_BEAM_WIDTH,
+                        max_tracks_per_gap,
+                        track_guidance_percent: request.selection.lastfm_track_guidance_percent,
+                        artist_guidance_percent: request.selection.lastfm_artist_guidance_percent,
+                        variation_percent: request.selection.variation_percent,
+                        generation_seed: request.selection.generation_seed,
+                    },
+                    &endpoint_slots,
+                    preview::ExactScoringContext {
+                        tracks: &bridge_tracks,
+                        learned_matrix: &learned_matrix,
+                        config: &bridge_config,
+                        reference: &reference,
+                    },
+                )
+                .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))
+            };
+            let (requested_added_tracks, selection) = if destination_automatic {
+                let direct_percentile = preview_gaps
+                    .first()
+                    .map(|gap| gap.direct_percentile)
+                    .unwrap_or(0.0);
+                let threshold = trigger_percentile
+                    .expect("automatic destination route has a validated threshold");
+                if direct_percentile <= threshold {
+                    (0, select_count(0)?)
+                } else {
+                    let maximum = max_added_tracks
+                        .expect("automatic destination route has a validated maximum");
+                    let mut qualifying = None;
+                    for count in 1..=maximum {
+                        progress.update(
+                            "bridge_selection",
+                            format!("Searching destination route with {count}/{maximum} intermediate tracks"),
+                            Some(count),
+                            Some(maximum),
+                        );
+                        let attempt = select_count(count)?;
+                        if attempt.final_route.is_some() {
+                            qualifying = Some((count, attempt));
+                            break;
+                        }
+                    }
+                    qualifying.unwrap_or((0, select_count(0)?))
+                }
+            } else {
+                (
                     requested_added_tracks,
-                    candidate_limit: retained_candidate_limit,
-                    beam_width: EXACT_COUNT_BEAM_WIDTH,
-                    max_tracks_per_gap,
-                    track_guidance_percent: request.selection.lastfm_track_guidance_percent,
-                    artist_guidance_percent: request.selection.lastfm_artist_guidance_percent,
-                },
-                &endpoint_slots,
-                preview::ExactScoringContext {
-                    tracks: &bridge_tracks,
-                    learned_matrix: &learned_matrix,
-                    config: &bridge_config,
-                    reference: &reference,
-                },
-            )
-            .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))?;
+                    select_count(requested_added_tracks)?,
+                )
+            };
             let feasible = selection.final_route.is_some();
             let decisions = selection
                 .decisions
@@ -3542,7 +3644,11 @@ fn analyze_bridge_validated(
         eligible_candidate_count: eligible_candidates.len(),
         frozen_reference_count: reference.len(),
         trigger_percentile,
-        max_leg_percentile: bridge::DEFAULT_MAX_LEG_PERCENTILE,
+        max_leg_percentile: if request.extension.mode == "destination_route" {
+            trigger_percentile.unwrap_or(bridge::DEFAULT_MAX_LEG_PERCENTILE)
+        } else {
+            bridge::DEFAULT_MAX_LEG_PERCENTILE
+        },
         max_detour_percentile: bridge::DEFAULT_MAX_DETOUR_PERCENTILE,
         retained_candidate_limit,
         semantic_mode: if semantic_assisted {
@@ -3593,12 +3699,12 @@ fn analyze_bridge_request_with_options(
     }
     if !matches!(
         request.route.ordering_policy.as_str(),
-        "optimize_order" | "preserve_order"
+        "optimize_order" | "preserve_order" | "queue_destination"
     ) {
         return Err(CommandFailure::new(
             "ROUTE_POLICY_UNSUPPORTED",
             format!(
-                "the bridge command currently supports optimize_order or preserve_order, not '{}'",
+                "the bridge command currently supports optimize_order, preserve_order, or queue_destination, not '{}'",
                 request.route.ordering_policy
             ),
         ));
@@ -3612,10 +3718,98 @@ fn analyze_bridge_request_with_options(
             ),
         ));
     }
-    if request.route.start_track_id.is_some() || request.route.destination_track_id.is_some() {
+    if request.extension.mode == "destination_route" {
+        let destination_mode = request
+            .extension
+            .destination_mode
+            .as_deref()
+            .ok_or_else(|| {
+                CommandFailure::new(
+                    "DESTINATION_ROUTE_MODE_REQUIRED",
+                    "destination_route requires extension.destination_mode=automatic or exact",
+                )
+            })?;
+        if !matches!(destination_mode, "automatic" | "exact") {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_MODE_INVALID",
+                "destination_route requires extension.destination_mode=automatic or exact",
+            ));
+        }
+        if request.route.ordering_policy != "queue_destination" {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_POLICY_REQUIRED",
+                "destination_route requires route.ordering_policy=queue_destination",
+            ));
+        }
+        let start = request.route.start_track_id.as_deref().ok_or_else(|| {
+            CommandFailure::new(
+                "DESTINATION_ROUTE_START_REQUIRED",
+                "destination_route requires route.start_track_id",
+            )
+        })?;
+        let destination = request
+            .route
+            .destination_track_id
+            .as_deref()
+            .ok_or_else(|| {
+                CommandFailure::new(
+                    "DESTINATION_ROUTE_TARGET_REQUIRED",
+                    "destination_route requires route.destination_track_id",
+                )
+            })?;
+        let start_position = request
+            .source_tracks
+            .iter()
+            .position(|track| track.id == start)
+            .ok_or_else(|| {
+                CommandFailure::new(
+                    "DESTINATION_ROUTE_START_INVALID",
+                    "route.start_track_id is not present in source_tracks",
+                )
+            })?;
+        let destination_position = request
+            .source_tracks
+            .iter()
+            .position(|track| track.id == destination)
+            .ok_or_else(|| {
+                CommandFailure::new(
+                    "DESTINATION_ROUTE_TARGET_INVALID",
+                    "route.destination_track_id is not present in source_tracks",
+                )
+            })?;
+        if destination_position + 1 != request.source_tracks.len()
+            || start_position + 1 != destination_position
+        {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_ANCHORS_INVALID",
+                "destination_route requires the start and destination to be the final two source_tracks",
+            ));
+        }
+        let maximum = request.extension.max_added_tracks.unwrap_or(0);
+        if maximum > preview::MAX_EXACT_TRACKS_PER_GAP {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_MAX_UNSUPPORTED",
+                format!(
+                    "destination routes support at most {} intermediate tracks",
+                    preview::MAX_EXACT_TRACKS_PER_GAP
+                ),
+            ));
+        }
+        if request.extension.destination_mode.as_deref() == Some("exact")
+            && request.extension.additional_track_count.unwrap_or(0) > maximum
+        {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_COUNT_INVALID",
+                "exact intermediate count exceeds the configured destination-route maximum",
+            ));
+        }
+    } else if request.route.ordering_policy == "queue_destination"
+        || request.route.start_track_id.is_some()
+        || request.route.destination_track_id.is_some()
+    {
         return Err(CommandFailure::new(
             "ROUTE_LOCK_UNSUPPORTED",
-            "start and destination locks are not implemented in bridge analysis",
+            "queue_destination and endpoint locks are supported only by destination_route",
         ));
     }
     if request.route.search.time_budget_ms.is_some() {
@@ -3626,12 +3820,12 @@ fn analyze_bridge_request_with_options(
     }
     if !matches!(
         request.extension.mode.as_str(),
-        "automatic" | "exact_count" | "fixed_source_extension"
+        "automatic" | "exact_count" | "fixed_source_extension" | "destination_route"
     ) {
         return Err(CommandFailure::new(
             "EXTENSION_MODE_UNSUPPORTED",
             format!(
-                "the bridge command currently analyzes automatic, exact_count, or fixed_source_extension extension, not '{}'",
+                "the bridge command currently analyzes automatic, exact_count, fixed_source_extension, or destination_route extension, not '{}'",
                 request.extension.mode
             ),
         ));
@@ -3801,6 +3995,63 @@ mod tests {
         assert_eq!(progress["msg"], "Optimization finished");
         let _ = fs::remove_file(progress_path);
     }
+    #[test]
+    fn automatic_destination_route_accepts_a_qualified_direct_transition() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let request_path = repository.join("fixtures/synthetic/automatic-bridge-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(request_path).unwrap()).unwrap();
+        request["job_id"] = Value::String("destination-route-direct-test".to_owned());
+        request["route"]["ordering_policy"] = Value::String("queue_destination".to_owned());
+        request["route"]["start_track_id"] = Value::String("track-04".to_owned());
+        request["route"]["destination_track_id"] = Value::String("track-07".to_owned());
+        request["route"]["search"]["restart_count"] = Value::from(0);
+        request["extension"] = serde_json::json!({
+            "mode": "destination_route",
+            "destination_mode": "automatic",
+            "candidate_limit": 8,
+            "shortlist_limit": 256,
+            "max_added_tracks": 4,
+            "trigger_percentile": 1.0
+        });
+        request["selection"] = serde_json::json!({
+            "variation_percent": 75,
+            "generation_seed": 1234,
+            "lastfm_track_guidance_percent": 0,
+            "lastfm_artist_guidance_percent": 0
+        });
+
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-destination-{}.json",
+            std::process::id()
+        ));
+        let mut missing_mode = request.clone();
+        missing_mode["extension"]
+            .as_object_mut()
+            .unwrap()
+            .remove("destination_mode");
+        fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(&missing_mode).unwrap(),
+        )
+        .unwrap();
+        let failure = analyze_bridge_request(&temporary).unwrap_err();
+        assert_eq!(failure.code, "INVALID_REQUEST");
+
+        fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+        let result = analyze_bridge_request(&temporary).unwrap();
+        let _ = fs::remove_file(temporary);
+
+        assert_eq!(result.ordering_policy, "queue_destination");
+        let SelectionPreviewArtifact::Exact(preview) = result.selection_preview else {
+            panic!("destination route must return an exact-selection preview");
+        };
+        assert_eq!(preview.mode, "exact_count");
+        assert_eq!(preview.added_track_count, 0);
+        assert_eq!(preview.requested_added_tracks, 0);
+        assert!(preview.feasible);
+        assert_eq!(preview.final_sequence.unwrap().len(), 12);
+    }
+
     #[test]
     fn fixed_source_extension_reaches_exact_target_without_relevance_drift() {
         let tracks = (0..32)

@@ -5,7 +5,8 @@ plugin [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss).
 It turns a frozen playlist request, Bliss feature database, repeat rules, the
 current learned similarity matrix, and optional semantic evidence into an
 auditable proposed route. It can reorder fixed membership, analyze and select
-bridge tracks, preserve source anchors, or grow a seed set to an exact target.
+bridge tracks, preserve source anchors, extend a fixed source set to an exact
+target, or build a destination-locked route from a live queue tail.
 
 The native engine is needed because scoring tens of thousands of analyzed
 tracks and searching many contextual routes is computational work that does not
@@ -118,9 +119,10 @@ settings, and repeat validation.
 Requests may include the strategy-neutral `selection` block with
 `variation_percent`, `generation_seed`, `lastfm_track_guidance_percent`, and
 `lastfm_artist_guidance_percent`.
-Variation zero preserves the strict deterministic route and best-match
-fixed-source extension membership. Higher values seed route search; fixed-source extension also
-performs reproducible weighted sampling inside a bounded top acoustic pool.
+Variation zero preserves strict deterministic route, bridge, and fixed-source
+extension choices. Higher values seed route search, reorder a bounded pool of
+acoustically qualified bridge candidates, and let fixed-source extension perform
+reproducible weighted sampling inside a bounded top acoustic pool.
 The same seed and inputs reproduce membership across worker counts. Selection
 is downstream of scoring rather than nested under Adaptive, so Static and
 Forest can reuse it when those strategies are connected. The two Last.fm values
@@ -217,6 +219,21 @@ be recomputed. Once a route is selected, each inserted bridge is removed and
 reinserted virtually so its published two-leg diagnostics reflect its final
 neighbors and Adaptive context. All tracks in a chained gap currently come from
 the semantic pool frozen for the original anchor endpoints.
+
+Destination-route requests use `extension.mode=destination_route` together with
+`route.ordering_policy=queue_destination`, `route.start_track_id`, and
+`route.destination_track_id`. The final two source tracks must be the locked
+start and destination; any earlier source tracks are read-only acoustic and
+repeat context. Only the final gap is extended. `destination_mode=automatic`
+accepts a qualified direct leg or searches one through `max_added_tracks`
+intermediates, stopping at the shortest feasible count. If none qualifies it
+returns the direct route so the caller can show an explicit fallback warning.
+`destination_mode=exact` requires exactly `additional_track_count` intermediates.
+Both counts are bounded from zero through eight. Generated tracks remain unique,
+repeat-safe, and below the configured leg percentile. The chosen destination is
+immutable user intent and is therefore exempt from artist/album rejection caused
+by recent queue history. Variation and the frozen provider-neutral evidence graph
+rerank only candidates that still pass those native gates.
 
 Exact-count requests may independently opt into
 `extension.allow_opening_track` and `extension.allow_closing_track`. Each

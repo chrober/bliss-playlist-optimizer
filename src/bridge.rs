@@ -272,8 +272,13 @@ pub fn evaluate_gap(
     })
 }
 
-fn repeat_safe(route: &[usize], tracks: &[RouteTrack], config: &BridgeConfig) -> bool {
-    for right in 0..route.len() {
+fn repeat_safe_from(
+    route: &[usize],
+    tracks: &[RouteTrack],
+    config: &BridgeConfig,
+    first_right: usize,
+) -> bool {
+    for right in first_right..route.len() {
         for left in 0..right {
             let distance = right - left;
             let left_track = &tracks[route[left]];
@@ -331,7 +336,8 @@ pub fn evaluate_candidate(
     let right_percentile = reference.percentile(right_distance)?;
     let max_percentile = left_percentile.max(right_percentile);
     let detour_percentile = left_percentile + right_percentile;
-    let repeat_safe = !route.contains(&candidate) && repeat_safe(&tentative, tracks, config);
+    let repeat_safe =
+        !route.contains(&candidate) && repeat_safe_from(&tentative, tracks, config, position);
     let accepted = repeat_safe
         && max_percentile <= config.max_leg_percentile
         && detour_percentile <= config.max_detour_percentile;
@@ -380,7 +386,8 @@ pub fn rank_candidates(
             let right_percentile = reference.percentile(right_distance)?;
             let max_percentile = left_percentile.max(right_percentile);
             let detour_percentile = left_percentile + right_percentile;
-            let repeat_safe = !route.contains(candidate) && repeat_safe(&tentative, tracks, config);
+            let repeat_safe = !route.contains(candidate)
+                && repeat_safe_from(&tentative, tracks, config, position);
             let accepted = repeat_safe
                 && max_percentile <= config.max_leg_percentile
                 && detour_percentile <= config.max_detour_percentile;
@@ -443,7 +450,12 @@ pub fn evaluate_endpoint_candidate(
         }
     };
     let percentile = reference.percentile(distance)?;
-    let repeat_safe = !route.contains(&candidate) && repeat_safe(&tentative, tracks, config);
+    let first_right = match slot {
+        EndpointSlot::Opening => 0,
+        EndpointSlot::Closing => tentative.len().saturating_sub(1),
+    };
+    let repeat_safe =
+        !route.contains(&candidate) && repeat_safe_from(&tentative, tracks, config, first_right);
     Ok(EndpointCandidateEvaluation {
         candidate,
         distance,

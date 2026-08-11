@@ -32,6 +32,8 @@ pub struct AutomaticSelectionConfig {
     pub trigger_percentile: f64,
     pub track_guidance_percent: u8,
     pub artist_guidance_percent: u8,
+    pub variation_percent: u8,
+    pub generation_seed: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,12 +44,21 @@ pub struct ExactSelectionConfig {
     pub max_tracks_per_gap: usize,
     pub track_guidance_percent: u8,
     pub artist_guidance_percent: u8,
+    pub variation_percent: u8,
+    pub generation_seed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct GuidanceConfig {
     track_percent: u8,
     artist_percent: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VariationConfig {
+    percent: u8,
+    seed: u64,
+    minimum_pool: usize,
 }
 
 impl AutomaticSelectionConfig {
@@ -57,6 +68,14 @@ impl AutomaticSelectionConfig {
             artist_percent: self.artist_guidance_percent,
         }
     }
+
+    fn variation(self) -> VariationConfig {
+        VariationConfig {
+            percent: self.variation_percent,
+            seed: self.generation_seed,
+            minimum_pool: 2,
+        }
+    }
 }
 
 impl ExactSelectionConfig {
@@ -64,6 +83,14 @@ impl ExactSelectionConfig {
         GuidanceConfig {
             track_percent: self.track_guidance_percent,
             artist_percent: self.artist_guidance_percent,
+        }
+    }
+
+    fn variation(self) -> VariationConfig {
+        VariationConfig {
+            percent: self.variation_percent,
+            seed: self.generation_seed,
+            minimum_pool: self.candidate_limit.saturating_add(1),
         }
     }
 }
@@ -214,12 +241,37 @@ fn gap_right_position(route: &[usize], gap: &AutomaticGap) -> Option<usize> {
     (left < right).then_some(right)
 }
 
+fn variation_key(seed: u64, route: &[usize], position: usize, candidate: usize) -> u64 {
+    let mut value = seed
+        ^ (candidate as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (position as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    for track in route {
+        value ^= (*track as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        value = value.rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
+    }
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn varied_pool_length(accepted: usize, variation: VariationConfig) -> usize {
+    if accepted == 0 || variation.percent == 0 {
+        return accepted.min(1);
+    }
+    let ceiling = accepted.min(32);
+    let floor = variation.minimum_pool.clamp(1, ceiling);
+    floor + (ceiling.saturating_sub(floor) * usize::from(variation.percent) / 100)
+}
+
 fn rank_for_evolving_route(
     route: &[usize],
     position: usize,
     semantics: &[CandidateSemantics],
     scoring: ExactScoringContext<'_>,
     guidance: GuidanceConfig,
+    variation: VariationConfig,
 ) -> Result<Vec<BridgeCandidateEvaluation>, PreviewError> {
     let ExactScoringContext {
         tracks,
@@ -283,6 +335,12 @@ fn rank_for_evolving_route(
             .then_with(|| left.detour_percentile.total_cmp(&right.detour_percentile))
             .then_with(|| left.candidate.cmp(&right.candidate))
     });
+    let accepted = evaluations.iter().take_while(|item| item.accepted).count();
+    let pool = varied_pool_length(accepted, variation);
+    if pool > 1 {
+        evaluations[..pool]
+            .sort_by_key(|item| variation_key(variation.seed, route, position, item.candidate));
+    }
     Ok(evaluations)
 }
 
@@ -334,6 +392,7 @@ pub fn select_automatic_bridges(
                     reference,
                 },
                 selection_config.guidance(),
+                selection_config.variation(),
             )?;
             if let Some(evaluation) = evaluations.iter().find(|candidate| {
                 let inserted = local_objective(
@@ -501,6 +560,7 @@ fn final_exact_decisions(
                     reference,
                 },
                 selection_config.guidance(),
+                selection_config.variation(),
             )?
             .into_iter()
             .next()
@@ -600,6 +660,7 @@ fn select_exact_count_multi_gap_bridges(
                                 reference,
                             },
                             selection_config.guidance(),
+                            selection_config.variation(),
                         )?;
                         for evaluation in evaluations
                             .into_iter()
@@ -766,8 +827,8 @@ fn rank_endpoint_for_route(
     slot: EndpointSlot,
     endpoint: &ExactEndpointSlot,
     candidate_limit: usize,
-    track_guidance_percent: u8,
-    artist_guidance_percent: u8,
+    guidance: GuidanceConfig,
+    variation: VariationConfig,
     scoring: ExactScoringContext<'_>,
 ) -> Result<Vec<SelectedEndpoint>, PreviewError> {
     let ExactScoringContext {
@@ -806,20 +867,30 @@ fn rank_endpoint_for_route(
                 semantics_by_candidate[&left.candidate]
                     .adjusted_percentile(
                         left.percentile,
-                        track_guidance_percent,
-                        artist_guidance_percent,
+                        guidance.track_percent,
+                        guidance.artist_percent,
                     )
                     .total_cmp(
                         &semantics_by_candidate[&right.candidate].adjusted_percentile(
                             right.percentile,
-                            track_guidance_percent,
-                            artist_guidance_percent,
+                            guidance.track_percent,
+                            guidance.artist_percent,
                         ),
                     )
             })
             .then_with(|| left.percentile.total_cmp(&right.percentile))
             .then_with(|| left.candidate.cmp(&right.candidate))
     });
+    let accepted = evaluations.iter().take_while(|item| item.accepted).count();
+    let pool = varied_pool_length(accepted, variation);
+    if pool > 1 {
+        let position = match slot {
+            EndpointSlot::Opening => 0,
+            EndpointSlot::Closing => route.len(),
+        };
+        evaluations[..pool]
+            .sort_by_key(|item| variation_key(variation.seed, route, position, item.candidate));
+    }
     Ok(evaluations
         .into_iter()
         .filter(|evaluation| evaluation.accepted)
@@ -920,8 +991,8 @@ pub fn select_exact_count_bridges_with_endpoints(
                     EndpointSlot::Opening,
                     endpoints.opening.as_ref().expect("opening slot is enabled"),
                     selection_config.candidate_limit,
-                    selection_config.track_guidance_percent,
-                    selection_config.artist_guidance_percent,
+                    selection_config.guidance(),
+                    selection_config.variation(),
                     scoring,
                 )?
                 .into_iter()
@@ -956,8 +1027,8 @@ pub fn select_exact_count_bridges_with_endpoints(
                         EndpointSlot::Closing,
                         endpoints.closing.as_ref().expect("closing slot is enabled"),
                         selection_config.candidate_limit,
-                        selection_config.track_guidance_percent,
-                        selection_config.artist_guidance_percent,
+                        selection_config.guidance(),
+                        selection_config.variation(),
                         scoring,
                     )?
                     .into_iter()
@@ -1176,6 +1247,7 @@ fn select_exact_count_single_gap_bridges(
                             reference,
                         },
                         selection_config.guidance(),
+                        selection_config.variation(),
                     )?;
                     for evaluation in evaluations
                         .into_iter()
@@ -1322,6 +1394,35 @@ mod tests {
     }
 
     #[test]
+    fn bounded_variation_is_reproducible_and_seeded() {
+        let strict = VariationConfig::default();
+        let low = VariationConfig {
+            percent: 1,
+            seed: 101,
+            minimum_pool: 9,
+        };
+        let full = VariationConfig {
+            percent: 100,
+            seed: 101,
+            minimum_pool: 9,
+        };
+        assert_eq!(varied_pool_length(0, full), 0);
+        assert_eq!(varied_pool_length(20, strict), 1);
+        assert_eq!(varied_pool_length(20, low), 9);
+        assert_eq!(varied_pool_length(20, full), 20);
+        assert_eq!(varied_pool_length(100, full), 32);
+
+        let route = [3, 8, 13];
+        let ordered = |seed| {
+            let mut candidates = (1..=16).collect::<Vec<_>>();
+            candidates.sort_by_key(|candidate| variation_key(seed, &route, 2, *candidate));
+            candidates
+        };
+        assert_eq!(ordered(101), ordered(101));
+        assert_ne!(ordered(101), ordered(202));
+    }
+
+    #[test]
     fn selection_is_left_to_right_budgeted_and_worker_deterministic() {
         let tracks = vec![
             track(0.0, "a"),
@@ -1347,6 +1448,8 @@ mod tests {
             trigger_percentile: 0.70,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_721,
         };
         let one = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -1416,6 +1519,8 @@ mod tests {
             trigger_percentile: 0.70,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_721,
         };
         let selected = select_automatic_bridges(
             &route,
@@ -1459,6 +1564,8 @@ mod tests {
             max_tracks_per_gap: 1,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_721,
         };
         let one = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -1547,6 +1654,8 @@ mod tests {
             max_tracks_per_gap: 2,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_721,
         };
         let one = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -1640,6 +1749,8 @@ mod tests {
             max_tracks_per_gap: 1,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_721,
         };
         let without_endpoints =
             select_exact_count_bridges(&route, &[], &exact, &tracks, &matrix, &config, &reference)
