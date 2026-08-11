@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bliss_mixer_core::FeatureVector;
 use ndarray::Array2;
@@ -67,6 +68,13 @@ pub struct RouteSearchResult {
     pub violations: Vec<RepeatViolation>,
     pub search_tasks: usize,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteProgressEvent {
+    pub phase: &'static str,
+    pub completed_tasks: usize,
+    pub total_tasks: usize,
+    pub local_search_passes: usize,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteError {
@@ -105,6 +113,18 @@ pub fn optimize_adaptive_route(
     learned_matrix: &Array2<f32>,
     config: &SearchConfig,
 ) -> Result<RouteSearchResult, RouteError> {
+    optimize_adaptive_route_with_progress(tracks, learned_matrix, config, |_| {})
+}
+
+pub fn optimize_adaptive_route_with_progress<F>(
+    tracks: &[RouteTrack],
+    learned_matrix: &Array2<f32>,
+    config: &SearchConfig,
+    progress: F,
+) -> Result<RouteSearchResult, RouteError>
+where
+    F: Fn(RouteProgressEvent) + Sync,
+{
     if tracks.len() < 2 {
         return Err(RouteError::TooFewTracks);
     }
@@ -118,7 +138,18 @@ pub fn optimize_adaptive_route(
     let intensities = intensity_values(tracks);
     let targets = arc_targets(tracks.len());
     let arc_context = Some((intensities.as_slice(), targets.as_slice()));
-    let mut primary = search_candidate(tracks, learned_matrix, config, None, "adaptive")?;
+    let total_tasks = config.restart_count * 2 + 5;
+    let primary_tasks = config.restart_count + 2;
+    let mut primary = search_candidate(
+        tracks,
+        learned_matrix,
+        config,
+        None,
+        "adaptive",
+        0,
+        total_tasks,
+        &progress,
+    )?;
     let mut primary_cache = ScoreCache::new();
     primary.metrics = route_metrics(
         &primary.route,
@@ -128,7 +159,16 @@ pub fn optimize_adaptive_route(
         arc_context,
         &mut primary_cache,
     )?;
-    let arc = search_candidate(tracks, learned_matrix, config, arc_context, "adaptive-arc")?;
+    let arc = search_candidate(
+        tracks,
+        learned_matrix,
+        config,
+        arc_context,
+        "adaptive-arc",
+        primary_tasks,
+        total_tasks,
+        &progress,
+    )?;
     let selected = if arc.metrics.objective <= primary.metrics.objective * ARC_PRIMARY_TOLERANCE
         && arc.metrics.arc_error <= primary.metrics.arc_error * ARC_ERROR_IMPROVEMENT
     {
@@ -146,7 +186,7 @@ pub fn optimize_adaptive_route(
         arc,
         selected,
         violations,
-        search_tasks: config.restart_count * 2 + 5,
+        search_tasks: total_tasks,
     })
 }
 
@@ -190,15 +230,29 @@ pub fn evaluate_adaptive_sequence(
     )
 }
 
-fn search_candidate(
+fn search_candidate<F>(
     tracks: &[RouteTrack],
     learned_matrix: &Array2<f32>,
     config: &SearchConfig,
     arc_context: Option<(&[f64], &[f64])>,
     strategy: &'static str,
-) -> Result<CandidateRoute, RouteError> {
+    completed_offset: usize,
+    total_tasks: usize,
+    progress: &F,
+) -> Result<CandidateRoute, RouteError>
+where
+    F: Fn(RouteProgressEvent) + Sync,
+{
     let fixed_starts = if arc_context.is_some() { 3 } else { 2 };
     let task_count = fixed_starts + config.restart_count;
+    let completed = AtomicUsize::new(0);
+    let local_search_passes = AtomicUsize::new(0);
+    progress(RouteProgressEvent {
+        phase: strategy,
+        completed_tasks: completed_offset,
+        total_tasks,
+        local_search_passes: 0,
+    });
     let attempts: Vec<Result<CandidateRoute, RouteError>> = (0..task_count)
         .into_par_iter()
         .map(|task| {
@@ -222,6 +276,15 @@ fn search_candidate(
                 config,
                 arc_context,
                 &mut score_cache,
+                || {
+                    let passes = local_search_passes.fetch_add(1, Ordering::Relaxed) + 1;
+                    progress(RouteProgressEvent {
+                        phase: strategy,
+                        completed_tasks: completed_offset + completed.load(Ordering::Relaxed),
+                        total_tasks,
+                        local_search_passes: passes,
+                    });
+                },
             )?;
             if !repeat_violations(&route, tracks, config).is_empty() {
                 return Err(RouteError::Infeasible);
@@ -234,6 +297,13 @@ fn search_candidate(
                 arc_context,
                 &mut score_cache,
             )?;
+            let completed_now = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            progress(RouteProgressEvent {
+                phase: strategy,
+                completed_tasks: completed_offset + completed_now,
+                total_tasks,
+                local_search_passes: local_search_passes.load(Ordering::Relaxed),
+            });
             Ok(CandidateRoute {
                 strategy,
                 route,
@@ -319,15 +389,20 @@ fn greedy_route(
     Ok(route)
 }
 
-fn improve_route(
+fn improve_route<F>(
     mut route: Vec<usize>,
     tracks: &[RouteTrack],
     learned_matrix: &Array2<f32>,
     config: &SearchConfig,
     arc_context: Option<(&[f64], &[f64])>,
     score_cache: &mut ScoreCache,
-) -> Result<Vec<usize>, RouteError> {
+    on_pass: F,
+) -> Result<Vec<usize>, RouteError>
+where
+    F: Fn(),
+{
     loop {
+        on_pass();
         let current = route_metrics(
             &route,
             tracks,

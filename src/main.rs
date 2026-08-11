@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -672,19 +672,21 @@ impl ProgressReporter {
         Self::new(None)
     }
 
-    fn heartbeat(
+    fn dynamic_heartbeat<F>(
         &self,
         stage: &'static str,
-        msg: impl Into<String>,
         interval: Duration,
-    ) -> ProgressHeartbeat {
+        message: F,
+    ) -> ProgressHeartbeat
+    where
+        F: Fn() -> String + Send + 'static,
+    {
         let Some(path) = self.path.clone() else {
             return ProgressHeartbeat::disabled();
         };
         let done = Arc::new(AtomicBool::new(false));
         let done_for_thread = Arc::clone(&done);
         let started = self.started;
-        let msg = msg.into();
         let handle = thread::spawn(move || {
             let mut reporter = ProgressReporter {
                 path: Some(path),
@@ -695,7 +697,7 @@ impl ProgressReporter {
                 if done_for_thread.load(Ordering::Relaxed) {
                     break;
                 }
-                reporter.update(stage, &msg, None, None);
+                reporter.update(stage, message(), None, None);
             }
         });
         ProgressHeartbeat {
@@ -767,6 +769,25 @@ impl Drop for ProgressHeartbeat {
         self.done.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RouteProgressSnapshot {
+    phase: &'static str,
+    completed_tasks: usize,
+    total_tasks: usize,
+    local_search_passes: usize,
+}
+
+impl Default for RouteProgressSnapshot {
+    fn default() -> Self {
+        Self {
+            phase: "adaptive",
+            completed_tasks: 0,
+            total_tasks: 0,
+            local_search_passes: 0,
         }
     }
 }
@@ -1932,18 +1953,36 @@ fn select_fixed_source_extension(
     // ordering; this selector owns reproducible membership diversity.
     progress.update(
         "extension_semantic_guidance",
-        "Collecting optional Last.fm guidance for addition candidates",
-        None,
-        None,
+        format!(
+            "Matching optional Last.fm guidance against {} addition candidates and {} evidence edges",
+            semantic_candidates.len(),
+            semantic_bundle.edges.len()
+        ),
+        Some(0),
+        Some(semantic_candidates.len()),
     );
-    let semantic_candidates_by_id = semantic::select_seed_candidates(
-        semantic_bundle,
-        source_semantic_identities,
-        semantic_candidates,
-    )
-    .into_iter()
-    .map(|candidate| (candidate.candidate, candidate))
-    .collect::<HashMap<_, _>>();
+    let mut semantic_candidate_matches = Vec::new();
+    let mut semantic_checked = 0usize;
+    for chunk in semantic_candidates.chunks(EXTENSION_PROGRESS_CHUNK) {
+        let mut chunk_matches =
+            semantic::select_seed_candidates(semantic_bundle, source_semantic_identities, chunk);
+        semantic_checked += chunk.len();
+        semantic_candidate_matches.append(&mut chunk_matches);
+        progress.update(
+            "extension_semantic_guidance",
+            format!(
+                "Matched Last.fm guidance for {semantic_checked}/{} addition candidates: {} endorsed",
+                semantic_candidates.len(),
+                semantic_candidate_matches.len()
+            ),
+            Some(semantic_checked),
+            Some(semantic_candidates.len()),
+        );
+    }
+    let semantic_candidates_by_id = semantic_candidate_matches
+        .into_iter()
+        .map(|candidate| (candidate.candidate, candidate))
+        .collect::<HashMap<_, _>>();
 
     let guidance_enabled =
         selection.lastfm_track_guidance_percent > 0 || selection.lastfm_artist_guidance_percent > 0;
@@ -2168,22 +2207,56 @@ fn select_fixed_source_extension(
             route_config.restart_count
         );
         progress.update("extension_route_search", &route_message, None, None);
-        let _heartbeat = progress.heartbeat(
+        let route_progress = Arc::new(Mutex::new(RouteProgressSnapshot {
+            total_tasks: route_config.restart_count * 2 + 5,
+            ..RouteProgressSnapshot::default()
+        }));
+        let heartbeat_progress = Arc::clone(&route_progress);
+        let track_count = membership.len();
+        let _heartbeat = progress.dynamic_heartbeat(
             "extension_route_search",
-            format!(
-                "Still routing {} selected tracks: local search is evaluating reversal and relocation neighborhoods",
-                membership.len()
-            ),
             Duration::from_secs(2),
+            move || {
+                let snapshot = heartbeat_progress
+                    .lock()
+                    .map(|guard| *guard)
+                    .unwrap_or_default();
+                let phase = match snapshot.phase {
+                    "adaptive" => "primary route",
+                    "adaptive-arc" => "energy-arc route",
+                    other => other,
+                };
+                format!(
+                    "Routing {track_count} selected tracks: {phase}, completed {}/{} route tasks, {} local-search passes",
+                    snapshot.completed_tasks,
+                    snapshot.total_tasks,
+                    snapshot.local_search_passes
+                )
+            },
         );
         let route_tracks = membership
             .iter()
             .map(|index| tracks[*index].clone())
             .collect::<Vec<_>>();
-        let result = route::optimize_adaptive_route(&route_tracks, learned_matrix, route_config)
-            .map_err(|error| {
-                CommandFailure::new("FIXED_SOURCE_EXTENSION_ROUTE_FAILED", error.to_string())
-            })?;
+        let route_progress_writer = Arc::clone(&route_progress);
+        let result = route::optimize_adaptive_route_with_progress(
+            &route_tracks,
+            learned_matrix,
+            route_config,
+            move |event| {
+                if let Ok(mut snapshot) = route_progress_writer.lock() {
+                    *snapshot = RouteProgressSnapshot {
+                        phase: event.phase,
+                        completed_tasks: event.completed_tasks,
+                        total_tasks: event.total_tasks,
+                        local_search_passes: event.local_search_passes,
+                    };
+                }
+            },
+        )
+        .map_err(|error| {
+            CommandFailure::new("FIXED_SOURCE_EXTENSION_ROUTE_FAILED", error.to_string())
+        })?;
         let selected_strategy = result.selected.strategy;
         let route_metrics = result.selected.metrics;
         let final_route = result
