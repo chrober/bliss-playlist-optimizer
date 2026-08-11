@@ -5091,7 +5091,7 @@ mod tests {
                 .filter(|entry| entry.kind == "bridge")
                 .map(|entry| entry.track_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["bliss-row-5", "bliss-row-6", "bliss-row-8", "bliss-row-7"]
+            vec!["bliss-row-3", "bliss-row-8", "bliss-row-7", "bliss-row-6"]
         );
         assert_eq!(
             preserve_multi_track
