@@ -717,6 +717,7 @@ impl ProgressReporter {
             return;
         };
         let msg = msg.as_ref();
+
         let percent = match (current, total) {
             (Some(current), Some(total)) if total > 0 => {
                 Some((current as f64 * 100.0) / total as f64)
@@ -1968,11 +1969,28 @@ fn select_fixed_source_extension(
             semantic::select_seed_candidates(semantic_bundle, source_semantic_identities, chunk);
         semantic_checked += chunk.len();
         semantic_candidate_matches.append(&mut chunk_matches);
+        let track_supported = semantic_candidate_matches
+            .iter()
+            .filter(|candidate| {
+                candidate.evidence.iter().any(|evidence| {
+                    evidence.provider.eq_ignore_ascii_case("last.fm")
+                        && evidence.kind == semantic::EntityKind::Recording
+                })
+            })
+            .count();
+        let artist_supported = semantic_candidate_matches
+            .iter()
+            .filter(|candidate| {
+                candidate.evidence.iter().any(|evidence| {
+                    evidence.provider.eq_ignore_ascii_case("last.fm")
+                        && evidence.kind == semantic::EntityKind::Artist
+                })
+            })
+            .count();
         progress.update(
             "extension_semantic_guidance",
             format!(
-                "Matched Last.fm guidance: {} endorsed",
-                semantic_candidate_matches.len()
+                "Matched Last.fm guidance: {track_supported} candidate tracks supported by track similarity, {artist_supported} candidate tracks supported by artist similarity"
             ),
             Some(semantic_checked),
             Some(semantic_candidates.len()),
@@ -2410,6 +2428,7 @@ fn optimize_route_request_with_options(
         artist_window: request.repeat_windows.artist,
         album_window: request.repeat_windows.album,
     };
+    let route_total_tasks = restart_count * 2 + 5;
     progress.update(
         "route_search",
         format!(
@@ -2417,18 +2436,56 @@ fn optimize_route_request_with_options(
             tracks.len(),
             restart_count
         ),
-        Some(0),
-        Some(restart_count),
+        None,
+        None,
     );
+    let route_progress = Arc::new(Mutex::new(RouteProgressSnapshot {
+        total_tasks: route_total_tasks,
+        ..RouteProgressSnapshot::default()
+    }));
+    let heartbeat_progress = Arc::clone(&route_progress);
+    let route_track_count = tracks.len();
+    let _heartbeat = progress.dynamic_heartbeat("route_search", Duration::from_secs(2), move || {
+        let snapshot = heartbeat_progress
+            .lock()
+            .map(|guard| *guard)
+            .unwrap_or_default();
+        let phase = match snapshot.phase {
+            "adaptive" => "primary route",
+            "adaptive-arc" => "energy-arc route",
+            other => other,
+        };
+        format!(
+            "Searching route through {route_track_count} tracks: {phase}, completed {}/{} route tasks, {} local-search passes",
+            snapshot.completed_tasks,
+            snapshot.total_tasks,
+            snapshot.local_search_passes
+        )
+    });
+    let route_progress_writer = Arc::clone(&route_progress);
     let started = Instant::now();
-    let result = route::optimize_adaptive_route(&tracks, &learned_matrix, &config)
-        .map_err(|error| CommandFailure::new("ROUTE_SEARCH_FAILED", error.to_string()))?;
+    let result = route::optimize_adaptive_route_with_progress(
+        &tracks,
+        &learned_matrix,
+        &config,
+        move |event| {
+            if let Ok(mut snapshot) = route_progress_writer.lock() {
+                *snapshot = RouteProgressSnapshot {
+                    phase: event.phase,
+                    completed_tasks: event.completed_tasks,
+                    total_tasks: event.total_tasks,
+                    local_search_passes: event.local_search_passes,
+                };
+            }
+        },
+    )
+    .map_err(|error| CommandFailure::new("ROUTE_SEARCH_FAILED", error.to_string()))?;
     timings.record("route_search", started.elapsed());
     progress.update(
         "route_search",
         "Route search completed",
-        Some(restart_count),
-        Some(restart_count),
+        Some(route_total_tasks),
+        Some(route_total_tasks),
     );
     let selected_track_ids = route_track_ids(&result.selected.route, &request.source_tracks);
     let track_window_satisfied_by_unique_membership = request.repeat_windows.track == 0
@@ -2622,6 +2679,7 @@ fn analyze_bridge_validated(
     } else {
         route_config.clone()
     };
+    let base_route_total_tasks = restart_count * 2 + 5;
     progress.update(
         "route_search",
         format!(
@@ -2629,8 +2687,8 @@ fn analyze_bridge_validated(
             source_route_tracks.len(),
             restart_count
         ),
-        Some(0),
-        Some(restart_count),
+        None,
+        None,
     );
     let started = Instant::now();
     let (
@@ -2640,10 +2698,44 @@ fn analyze_bridge_validated(
         parallel_execution,
     ) = match request.route.ordering_policy.as_str() {
         "optimize_order" => {
-            let result = route::optimize_adaptive_route(
+            let route_progress = Arc::new(Mutex::new(RouteProgressSnapshot {
+                total_tasks: base_route_total_tasks,
+                ..RouteProgressSnapshot::default()
+            }));
+            let heartbeat_progress = Arc::clone(&route_progress);
+            let route_track_count = source_route_tracks.len();
+            let _heartbeat = progress.dynamic_heartbeat("route_search", Duration::from_secs(2), move || {
+                let snapshot = heartbeat_progress
+                    .lock()
+                    .map(|guard| *guard)
+                    .unwrap_or_default();
+                let phase = match snapshot.phase {
+                    "adaptive" => "primary route",
+                    "adaptive-arc" => "energy-arc route",
+                    other => other,
+                };
+                format!(
+                    "Preparing base route for {route_track_count} source tracks: {phase}, completed {}/{} route tasks, {} local-search passes",
+                    snapshot.completed_tasks,
+                    snapshot.total_tasks,
+                    snapshot.local_search_passes
+                )
+            });
+            let route_progress_writer = Arc::clone(&route_progress);
+            let result = route::optimize_adaptive_route_with_progress(
                 &source_route_tracks,
                 &learned_matrix,
                 &base_route_config,
+                move |event| {
+                    if let Ok(mut snapshot) = route_progress_writer.lock() {
+                        *snapshot = RouteProgressSnapshot {
+                            phase: event.phase,
+                            completed_tasks: event.completed_tasks,
+                            total_tasks: event.total_tasks,
+                            local_search_passes: event.local_search_passes,
+                        };
+                    }
+                },
             )
             .map_err(|error| CommandFailure::new("ROUTE_SEARCH_FAILED", error.to_string()))?;
             (
@@ -2689,8 +2781,8 @@ fn analyze_bridge_validated(
     progress.update(
         "route_search",
         "Base route prepared",
-        Some(restart_count),
-        Some(restart_count),
+        Some(base_route_total_tasks),
+        Some(base_route_total_tasks),
     );
     let selected_library_route = selected_local_route
         .iter()
