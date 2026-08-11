@@ -1971,8 +1971,7 @@ fn select_fixed_source_extension(
         progress.update(
             "extension_semantic_guidance",
             format!(
-                "Matched Last.fm guidance for {semantic_checked}/{} addition candidates: {} endorsed",
-                semantic_candidates.len(),
+                "Matched Last.fm guidance: {} endorsed",
                 semantic_candidate_matches.len()
             ),
             Some(semantic_checked),
