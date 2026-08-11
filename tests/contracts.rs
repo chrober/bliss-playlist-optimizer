@@ -228,6 +228,53 @@ fn automatic_request_requires_a_budget_and_trigger() {
 }
 
 #[test]
+fn destination_route_requires_locked_endpoints_and_exact_count_when_requested() {
+    let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut request = read_json(&repository_path(
+        "fixtures/synthetic/automatic-preview-request.json",
+    ));
+    let source = request["source_tracks"].as_array().unwrap();
+    let start = source[source.len() - 2]["id"].clone();
+    let destination = source[source.len() - 1]["id"].clone();
+    request["route"]["ordering_policy"] = Value::String("queue_destination".to_owned());
+    request["route"]["start_track_id"] = start;
+    request["route"]["destination_track_id"] = destination;
+    request["extension"] = serde_json::json!({
+        "mode": "destination_route",
+        "destination_mode": "automatic",
+        "candidate_limit": 8,
+        "shortlist_limit": 256,
+        "max_added_tracks": 4,
+        "trigger_percentile": 0.7
+    });
+    assert!(validator.is_valid(&request));
+
+    let mut without_start = request.clone();
+    without_start["route"]
+        .as_object_mut()
+        .unwrap()
+        .remove("start_track_id");
+    assert!(!validator.is_valid(&without_start));
+
+    let mut wrong_policy = request.clone();
+    wrong_policy["route"]["ordering_policy"] = Value::String("preserve_order".to_owned());
+    assert!(!validator.is_valid(&wrong_policy));
+
+    let mut exact_without_count = request.clone();
+    exact_without_count["extension"]["destination_mode"] = Value::String("exact".to_owned());
+    assert!(!validator.is_valid(&exact_without_count));
+
+    exact_without_count["extension"]["additional_track_count"] = Value::from(2);
+    assert!(validator.is_valid(&exact_without_count));
+
+    let mut non_destination_with_locks = request;
+    non_destination_with_locks["extension"] = serde_json::json!({"mode": "none"});
+    non_destination_with_locks["route"]["ordering_policy"] =
+        Value::String("preserve_order".to_owned());
+    assert!(!validator.is_valid(&non_destination_with_locks));
+}
+#[test]
 fn exact_count_request_requires_the_requested_addition_count() {
     let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
     let validator = jsonschema::validator_for(&schema).unwrap();
