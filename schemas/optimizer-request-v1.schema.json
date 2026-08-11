@@ -148,9 +148,10 @@
       "required": ["mode"],
       "properties": {
         "mode": {
-          "enum": ["none", "automatic", "exact_count", "fixed_source_extension", "one_per_transition", "target_length"]
+          "enum": ["none", "automatic", "exact_count", "fixed_source_extension", "destination_route", "one_per_transition", "target_length"]
         },
         "additional_track_count": { "type": "integer", "minimum": 0 },
+        "destination_mode": { "enum": ["automatic", "exact"] },
         "allow_opening_track": { "type": "boolean" },
         "allow_closing_track": { "type": "boolean" },
         "target_track_count": { "type": "integer", "minimum": 2 },
@@ -178,6 +179,20 @@
             "properties": { "mode": { "const": "fixed_source_extension" } }
           },
           "then": { "required": ["target_track_count"] }
+        },
+        {
+          "if": {
+            "properties": { "mode": { "const": "destination_route" } }
+          },
+          "then": {
+            "required": ["destination_mode", "max_added_tracks", "trigger_percentile"],
+            "allOf": [
+              {
+                "if": { "properties": { "destination_mode": { "const": "exact" } } },
+                "then": { "required": ["additional_track_count"] }
+              }
+            ]
+          }
         }
       ]
     },
@@ -244,6 +259,42 @@
         "properties": {
           "extension": {
             "properties": { "mode": { "const": "exact_count" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "extension": {
+            "properties": { "mode": { "const": "destination_route" } }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "route": {
+            "required": ["start_track_id", "destination_track_id"],
+            "properties": {
+              "ordering_policy": { "const": "queue_destination" }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "route": {
+            "not": {
+              "anyOf": [
+                { "required": ["start_track_id"] },
+                { "required": ["destination_track_id"] }
+              ]
+            },
+            "properties": {
+              "ordering_policy": {
+                "enum": ["optimize_order", "preserve_order"]
+              }
+            }
           }
         }
       }

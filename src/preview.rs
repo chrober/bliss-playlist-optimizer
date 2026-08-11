@@ -32,6 +32,8 @@ pub struct AutomaticSelectionConfig {
     pub trigger_percentile: f64,
     pub track_guidance_percent: u8,
     pub artist_guidance_percent: u8,
+    pub variation_percent: u8,
+    pub generation_seed: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,12 +44,38 @@ pub struct ExactSelectionConfig {
     pub max_tracks_per_gap: usize,
     pub track_guidance_percent: u8,
     pub artist_guidance_percent: u8,
+    pub variation_percent: u8,
+    pub generation_seed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct GuidanceConfig {
     track_percent: u8,
     artist_percent: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VariationConfig {
+    percent: u8,
+    seed: u64,
+    minimum_pool: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvolvingAcceptance {
+    FullBridge,
+    ReachableFromLeft,
+}
+
+impl EvolvingAcceptance {
+    fn accepts(self, evaluation: &BridgeCandidateEvaluation, config: &BridgeConfig) -> bool {
+        match self {
+            Self::FullBridge => evaluation.accepted,
+            Self::ReachableFromLeft => {
+                evaluation.repeat_safe && evaluation.left_percentile <= config.max_leg_percentile
+            }
+        }
+    }
 }
 
 impl AutomaticSelectionConfig {
@@ -57,6 +85,14 @@ impl AutomaticSelectionConfig {
             artist_percent: self.artist_guidance_percent,
         }
     }
+
+    fn variation(self) -> VariationConfig {
+        VariationConfig {
+            percent: self.variation_percent,
+            seed: self.generation_seed,
+            minimum_pool: 2,
+        }
+    }
 }
 
 impl ExactSelectionConfig {
@@ -64,6 +100,14 @@ impl ExactSelectionConfig {
         GuidanceConfig {
             track_percent: self.track_guidance_percent,
             artist_percent: self.artist_guidance_percent,
+        }
+    }
+
+    fn variation(self) -> VariationConfig {
+        VariationConfig {
+            percent: self.variation_percent,
+            seed: self.generation_seed,
+            minimum_pool: self.candidate_limit.saturating_add(1),
         }
     }
 }
@@ -214,12 +258,38 @@ fn gap_right_position(route: &[usize], gap: &AutomaticGap) -> Option<usize> {
     (left < right).then_some(right)
 }
 
+fn variation_key(seed: u64, route: &[usize], position: usize, candidate: usize) -> u64 {
+    let mut value = seed
+        ^ (candidate as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (position as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    for track in route {
+        value ^= (*track as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        value = value.rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
+    }
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn varied_pool_length(accepted: usize, variation: VariationConfig) -> usize {
+    if accepted == 0 || variation.percent == 0 {
+        return accepted.min(1);
+    }
+    let ceiling = accepted.min(32);
+    let floor = variation.minimum_pool.clamp(1, ceiling);
+    floor + (ceiling.saturating_sub(floor) * usize::from(variation.percent) / 100)
+}
+
 fn rank_for_evolving_route(
     route: &[usize],
     position: usize,
     semantics: &[CandidateSemantics],
     scoring: ExactScoringContext<'_>,
     guidance: GuidanceConfig,
+    variation: VariationConfig,
+    acceptance: EvolvingAcceptance,
 ) -> Result<Vec<BridgeCandidateEvaluation>, PreviewError> {
     let ExactScoringContext {
         tracks,
@@ -246,9 +316,9 @@ fn rank_for_evolving_route(
     )
     .map_err(PreviewError::Scoring)?;
     evaluations.sort_by(|left, right| {
-        right
-            .accepted
-            .cmp(&left.accepted)
+        acceptance
+            .accepts(right, config)
+            .cmp(&acceptance.accepts(left, config))
             .then_with(|| {
                 semantics_by_candidate[&left.candidate]
                     .adjusted_percentile(
@@ -283,6 +353,15 @@ fn rank_for_evolving_route(
             .then_with(|| left.detour_percentile.total_cmp(&right.detour_percentile))
             .then_with(|| left.candidate.cmp(&right.candidate))
     });
+    let accepted = evaluations
+        .iter()
+        .take_while(|item| acceptance.accepts(item, config))
+        .count();
+    let pool = varied_pool_length(accepted, variation);
+    if pool > 1 {
+        evaluations[..pool]
+            .sort_by_key(|item| variation_key(variation.seed, route, position, item.candidate));
+    }
     Ok(evaluations)
 }
 
@@ -334,6 +413,8 @@ pub fn select_automatic_bridges(
                     reference,
                 },
                 selection_config.guidance(),
+                selection_config.variation(),
+                EvolvingAcceptance::FullBridge,
             )?;
             if let Some(evaluation) = evaluations.iter().find(|candidate| {
                 let inserted = local_objective(
@@ -501,6 +582,8 @@ fn final_exact_decisions(
                     reference,
                 },
                 selection_config.guidance(),
+                selection_config.variation(),
+                EvolvingAcceptance::FullBridge,
             )?
             .into_iter()
             .next()
@@ -573,20 +656,22 @@ fn select_exact_count_multi_gap_bridges(
                     .saturating_sub(already_added)
                     .min(selection_config.max_tracks_per_gap);
                 let mut completed = Vec::new();
-                let mut frontier = vec![(state.clone(), Vec::<usize>::new())];
+                let mut frontier = vec![(state.clone(), Vec::<usize>::new(), true)];
 
                 for depth in 0..=depth_limit {
-                    for (variant, selected) in &frontier {
-                        let mut finalized = variant.clone();
-                        finalized.gap_selections.push(selected.clone());
-                        completed.push(finalized);
+                    for (variant, selected, right_connected) in &frontier {
+                        if *right_connected {
+                            let mut finalized = variant.clone();
+                            finalized.gap_selections.push(selected.clone());
+                            completed.push(finalized);
+                        }
                     }
                     if depth == depth_limit || frontier.is_empty() {
                         break;
                     }
 
                     let mut next = Vec::new();
-                    for (variant, selected) in frontier {
+                    for (variant, selected, _) in frontier {
                         let position = gap_right_position(&variant.route, gap)
                             .ok_or(PreviewError::InvalidOriginalGap(gap.original_position))?;
                         let evaluations = rank_for_evolving_route(
@@ -600,10 +685,14 @@ fn select_exact_count_multi_gap_bridges(
                                 reference,
                             },
                             selection_config.guidance(),
+                            selection_config.variation(),
+                            EvolvingAcceptance::ReachableFromLeft,
                         )?;
                         for evaluation in evaluations
                             .into_iter()
-                            .filter(|candidate| candidate.accepted)
+                            .filter(|candidate| {
+                                EvolvingAcceptance::ReachableFromLeft.accepts(candidate, config)
+                            })
                             .take(selection_config.candidate_limit)
                         {
                             let mut inserted = variant.clone();
@@ -619,10 +708,10 @@ fn select_exact_count_multi_gap_bridges(
                             .objective;
                             let mut inserted_selection = selected.clone();
                             inserted_selection.push(evaluation.candidate);
-                            next.push((inserted, inserted_selection));
+                            next.push((inserted, inserted_selection, evaluation.accepted));
                         }
                     }
-                    next.sort_by(|(left, left_selection), (right, right_selection)| {
+                    next.sort_by(|(left, left_selection, _), (right, right_selection, _)| {
                         if multi_exact_state_precedes(left, right) {
                             std::cmp::Ordering::Less
                         } else if multi_exact_state_precedes(right, left) {
@@ -631,7 +720,7 @@ fn select_exact_count_multi_gap_bridges(
                             left_selection.cmp(right_selection)
                         }
                     });
-                    next.dedup_by(|(left, _), (right, _)| left.route == right.route);
+                    next.dedup_by(|(left, _, _), (right, _, _)| left.route == right.route);
                     next.truncate(selection_config.beam_width);
                     frontier = next;
                 }
@@ -766,8 +855,8 @@ fn rank_endpoint_for_route(
     slot: EndpointSlot,
     endpoint: &ExactEndpointSlot,
     candidate_limit: usize,
-    track_guidance_percent: u8,
-    artist_guidance_percent: u8,
+    guidance: GuidanceConfig,
+    variation: VariationConfig,
     scoring: ExactScoringContext<'_>,
 ) -> Result<Vec<SelectedEndpoint>, PreviewError> {
     let ExactScoringContext {
@@ -806,20 +895,30 @@ fn rank_endpoint_for_route(
                 semantics_by_candidate[&left.candidate]
                     .adjusted_percentile(
                         left.percentile,
-                        track_guidance_percent,
-                        artist_guidance_percent,
+                        guidance.track_percent,
+                        guidance.artist_percent,
                     )
                     .total_cmp(
                         &semantics_by_candidate[&right.candidate].adjusted_percentile(
                             right.percentile,
-                            track_guidance_percent,
-                            artist_guidance_percent,
+                            guidance.track_percent,
+                            guidance.artist_percent,
                         ),
                     )
             })
             .then_with(|| left.percentile.total_cmp(&right.percentile))
             .then_with(|| left.candidate.cmp(&right.candidate))
     });
+    let accepted = evaluations.iter().take_while(|item| item.accepted).count();
+    let pool = varied_pool_length(accepted, variation);
+    if pool > 1 {
+        let position = match slot {
+            EndpointSlot::Opening => 0,
+            EndpointSlot::Closing => route.len(),
+        };
+        evaluations[..pool]
+            .sort_by_key(|item| variation_key(variation.seed, route, position, item.candidate));
+    }
     Ok(evaluations
         .into_iter()
         .filter(|evaluation| evaluation.accepted)
@@ -920,8 +1019,8 @@ pub fn select_exact_count_bridges_with_endpoints(
                     EndpointSlot::Opening,
                     endpoints.opening.as_ref().expect("opening slot is enabled"),
                     selection_config.candidate_limit,
-                    selection_config.track_guidance_percent,
-                    selection_config.artist_guidance_percent,
+                    selection_config.guidance(),
+                    selection_config.variation(),
                     scoring,
                 )?
                 .into_iter()
@@ -956,8 +1055,8 @@ pub fn select_exact_count_bridges_with_endpoints(
                         EndpointSlot::Closing,
                         endpoints.closing.as_ref().expect("closing slot is enabled"),
                         selection_config.candidate_limit,
-                        selection_config.track_guidance_percent,
-                        selection_config.artist_guidance_percent,
+                        selection_config.guidance(),
+                        selection_config.variation(),
                         scoring,
                     )?
                     .into_iter()
@@ -1176,6 +1275,8 @@ fn select_exact_count_single_gap_bridges(
                             reference,
                         },
                         selection_config.guidance(),
+                        selection_config.variation(),
+                        EvolvingAcceptance::FullBridge,
                     )?;
                     for evaluation in evaluations
                         .into_iter()
@@ -1322,6 +1423,35 @@ mod tests {
     }
 
     #[test]
+    fn bounded_variation_is_reproducible_and_seeded() {
+        let strict = VariationConfig::default();
+        let low = VariationConfig {
+            percent: 1,
+            seed: 101,
+            minimum_pool: 9,
+        };
+        let full = VariationConfig {
+            percent: 100,
+            seed: 101,
+            minimum_pool: 9,
+        };
+        assert_eq!(varied_pool_length(0, full), 0);
+        assert_eq!(varied_pool_length(20, strict), 1);
+        assert_eq!(varied_pool_length(20, low), 9);
+        assert_eq!(varied_pool_length(20, full), 20);
+        assert_eq!(varied_pool_length(100, full), 32);
+
+        let route = [3, 8, 13];
+        let ordered = |seed| {
+            let mut candidates = (1..=16).collect::<Vec<_>>();
+            candidates.sort_by_key(|candidate| variation_key(seed, &route, 2, *candidate));
+            candidates
+        };
+        assert_eq!(ordered(101), ordered(101));
+        assert_ne!(ordered(101), ordered(202));
+    }
+
+    #[test]
     fn selection_is_left_to_right_budgeted_and_worker_deterministic() {
         let tracks = vec![
             track(0.0, "a"),
@@ -1347,6 +1477,8 @@ mod tests {
             trigger_percentile: 0.70,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_721,
         };
         let one = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -1416,6 +1548,8 @@ mod tests {
             trigger_percentile: 0.70,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_721,
         };
         let selected = select_automatic_bridges(
             &route,
@@ -1459,6 +1593,8 @@ mod tests {
             max_tracks_per_gap: 1,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_721,
         };
         let one = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -1547,6 +1683,8 @@ mod tests {
             max_tracks_per_gap: 2,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_721,
         };
         let one = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
@@ -1614,6 +1752,71 @@ mod tests {
     }
 
     #[test]
+    fn exact_count_can_build_a_path_when_no_single_bridge_reaches_both_anchors() {
+        let tracks = vec![
+            track(0.0, "anchor-a"),
+            track(1.0, "bridge-a"),
+            track(2.0, "bridge-b"),
+            track(3.0, "anchor-b"),
+        ];
+        let route = [0, 3];
+        let matrix = Array2::eye(23);
+        let config = BridgeConfig {
+            seed_limit: 1,
+            learned_percent: 20,
+            artist_window: 1,
+            album_window: 1,
+            max_leg_percentile: 0.25,
+            max_detour_percentile: 0.50,
+        };
+        let reference =
+            build_frozen_reference(&route, &[0, 1, 2, 3], &tracks, &matrix, &config).unwrap();
+        let gaps = [AutomaticGap {
+            original_position: 1,
+            left: 0,
+            right: 3,
+            direct_distance: 10.0,
+            direct_percentile: 1.0,
+            semantics: GapEvidence {
+                pool: SemanticPool::BlissOnly,
+                candidates: vec![semantics(1), semantics(2)],
+            },
+        }];
+        let exact = ExactSelectionConfig {
+            requested_added_tracks: 1,
+            candidate_limit: 2,
+            beam_width: 16,
+            max_tracks_per_gap: 2,
+            track_guidance_percent: 0,
+            artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_811,
+        };
+
+        let one_bridge = select_exact_count_bridges(
+            &route, &gaps, &exact, &tracks, &matrix, &config, &reference,
+        )
+        .unwrap();
+        assert_eq!(one_bridge.final_route, None);
+
+        let two_bridges = select_exact_count_bridges(
+            &route,
+            &gaps,
+            &ExactSelectionConfig {
+                requested_added_tracks: 2,
+                ..exact
+            },
+            &tracks,
+            &matrix,
+            &config,
+            &reference,
+        )
+        .unwrap();
+        assert_eq!(two_bridges.final_route, Some(vec![0, 1, 2, 3]));
+        assert_eq!(two_bridges.stats.maximum_additions_found, 2);
+    }
+
+    #[test]
     fn explicit_endpoint_slots_make_an_otherwise_impossible_count_deterministic() {
         let tracks = vec![
             track(1.0, "anchor-a"),
@@ -1640,6 +1843,8 @@ mod tests {
             max_tracks_per_gap: 1,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_721,
         };
         let without_endpoints =
             select_exact_count_bridges(&route, &[], &exact, &tracks, &matrix, &config, &reference)

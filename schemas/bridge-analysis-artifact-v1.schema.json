@@ -30,7 +30,7 @@
     "local_candidate_inventory_sha256": { "$ref": "#/$defs/sha256" },
     "semantic_evidence_sha256": { "$ref": "#/$defs/sha256" },
     "algorithm_requested": { "enum": ["adaptive", "static"] },
-    "ordering_policy": { "enum": ["optimize_order", "preserve_order"] },
+    "ordering_policy": { "enum": ["optimize_order", "preserve_order", "queue_destination"] },
     "learned_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
     "seed_limit": { "type": "integer", "minimum": 1 },
     "deterministic_seed": { "type": "integer", "minimum": 0 },
