@@ -230,6 +230,7 @@ pub fn evaluate_adaptive_sequence(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_candidate<F>(
     tracks: &[RouteTrack],
     learned_matrix: &Array2<f32>,

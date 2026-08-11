@@ -742,11 +742,9 @@ impl ProgressReporter {
             let _ = fs::create_dir_all(parent);
         }
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-        if fs::write(&temporary, bytes).is_ok() {
-            if fs::rename(&temporary, path).is_err() {
-                let _ = fs::remove_file(path);
-                let _ = fs::rename(&temporary, path);
-            }
+        if fs::write(&temporary, bytes).is_ok() && fs::rename(&temporary, path).is_err() {
+            let _ = fs::remove_file(path);
+            let _ = fs::rename(&temporary, path);
         }
     }
 }
@@ -2156,7 +2154,7 @@ fn select_fixed_source_extension(
         if artist_counts.get(artist).copied().unwrap_or(0) >= artist_capacity
             || album_counts.get(album).copied().unwrap_or(0) >= album_capacity
         {
-            if considered % EXTENSION_PROGRESS_CHUNK == 0 {
+            if considered.is_multiple_of(EXTENSION_PROGRESS_CHUNK) {
                 progress.update(
                     "extension_membership_selection",
                     format!(
