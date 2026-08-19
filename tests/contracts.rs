@@ -250,6 +250,12 @@ fn destination_route_requires_locked_endpoints_and_exact_count_when_requested() 
     });
     assert!(validator.is_valid(&request));
 
+    request["extension"]["search_effort"] = Value::String("fast".to_owned());
+    assert!(validator.is_valid(&request));
+    let mut invalid_effort = request.clone();
+    invalid_effort["extension"]["search_effort"] = Value::String("unbounded".to_owned());
+    assert!(!validator.is_valid(&invalid_effort));
+
     let mut without_start = request.clone();
     without_start["route"]
         .as_object_mut()

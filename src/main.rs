@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use bincode::Options;
 use bliss_mixer_core::database::{BlissDatabase, SUPPORTED_SCHEMA_IDENTITY};
-use bliss_mixer_core::{scoring::score_adaptive_sequence, FEATURE_COUNT};
+#[cfg(test)]
+use bliss_mixer_core::scoring::adaptive_distance;
+use bliss_mixer_core::{scoring::score_adaptive_sequence, FeatureVector, FEATURE_COUNT};
 use ndarray::Array2;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -33,6 +35,36 @@ const SEMANTIC_SHORTLIST_RESERVE: usize = 32;
 const LIBRARY_CACHE_VERSION: u8 = 1;
 const MAX_LIBRARY_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v1\n";
+#[derive(Clone, Copy)]
+struct DestinationSearchEffort {
+    name: &'static str,
+    candidate_limit: usize,
+    beam_width: usize,
+    shortlist_limit: usize,
+}
+
+fn destination_search_effort(value: Option<&str>) -> DestinationSearchEffort {
+    match value.unwrap_or("balanced") {
+        "fast" => DestinationSearchEffort {
+            name: "fast",
+            candidate_limit: 6,
+            beam_width: 32,
+            shortlist_limit: 128,
+        },
+        "thorough" => DestinationSearchEffort {
+            name: "thorough",
+            candidate_limit: 16,
+            beam_width: 192,
+            shortlist_limit: 512,
+        },
+        _ => DestinationSearchEffort {
+            name: "balanced",
+            candidate_limit: 8,
+            beam_width: 64,
+            shortlist_limit: 256,
+        },
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -143,6 +175,7 @@ struct RepeatWindows {
 struct ExtensionSettings {
     mode: String,
     destination_mode: Option<String>,
+    search_effort: Option<String>,
     additional_track_count: Option<usize>,
     target_track_count: Option<usize>,
     allow_opening_track: Option<bool>,
@@ -201,6 +234,39 @@ struct ContextualLeg {
     candidate_track_id: String,
     algorithm: String,
     distance: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct DestinationRouteQualityArtifact {
+    primary_metric: &'static str,
+    reference_model: &'static str,
+    matrix_role: &'static str,
+    matrix_sha256: String,
+    adjacent_legs: Vec<AdjacentTransitionArtifact>,
+    adjacent_transition_sum: f64,
+    adjacent_worst_transition: f64,
+    adjacent_worst_percentile: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct AdjacentTransitionArtifact {
+    position: usize,
+    left_track_id: String,
+    right_track_id: String,
+    distance: f64,
+    source_relative_percentile: f64,
+}
+
+struct AdjacentRouteQuality {
+    legs: Vec<(usize, usize, f64, f64)>,
+    transition_sum: f64,
+    worst_transition: f64,
+    worst_percentile: f64,
+}
+struct FixedMatrixDistanceIndex<'a> {
+    tracks: &'a [route::RouteTrack],
+    transformed: Vec<FeatureVector>,
+    quadratic: Vec<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -528,6 +594,8 @@ struct ExactSelectionArtifact {
     achieved_max_leg_percentile: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     best_effort: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_quality: Option<DestinationRouteQualityArtifact>,
     search: ExactSearchArtifact,
     infeasibility: Option<ExactInfeasibilityArtifact>,
 }
@@ -562,6 +630,8 @@ struct EndpointCandidateArtifact {
 struct ExactSearchArtifact {
     beam_width: usize,
     candidate_limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_effort: Option<&'static str>,
     max_tracks_per_gap: usize,
     evaluated_states: usize,
     retained_states: usize,
@@ -1684,6 +1754,7 @@ fn score_request(path: &Path) -> Result<ScoringArtifact, CommandFailure> {
         features.push(metrics);
     }
 
+    let static_scoring = request.scoring.algorithm == "static";
     let scored = score_adaptive_sequence(
         &features,
         Some(&scoring_matrix),
@@ -1702,7 +1773,11 @@ fn score_request(path: &Path) -> Result<ScoringArtifact, CommandFailure> {
                 .map(|track| track.id.clone())
                 .collect(),
             candidate_track_id: request.source_tracks[leg.position].id.clone(),
-            algorithm: leg.algorithm.to_string(),
+            algorithm: if static_scoring {
+                "static-weights".to_owned()
+            } else {
+                leg.algorithm.to_string()
+            },
             distance: f64::from(leg.distance),
         })
         .collect();
@@ -2562,11 +2637,24 @@ fn analyze_bridge_validated(
     let seed_limit = adaptive.seed_limit;
     let deterministic_seed = request.route.search.deterministic_seed;
     let restart_count = request.route.search.restart_count;
-    let retained_candidate_limit = request
-        .extension
-        .candidate_limit
-        .unwrap_or(DEFAULT_RETAINED_CANDIDATES);
-    let shortlist_limit = request.extension.shortlist_limit.unwrap_or(usize::MAX);
+    let destination_effort = (request.extension.mode == "destination_route")
+        .then(|| destination_search_effort(request.extension.search_effort.as_deref()));
+    let retained_candidate_limit = destination_effort.map_or_else(
+        || {
+            request
+                .extension
+                .candidate_limit
+                .unwrap_or(DEFAULT_RETAINED_CANDIDATES)
+        },
+        |effort| effort.candidate_limit,
+    );
+    let shortlist_limit = destination_effort.map_or_else(
+        || request.extension.shortlist_limit.unwrap_or(usize::MAX),
+        |effort| effort.shortlist_limit,
+    );
+    let destination_beam_width = destination_effort
+        .map(|effort| effort.beam_width)
+        .unwrap_or(EXACT_COUNT_BEAM_WIDTH);
     let (max_added_tracks, trigger_percentile, requested_exact_count) =
         match request.extension.mode.as_str() {
             "automatic" => (
@@ -2841,33 +2929,25 @@ fn analyze_bridge_validated(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
+    let adjacent_reference_candidates = library
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| {
+            local_candidate_rows
+                .as_ref()
+                .is_none_or(|rows| rows.contains(&track.row_id))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
     let semantic_candidates = eligible_candidates
         .iter()
         .map(|index| candidate_semantic_identity(*index, &library[*index]))
         .collect::<Vec<_>>();
     let semantic_candidate_lookup = semantic::CandidateLookup::new(&semantic_candidates);
-    let mut bridge_tracks = library
+    let bridge_tracks = library
         .iter()
         .map(|track| track.route_track.clone())
         .collect::<Vec<_>>();
-    if request.extension.mode == "destination_route" {
-        let destination_id = request
-            .route
-            .destination_track_id
-            .as_deref()
-            .expect("destination route validation requires a destination track id");
-        let destination_source_index = request
-            .source_tracks
-            .iter()
-            .position(|track| track.id == destination_id)
-            .expect("validated destination must be a source track");
-        let destination_library_index = source_library_indices[destination_source_index];
-        // The explicitly selected destination is immutable user intent. Generated
-        // intermediates remain repeat-safe, while the destination itself is allowed
-        // even when its artist or album is already present in recent queue history.
-        bridge_tracks[destination_library_index].artist_key.clear();
-        bridge_tracks[destination_library_index].album_key.clear();
-    }
     let bridge_config = bridge::BridgeConfig {
         seed_limit,
         learned_percent,
@@ -3353,34 +3433,56 @@ fn analyze_bridge_validated(
                 )
                 .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))
             };
-            let selection_quality = |selection: &preview::ExactSelection,
-                                     direct_percentile: f64|
-             -> Result<(f64, f64), CommandFailure> {
-                let achieved_max_leg_percentile = selection
-                    .decisions
+            let distance_index = destination_route
+                .then(|| FixedMatrixDistanceIndex::new(&bridge_tracks, &learned_matrix));
+            let evaluate_destination = |route: &[usize]| {
+                let path_start = route
                     .iter()
-                    .filter_map(|decision| decision.selected.as_ref())
-                    .map(|selected| selected.evaluation.max_percentile)
-                    .max_by(f64::total_cmp)
-                    .unwrap_or(direct_percentile);
-                let route = selection.final_route.as_ref().ok_or_else(|| {
-                    CommandFailure::new(
-                        "DESTINATION_ROUTE_NOT_FOUND",
-                        "destination search did not produce a complete route",
-                    )
-                })?;
-                let objective = route::evaluate_adaptive_sequence(
-                    route,
-                    &bridge_tracks,
-                    &learned_matrix,
-                    bridge_config.seed_limit,
-                    bridge_config.learned_percent,
+                    .position(|track| *track == preview_gaps[0].left)
+                    .ok_or_else(|| {
+                        CommandFailure::new(
+                            "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
+                            "the destination path start is absent from the selected route",
+                        )
+                    })?;
+                distance_index
+                    .as_ref()
+                    .expect("destination routes build a fixed distance index")
+                    .evaluate_route(&route[path_start..], &adjacent_reference_candidates)
+            };
+            let relaxed_config = bridge::BridgeConfig {
+                max_leg_percentile: f64::MAX,
+                max_detour_percentile: f64::MAX,
+                ..bridge_config.clone()
+            };
+            let destination_config = |count: usize| preview::ExactSelectionConfig {
+                requested_added_tracks: count,
+                candidate_limit: retained_candidate_limit,
+                beam_width: destination_beam_width,
+                max_tracks_per_gap: count.max(1),
+                track_guidance_percent: request.selection.lastfm_track_guidance_percent,
+                artist_guidance_percent: request.selection.lastfm_artist_guidance_percent,
+                variation_percent: request.selection.variation_percent,
+                generation_seed: request.selection.generation_seed,
+            };
+            let search_destination = |maximum: usize| {
+                let distance_index = distance_index
+                    .as_ref()
+                    .expect("destination routes build a fixed distance index");
+                preview::select_destination_bridge_routes(
+                    &selected_library_route,
+                    &preview_gaps[0],
+                    maximum,
+                    &destination_config(maximum),
+                    preview::ExactScoringContext {
+                        tracks: &bridge_tracks,
+                        learned_matrix: &learned_matrix,
+                        config: &relaxed_config,
+                        reference: &reference,
+                    },
+                    |left, right| distance_index.distance(left, right),
                 )
-                .map_err(|error| {
-                    CommandFailure::new("DESTINATION_ROUTE_SCORING_FAILED", error.to_string())
-                })?
-                .objective;
-                Ok((achieved_max_leg_percentile, objective))
+                .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))
             };
             let (
                 requested_added_tracks,
@@ -3388,95 +3490,177 @@ fn analyze_bridge_validated(
                 quality_target_met,
                 achieved_max_leg_percentile,
                 best_effort,
+                route_quality,
             ) = if destination_automatic {
-                let direct_percentile = preview_gaps
-                    .first()
-                    .map(|gap| gap.direct_percentile)
-                    .unwrap_or(0.0);
                 let threshold = trigger_percentile
                     .expect("automatic destination route has a validated threshold");
-                if direct_percentile <= threshold {
+                let direct_selection = search_destination(0)?
+                    .into_iter()
+                    .next()
+                    .expect("a direct destination option is always available");
+                let direct_quality = evaluate_destination(
+                    direct_selection
+                        .selection
+                        .final_route
+                        .as_deref()
+                        .expect("the direct destination route is feasible"),
+                )?;
+                if direct_quality.worst_percentile <= threshold {
                     (
                         0,
-                        select_count(0, &bridge_config)?,
+                        direct_selection.selection,
                         Some(true),
-                        Some(direct_percentile),
+                        Some(direct_quality.worst_percentile),
                         Some(false),
+                        Some(direct_quality),
                     )
                 } else {
                     let maximum = max_added_tracks
                         .expect("automatic destination route has a validated maximum");
+                    progress.update(
+                        "bridge_selection",
+                        format!(
+                            "Searching adjacent destination paths with up to {maximum} intermediate tracks"
+                        ),
+                        Some(0),
+                        Some(maximum),
+                    );
+                    let options = search_destination(maximum)?;
                     let mut qualifying = None;
-                    for count in 1..=maximum {
-                        progress.update(
-                            "bridge_selection",
-                            format!("Searching destination route with {count}/{maximum} intermediate tracks"),
-                            Some(count),
-                            Some(maximum),
-                        );
-                        let attempt = select_count(count, &bridge_config)?;
-                        if attempt.final_route.is_some() {
-                            let (achieved, _) = selection_quality(&attempt, direct_percentile)?;
-                            qualifying =
-                                Some((count, attempt, Some(true), Some(achieved), Some(false)));
-                            break;
-                        }
-                    }
-                    if let Some(qualifying) = qualifying {
-                        qualifying
-                    } else {
+                    let mut fallback = Some((direct_selection, direct_quality));
+                    for option in options
+                        .into_iter()
+                        .filter(|option| option.added_track_count > 0)
+                    {
                         progress.update(
                             "bridge_selection",
                             format!(
-                                "No route met the {:.0}% quality target; selecting the smoothest route within the {maximum}-track budget",
-                                threshold * 100.0
+                                "Comparing adjacent destination path with {}/{} intermediate tracks",
+                                option.added_track_count, maximum
                             ),
-                            Some(0),
-                            Some(maximum.saturating_add(1)),
+                            Some(option.added_track_count),
+                            Some(maximum),
                         );
-                        let relaxed_config = bridge::BridgeConfig {
-                            max_leg_percentile: f64::MAX,
-                            max_detour_percentile: f64::MAX,
-                            ..bridge_config.clone()
-                        };
-                        let mut fallback = None;
-                        for count in 0..=maximum {
-                            progress.update(
-                                "bridge_selection",
-                                format!(
-                                    "Comparing best-effort destination route with {count}/{maximum} intermediate tracks"
-                                ),
-                                Some(count.saturating_add(1)),
-                                Some(maximum.saturating_add(1)),
-                            );
-                            let attempt = select_count(count, &relaxed_config)?;
-                            if attempt.final_route.is_none() {
-                                continue;
-                            }
-                            let (achieved, objective) =
-                                selection_quality(&attempt, direct_percentile)?;
-                            let replace = fallback.as_ref().is_none_or(
-                                |(best_count, _, best_achieved, best_objective)| {
-                                    achieved.total_cmp(best_achieved).is_lt()
-                                        || (achieved == *best_achieved
-                                            && (objective.total_cmp(best_objective).is_lt()
-                                                || (objective == *best_objective
-                                                    && count < *best_count)))
+                        let quality = evaluate_destination(
+                            option
+                                .selection
+                                .final_route
+                                .as_deref()
+                                .expect("destination route options are feasible"),
+                        )?;
+                        let met = quality.worst_percentile <= threshold;
+                        let replace_fallback = fallback.as_ref().is_none_or(
+                            |(best_option, best_quality): &(
+                                preview::DestinationRouteOption,
+                                AdjacentRouteQuality,
+                            )| {
+                                quality
+                                    .worst_transition
+                                    .total_cmp(&best_quality.worst_transition)
+                                    .is_lt()
+                                    || (quality.worst_transition == best_quality.worst_transition
+                                        && (quality
+                                            .transition_sum
+                                            .total_cmp(&best_quality.transition_sum)
+                                            .is_lt()
+                                            || (quality.transition_sum
+                                                == best_quality.transition_sum
+                                                && option.added_track_count
+                                                    < best_option.added_track_count)))
+                            },
+                        );
+                        if replace_fallback {
+                            fallback = Some((
+                                option.clone(),
+                                AdjacentRouteQuality {
+                                    legs: quality.legs.clone(),
+                                    transition_sum: quality.transition_sum,
+                                    worst_transition: quality.worst_transition,
+                                    worst_percentile: quality.worst_percentile,
                                 },
-                            );
-                            if replace {
-                                fallback = Some((count, attempt, achieved, objective));
-                            }
+                            ));
                         }
-                        let (count, attempt, achieved, _) = fallback.ok_or_else(|| {
-                            CommandFailure::new(
-                                "DESTINATION_ROUTE_NOT_FOUND",
-                                "no repeat-safe destination route could be constructed within the configured budget",
-                            )
-                        })?;
-                        let met = achieved <= threshold;
-                        (count, attempt, Some(met), Some(achieved), Some(!met))
+                        if met {
+                            qualifying = Some((option, quality));
+                            break;
+                        }
                     }
+                    let (option, quality) = qualifying.or(fallback).ok_or_else(|| {
+                        CommandFailure::new(
+                            "DESTINATION_ROUTE_NOT_FOUND",
+                            "no repeat-safe destination route could be constructed within the configured budget",
+                        )
+                    })?;
+                    let met = quality.worst_percentile <= threshold;
+                    (
+                        option.added_track_count,
+                        option.selection,
+                        Some(met),
+                        Some(quality.worst_percentile),
+                        Some(!met),
+                        Some(quality),
+                    )
+                }
+            } else if destination_route {
+                let options = search_destination(requested_added_tracks)?;
+                if let Some(option) = options
+                    .iter()
+                    .find(|option| option.added_track_count == requested_added_tracks)
+                    .cloned()
+                {
+                    let quality = evaluate_destination(
+                        option
+                            .selection
+                            .final_route
+                            .as_deref()
+                            .expect("destination route options are feasible"),
+                    )?;
+                    (
+                        requested_added_tracks,
+                        option.selection,
+                        None,
+                        None,
+                        None,
+                        Some(quality),
+                    )
+                } else {
+                    let maximum_additions_found = options
+                        .iter()
+                        .map(|option| option.added_track_count)
+                        .max()
+                        .unwrap_or(0);
+                    let structural_upper_bound = options
+                        .first()
+                        .map(|option| option.selection.stats.structural_upper_bound)
+                        .unwrap_or(0);
+                    (
+                        requested_added_tracks,
+                        preview::ExactSelection {
+                            requested_added_tracks,
+                            final_route: None,
+                            decisions: Vec::new(),
+                            endpoint_decisions: Vec::new(),
+                            stats: preview::ExactSearchStats {
+                                max_tracks_per_gap: requested_added_tracks.max(1),
+                                evaluated_states: options
+                                    .iter()
+                                    .map(|option| option.selection.stats.evaluated_states)
+                                    .sum::<usize>()
+                                    .max(1),
+                                retained_states: options
+                                    .iter()
+                                    .map(|option| option.selection.stats.retained_states)
+                                    .sum::<usize>()
+                                    .max(1),
+                                maximum_additions_found,
+                                structural_upper_bound,
+                            },
+                        },
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
                 }
             } else {
                 (
@@ -3485,9 +3669,43 @@ fn analyze_bridge_validated(
                     None,
                     None,
                     None,
+                    None,
                 )
             };
             let feasible = selection.final_route.is_some();
+            let track_id = |index: usize| {
+                original_ids_by_library
+                    .get(&index)
+                    .cloned()
+                    .unwrap_or_else(|| bridge_candidate_id(library[index].row_id))
+            };
+            let route_quality = route_quality.map(|quality| DestinationRouteQualityArtifact {
+                primary_metric: "fixed-matrix-adjacent-distance",
+                reference_model: "source-relative-local-library-percentile",
+                matrix_role: if request.scoring.algorithm == "static" || learned_percent == 0 {
+                    "static-weights"
+                } else {
+                    "learned-matrix"
+                },
+                matrix_sha256: scoring_matrix_sha256.clone(),
+                adjacent_legs: quality
+                    .legs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, (left, right, distance, percentile))| {
+                        AdjacentTransitionArtifact {
+                            position: position + 1,
+                            left_track_id: track_id(left),
+                            right_track_id: track_id(right),
+                            distance,
+                            source_relative_percentile: percentile,
+                        }
+                    })
+                    .collect(),
+                adjacent_transition_sum: quality.transition_sum,
+                adjacent_worst_transition: quality.worst_transition,
+                adjacent_worst_percentile: quality.worst_percentile,
+            });
             let decisions = selection
                 .decisions
                 .iter()
@@ -3553,9 +3771,9 @@ fn analyze_bridge_validated(
             });
             SelectionPreviewArtifact::Exact(ExactSelectionArtifact {
                 mode: "exact_count",
-                processing_order: if endpoint_slots.opening.is_some()
-                    || endpoint_slots.closing.is_some()
-                {
+                processing_order: if destination_route {
+                    "fixed-adjacent-layered-destination-beam-search"
+                } else if endpoint_slots.opening.is_some() || endpoint_slots.closing.is_some() {
                     "bounded-endpoints-and-original-gaps-beam-search"
                 } else {
                     "left-to-right-original-gaps-beam-search"
@@ -3579,8 +3797,10 @@ fn analyze_bridge_validated(
                 quality_target_met,
                 achieved_max_leg_percentile,
                 best_effort,
+                route_quality,
                 search: ExactSearchArtifact {
-                    beam_width: EXACT_COUNT_BEAM_WIDTH,
+                    beam_width: destination_beam_width,
+                    search_effort: destination_effort.map(|effort| effort.name),
                     candidate_limit: retained_candidate_limit,
                     max_tracks_per_gap: selection.stats.max_tracks_per_gap,
                     evaluated_states: selection.stats.evaluated_states,
@@ -4003,6 +4223,111 @@ fn analyze_bridge_request_with_options(
     Ok(artifact)
 }
 
+impl<'a> FixedMatrixDistanceIndex<'a> {
+    fn new(tracks: &'a [route::RouteTrack], matrix: &Array2<f32>) -> Self {
+        let transformed = tracks
+            .par_iter()
+            .map(|track| {
+                std::array::from_fn(|row| {
+                    (0..FEATURE_COUNT)
+                        .map(|column| matrix[(row, column)] * track.features[column])
+                        .sum::<f32>()
+                })
+            })
+            .collect::<Vec<FeatureVector>>();
+        let quadratic = tracks
+            .par_iter()
+            .zip(transformed.par_iter())
+            .map(|(track, transformed)| {
+                track
+                    .features
+                    .iter()
+                    .zip(transformed)
+                    .map(|(feature, projected)| feature * projected)
+                    .sum::<f32>()
+            })
+            .collect();
+        Self {
+            tracks,
+            transformed,
+            quadratic,
+        }
+    }
+
+    fn distance(&self, left: usize, right: usize) -> f64 {
+        let left_right = self.tracks[left]
+            .features
+            .iter()
+            .zip(&self.transformed[right])
+            .map(|(feature, projected)| feature * projected)
+            .sum::<f32>();
+        let right_left = self.tracks[right]
+            .features
+            .iter()
+            .zip(&self.transformed[left])
+            .map(|(feature, projected)| feature * projected)
+            .sum::<f32>();
+        f64::from(
+            (self.quadratic[left] + self.quadratic[right] - left_right - right_left)
+                .max(0.0)
+                .sqrt(),
+        )
+    }
+
+    fn source_relative_percentile(
+        &self,
+        left: usize,
+        observed_distance: f64,
+        reference_candidates: &[usize],
+    ) -> Result<f64, CommandFailure> {
+        let population = reference_candidates
+            .iter()
+            .filter(|candidate| **candidate != left)
+            .count();
+        if population == 0 {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
+                "an adjacent transition has no source-relative reference population",
+            ));
+        }
+        let below = reference_candidates
+            .par_iter()
+            .filter(|candidate| **candidate != left)
+            .filter(|candidate| self.distance(left, **candidate) < observed_distance)
+            .count();
+        Ok((below as f64 / population.saturating_sub(1).max(1) as f64).min(1.0))
+    }
+
+    fn evaluate_route(
+        &self,
+        route: &[usize],
+        reference_candidates: &[usize],
+    ) -> Result<AdjacentRouteQuality, CommandFailure> {
+        if route.len() < 2 || reference_candidates.len() < 2 {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
+                "adjacent route quality requires at least two route and reference tracks",
+            ));
+        }
+        let legs = route
+            .windows(2)
+            .map(|pair| {
+                let left = pair[0];
+                let right = pair[1];
+                let distance = self.distance(left, right);
+                let percentile =
+                    self.source_relative_percentile(left, distance, reference_candidates)?;
+                Ok((left, right, distance, percentile))
+            })
+            .collect::<Result<Vec<_>, CommandFailure>>()?;
+        Ok(AdjacentRouteQuality {
+            transition_sum: legs.iter().map(|leg| leg.2).sum(),
+            worst_transition: legs.iter().map(|leg| leg.2).fold(0.0_f64, f64::max),
+            worst_percentile: legs.iter().map(|leg| leg.3).fold(0.0_f64, f64::max),
+            legs,
+        })
+    }
+}
 fn repeat_key(value: &str) -> String {
     value.trim().to_lowercase()
 }
@@ -4124,6 +4449,39 @@ mod tests {
         let _ = fs::remove_file(progress_path);
     }
     #[test]
+    fn fixed_matrix_index_matches_core_pairwise_distance() {
+        let tracks = (0..4)
+            .map(|track| route::RouteTrack {
+                features: std::array::from_fn(|feature| {
+                    (track + 1) as f32 * (feature + 2) as f32 / 97.0
+                }),
+                artist_key: format!("artist-{track}"),
+                album_key: format!("album-{track}"),
+            })
+            .collect::<Vec<_>>();
+        let mut matrix = Array2::<f32>::zeros((FEATURE_COUNT, FEATURE_COUNT));
+        for feature in 0..FEATURE_COUNT {
+            matrix[(feature, feature)] = 0.5 + feature as f32 / 50.0;
+        }
+        matrix[(0, 1)] = 0.07;
+        matrix[(1, 0)] = 0.03;
+        let index = FixedMatrixDistanceIndex::new(&tracks, &matrix);
+        for left in 0..tracks.len() {
+            for right in 0..tracks.len() {
+                let expected = f64::from(adaptive_distance(
+                    &tracks[left].features,
+                    &tracks[right].features,
+                    &matrix,
+                ));
+                let actual = index.distance(left, right);
+                assert!(
+                    (actual - expected).abs() < 1.0e-5,
+                    "indexed distance {actual} differs from core distance {expected}"
+                );
+            }
+        }
+    }
+    #[test]
     fn automatic_destination_route_accepts_a_qualified_direct_transition() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
         let request_path = repository.join("fixtures/synthetic/automatic-bridge-request.json");
@@ -4137,6 +4495,7 @@ mod tests {
             "mode": "destination_route",
             "destination_mode": "automatic",
             "candidate_limit": 8,
+            "search_effort": "fast",
             "shortlist_limit": 256,
             "max_added_tracks": 4,
             "trigger_percentile": 1.0
@@ -4178,6 +4537,9 @@ mod tests {
         assert_eq!(preview.requested_added_tracks, 0);
         assert!(preview.feasible);
         assert_eq!(preview.final_sequence.unwrap().len(), 12);
+        assert_eq!(preview.search.search_effort, Some("fast"));
+        assert_eq!(preview.search.beam_width, 32);
+        assert_eq!(preview.search.candidate_limit, 6);
     }
 
     #[test]
@@ -4228,10 +4590,12 @@ mod tests {
         assert_eq!(direct_preview.added_track_count, 0);
         assert_eq!(direct_preview.quality_target_met, Some(false));
         assert_eq!(direct_preview.best_effort, Some(true));
+        let direct_quality = direct_preview.route_quality.as_ref().unwrap();
         assert_eq!(
             direct_preview.achieved_max_leg_percentile,
-            Some(direct_fallback.gaps[0].direct_percentile)
+            Some(direct_quality.adjacent_worst_percentile)
         );
+        assert_eq!(direct_quality.adjacent_legs.len(), 1);
 
         assert!(result.frozen_reference_count > 1);
         assert_eq!(result.gaps.len(), 1);
@@ -4247,9 +4611,29 @@ mod tests {
         assert!(preview.requested_added_tracks > 0);
         assert!(preview.added_track_count > 0);
         assert!(preview.feasible);
+        let quality = preview.route_quality.as_ref().unwrap();
+        assert_eq!(quality.primary_metric, "fixed-matrix-adjacent-distance");
+        assert_eq!(
+            quality.reference_model,
+            "source-relative-local-library-percentile"
+        );
+        assert_eq!(
+            quality.adjacent_legs.len(),
+            preview.final_sequence.as_ref().unwrap().len() - 1
+        );
         assert_eq!(preview.quality_target_met, Some(true));
         assert_eq!(preview.best_effort, Some(false));
-        assert!(preview.achieved_max_leg_percentile.unwrap() <= 0.5);
+        assert_eq!(preview.search.search_effort, Some("balanced"));
+        assert_eq!(preview.search.beam_width, 64);
+        assert_eq!(
+            preview.achieved_max_leg_percentile,
+            Some(quality.adjacent_worst_percentile)
+        );
+        assert!(quality.adjacent_worst_percentile <= 0.5);
+        assert!(
+            quality.adjacent_worst_transition < direct_quality.adjacent_worst_transition,
+            "using the bridge budget must improve the adjacent bottleneck"
+        );
     }
 
     #[test]
@@ -4696,6 +5080,28 @@ mod tests {
         std::env::set_current_dir(original).unwrap();
     }
 
+    #[test]
+    fn static_score_legs_report_static_strategy() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = repository.join("fixtures/synthetic/adaptive-scoring-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["job_id"] = Value::String("static-score-label-test".to_owned());
+        request["scoring"]["algorithm"] = Value::String("static".to_owned());
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-static-score-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+        let artifact = score_request(&temporary).unwrap();
+        let _ = fs::remove_file(temporary);
+
+        assert_eq!(artifact.algorithm_requested, "static");
+        assert_eq!(artifact.learned_percent, 100);
+        assert!(artifact
+            .legs
+            .iter()
+            .all(|leg| leg.algorithm == "static-weights"));
+    }
     #[test]
     fn published_requests_validate_and_match_the_python_scoring_oracle() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"));

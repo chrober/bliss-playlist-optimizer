@@ -189,6 +189,14 @@ pub struct ExactSelection {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct DestinationRouteOption {
+    pub added_track_count: usize,
+    pub selection: ExactSelection,
+    pub adjacent_transition_sum: f64,
+    pub adjacent_worst_transition: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct SelectedEndpoint {
     pub semantics: CandidateSemantics,
     pub evaluation: EndpointCandidateEvaluation,
@@ -798,6 +806,306 @@ fn select_exact_count_multi_gap_bridges(
     })
 }
 
+#[derive(Clone, Debug)]
+struct DestinationPathState {
+    bridges: Vec<usize>,
+    transition_sum: f64,
+    worst_transition: f64,
+    lower_sum: f64,
+    lower_worst: f64,
+    semantic_support: f64,
+}
+
+fn destination_path_order(
+    left: &DestinationPathState,
+    right: &DestinationPathState,
+) -> std::cmp::Ordering {
+    left.lower_worst
+        .total_cmp(&right.lower_worst)
+        .then_with(|| left.lower_sum.total_cmp(&right.lower_sum))
+        .then_with(|| right.semantic_support.total_cmp(&left.semantic_support))
+        .then_with(|| left.bridges.cmp(&right.bridges))
+}
+
+fn destination_complete_order(
+    left: &DestinationPathState,
+    right: &DestinationPathState,
+) -> std::cmp::Ordering {
+    left.worst_transition
+        .total_cmp(&right.worst_transition)
+        .then_with(|| left.transition_sum.total_cmp(&right.transition_sum))
+        .then_with(|| right.semantic_support.total_cmp(&left.semantic_support))
+        .then_with(|| left.bridges.cmp(&right.bridges))
+}
+
+fn destination_route_repeat_safe(
+    route: &[usize],
+    first_generated: usize,
+    generated_count: usize,
+    tracks: &[RouteTrack],
+    config: &BridgeConfig,
+) -> bool {
+    (first_generated..first_generated.saturating_add(generated_count))
+        .all(|position| crate::bridge::repeat_safe_at(route, tracks, config, position))
+}
+
+/// Searches the final source transition as a bounded, fixed-matrix path.
+/// Acoustic distances are supplied by one caller-owned index, so all bridge
+/// counts share preprocessing and the quick action remains latency-bounded.
+pub fn select_destination_bridge_routes<F>(
+    original_route: &[usize],
+    gap: &AutomaticGap,
+    max_added_tracks: usize,
+    selection_config: &ExactSelectionConfig,
+    scoring: ExactScoringContext<'_>,
+    adjacent_distance: F,
+) -> Result<Vec<DestinationRouteOption>, PreviewError>
+where
+    F: Fn(usize, usize) -> f64 + Sync + Copy,
+{
+    if original_route.len() < 2
+        || original_route[original_route.len() - 2] != gap.left
+        || original_route.last().copied() != Some(gap.right)
+    {
+        return Err(PreviewError::FinalRouteInvalid(
+            "destination search requires the final source transition as its only gap",
+        ));
+    }
+    if max_added_tracks > MAX_EXACT_TRACKS_PER_GAP {
+        return Err(PreviewError::InvalidExactConfig(
+            "destination bridge budget exceeds the supported limit",
+        ));
+    }
+    if selection_config.candidate_limit == 0 || selection_config.beam_width == 0 {
+        return Err(PreviewError::InvalidExactConfig(
+            "destination candidate and beam limits must be at least one",
+        ));
+    }
+
+    let tracks = scoring.tracks;
+    let config = scoring.config;
+    let destination = gap.right;
+    let prefix = &original_route[..original_route.len() - 1];
+    let first_generated = prefix.len();
+    let mut candidates = gap
+        .semantics
+        .candidates
+        .iter()
+        .map(|candidate| candidate.candidate)
+        .filter(|candidate| !original_route.contains(candidate))
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    let semantics = gap
+        .semantics
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.candidate, candidate))
+        .collect::<HashMap<_, _>>();
+    let structural_upper_bound = max_added_tracks.min(candidates.len());
+    let direct = adjacent_distance(gap.left, destination);
+    let direct_decisions = final_exact_decisions(
+        original_route,
+        std::slice::from_ref(gap),
+        &[Vec::new()],
+        scoring,
+        selection_config,
+    )?;
+    let mut options = vec![DestinationRouteOption {
+        added_track_count: 0,
+        selection: ExactSelection {
+            requested_added_tracks: 0,
+            final_route: Some(original_route.to_vec()),
+            decisions: direct_decisions,
+            endpoint_decisions: Vec::new(),
+            stats: ExactSearchStats {
+                max_tracks_per_gap: max_added_tracks.max(1),
+                evaluated_states: 1,
+                retained_states: 1,
+                maximum_additions_found: 0,
+                structural_upper_bound,
+            },
+        },
+        adjacent_transition_sum: direct,
+        adjacent_worst_transition: direct,
+    }];
+
+    for requested in 1..=max_added_tracks {
+        let mut evaluated_states = 1usize;
+        let mut retained_states = 1usize;
+        let mut frontier = vec![DestinationPathState {
+            bridges: Vec::with_capacity(requested),
+            transition_sum: 0.0,
+            worst_transition: 0.0,
+            lower_sum: direct,
+            lower_worst: direct / (requested + 1) as f64,
+            semantic_support: 0.0,
+        }];
+
+        for layer in 0..requested {
+            let mut next = frontier
+                .par_iter()
+                .flat_map_iter(|state| {
+                    let left = state.bridges.last().copied().unwrap_or(gap.left);
+                    let remaining_edges = requested - layer;
+                    let mut variants = candidates
+                        .iter()
+                        .copied()
+                        .filter(|candidate| !state.bridges.contains(candidate))
+                        .filter_map(|candidate| {
+                            let destination_distance = requested - layer;
+                            let candidate_track = &tracks[candidate];
+                            let destination_track = &tracks[destination];
+                            let conflicts_with_destination = (config.artist_window > 0
+                                && destination_distance <= config.artist_window
+                                && !candidate_track.artist_key.is_empty()
+                                && candidate_track.artist_key == destination_track.artist_key)
+                                || (config.album_window > 0
+                                    && destination_distance <= config.album_window
+                                    && !candidate_track.album_key.is_empty()
+                                    && candidate_track.album_key == destination_track.album_key);
+                            if conflicts_with_destination {
+                                return None;
+                            }
+                            let mut partial = prefix.to_vec();
+                            partial.extend(state.bridges.iter().copied());
+                            partial.push(candidate);
+                            if !crate::bridge::repeat_safe_at(
+                                &partial,
+                                tracks,
+                                config,
+                                partial.len() - 1,
+                            ) {
+                                return None;
+                            }
+                            let edge = adjacent_distance(left, candidate);
+                            let distance_left = adjacent_distance(candidate, destination);
+                            let transition_sum = state.transition_sum + edge;
+                            let worst_transition = state.worst_transition.max(edge);
+                            let mut bridges = state.bridges.clone();
+                            bridges.push(candidate);
+                            Some(DestinationPathState {
+                                bridges,
+                                transition_sum,
+                                worst_transition,
+                                lower_sum: transition_sum + distance_left,
+                                lower_worst: worst_transition
+                                    .max(distance_left / remaining_edges as f64),
+                                semantic_support: state.semantic_support
+                                    + semantics
+                                        .get(&candidate)
+                                        .map(|candidate| {
+                                            candidate.guidance_score(
+                                                selection_config.track_guidance_percent,
+                                                selection_config.artist_guidance_percent,
+                                            )
+                                        })
+                                        .unwrap_or(0.0),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    variants.sort_by(destination_path_order);
+                    variants.truncate(selection_config.candidate_limit);
+                    variants
+                })
+                .collect::<Vec<_>>();
+            evaluated_states = evaluated_states.saturating_add(next.len());
+            next.sort_by(destination_path_order);
+            next.dedup_by(|left, right| left.bridges == right.bridges);
+            next.truncate(selection_config.beam_width);
+            retained_states = retained_states.saturating_add(next.len());
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+
+        let mut complete = frontier
+            .into_iter()
+            .filter_map(|mut state| {
+                let mut route = prefix.to_vec();
+                route.extend(state.bridges.iter().copied());
+                route.push(destination);
+                if !destination_route_repeat_safe(
+                    &route,
+                    first_generated,
+                    requested,
+                    tracks,
+                    config,
+                ) {
+                    return None;
+                }
+                let final_edge = adjacent_distance(*state.bridges.last()?, destination);
+                state.transition_sum += final_edge;
+                state.worst_transition = state.worst_transition.max(final_edge);
+                state.lower_sum = state.transition_sum;
+                state.lower_worst = state.worst_transition;
+                Some(state)
+            })
+            .collect::<Vec<_>>();
+        complete.sort_by(destination_complete_order);
+        let Some(best) = complete.first() else {
+            continue;
+        };
+        let worst_limit = best.worst_transition + (best.worst_transition * 0.02).max(1.0e-9);
+        let sum_limit = best.transition_sum + (best.transition_sum * 0.05).max(1.0e-9);
+        let quality_band = complete
+            .iter()
+            .take_while(|candidate| candidate.worst_transition <= worst_limit)
+            .filter(|candidate| candidate.transition_sum <= sum_limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let pool = varied_pool_length(
+            quality_band.len(),
+            VariationConfig {
+                percent: selection_config.variation_percent,
+                seed: selection_config.generation_seed,
+                minimum_pool: 1,
+            },
+        );
+        let selected = quality_band
+            .into_iter()
+            .take(pool.max(1))
+            .min_by_key(|candidate| {
+                variation_key(
+                    selection_config.generation_seed,
+                    &candidate.bridges,
+                    requested,
+                    destination,
+                )
+            })
+            .expect("the destination quality band contains its best route");
+        let mut route = prefix.to_vec();
+        route.extend(selected.bridges.iter().copied());
+        route.push(destination);
+        let decisions = final_exact_decisions(
+            &route,
+            std::slice::from_ref(gap),
+            std::slice::from_ref(&selected.bridges),
+            scoring,
+            selection_config,
+        )?;
+        options.push(DestinationRouteOption {
+            added_track_count: requested,
+            selection: ExactSelection {
+                requested_added_tracks: requested,
+                final_route: Some(route),
+                decisions,
+                endpoint_decisions: Vec::new(),
+                stats: ExactSearchStats {
+                    max_tracks_per_gap: max_added_tracks.max(1),
+                    evaluated_states,
+                    retained_states,
+                    maximum_additions_found: requested,
+                    structural_upper_bound,
+                },
+            },
+            adjacent_transition_sum: selected.transition_sum,
+            adjacent_worst_transition: selected.worst_transition,
+        });
+    }
+    Ok(options)
+}
 pub fn select_exact_count_bridges(
     original_route: &[usize],
     gaps: &[AutomaticGap],

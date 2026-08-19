@@ -151,6 +151,7 @@
           "enum": ["none", "automatic", "exact_count", "fixed_source_extension", "destination_route", "one_per_transition", "target_length"]
         },
         "additional_track_count": { "type": "integer", "minimum": 0 },
+        "search_effort": { "enum": ["fast", "balanced", "thorough"] },
         "destination_mode": { "enum": ["automatic", "exact"] },
         "allow_opening_track": { "type": "boolean" },
         "allow_closing_track": { "type": "boolean" },

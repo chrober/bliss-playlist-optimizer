@@ -272,31 +272,32 @@ pub fn evaluate_gap(
     })
 }
 
-fn repeat_safe_from(
+pub(crate) fn repeat_safe_at(
     route: &[usize],
     tracks: &[RouteTrack],
     config: &BridgeConfig,
-    first_right: usize,
+    inserted_position: usize,
 ) -> bool {
-    for right in first_right..route.len() {
-        for left in 0..right {
-            let distance = right - left;
-            let left_track = &tracks[route[left]];
-            let right_track = &tracks[route[right]];
-            if config.artist_window > 0
-                && distance <= config.artist_window
-                && !right_track.artist_key.is_empty()
-                && left_track.artist_key == right_track.artist_key
-            {
-                return false;
-            }
-            if config.album_window > 0
-                && distance <= config.album_window
-                && !right_track.album_key.is_empty()
-                && left_track.album_key == right_track.album_key
-            {
-                return false;
-            }
+    let inserted = &tracks[route[inserted_position]];
+    for (position, track_index) in route.iter().enumerate() {
+        if position == inserted_position {
+            continue;
+        }
+        let distance = position.abs_diff(inserted_position);
+        let other = &tracks[*track_index];
+        if config.artist_window > 0
+            && distance <= config.artist_window
+            && !inserted.artist_key.is_empty()
+            && inserted.artist_key == other.artist_key
+        {
+            return false;
+        }
+        if config.album_window > 0
+            && distance <= config.album_window
+            && !inserted.album_key.is_empty()
+            && inserted.album_key == other.album_key
+        {
+            return false;
         }
     }
     true
@@ -337,7 +338,7 @@ pub fn evaluate_candidate(
     let max_percentile = left_percentile.max(right_percentile);
     let detour_percentile = left_percentile + right_percentile;
     let repeat_safe =
-        !route.contains(&candidate) && repeat_safe_from(&tentative, tracks, config, position);
+        !route.contains(&candidate) && repeat_safe_at(&tentative, tracks, config, position);
     let accepted = repeat_safe
         && max_percentile <= config.max_leg_percentile
         && detour_percentile <= config.max_detour_percentile;
@@ -386,8 +387,8 @@ pub fn rank_candidates(
             let right_percentile = reference.percentile(right_distance)?;
             let max_percentile = left_percentile.max(right_percentile);
             let detour_percentile = left_percentile + right_percentile;
-            let repeat_safe = !route.contains(candidate)
-                && repeat_safe_from(&tentative, tracks, config, position);
+            let repeat_safe =
+                !route.contains(candidate) && repeat_safe_at(&tentative, tracks, config, position);
             let accepted = repeat_safe
                 && max_percentile <= config.max_leg_percentile
                 && detour_percentile <= config.max_detour_percentile;
@@ -450,12 +451,12 @@ pub fn evaluate_endpoint_candidate(
         }
     };
     let percentile = reference.percentile(distance)?;
-    let first_right = match slot {
+    let inserted_position = match slot {
         EndpointSlot::Opening => 0,
         EndpointSlot::Closing => tentative.len().saturating_sub(1),
     };
-    let repeat_safe =
-        !route.contains(&candidate) && repeat_safe_from(&tentative, tracks, config, first_right);
+    let repeat_safe = !route.contains(&candidate)
+        && repeat_safe_at(&tentative, tracks, config, inserted_position);
     Ok(EndpointCandidateEvaluation {
         candidate,
         distance,
@@ -558,6 +559,41 @@ mod tests {
         assert!(!existing.repeat_safe);
     }
 
+    #[test]
+    fn destination_candidate_cannot_use_explicit_destination_repeat_exemption() {
+        let tracks = vec![
+            track(0.0, "same-artist", "source-album"),
+            track(2.0, "same-artist", "destination-album"),
+            track(1.0, "other-artist", "bridge-album"),
+            track(1.1, "same-artist", "other-album"),
+            track(1.2, "album-conflict-artist", "destination-album"),
+        ];
+        let route = [0, 1];
+        let matrix = Array2::eye(23);
+        let config = BridgeConfig {
+            seed_limit: 1,
+            learned_percent: 20,
+            artist_window: 5,
+            album_window: 5,
+            max_leg_percentile: 1.0,
+            max_detour_percentile: 2.0,
+        };
+        let reference =
+            build_frozen_reference(&route, &[0, 1, 2, 3, 4], &tracks, &matrix, &config).unwrap();
+
+        let permitted =
+            evaluate_candidate(&route, 1, 2, &tracks, &matrix, &config, &reference).unwrap();
+        assert!(permitted.repeat_safe);
+
+        let conflicts_with_destination =
+            evaluate_candidate(&route, 1, 3, &tracks, &matrix, &config, &reference).unwrap();
+        assert!(!conflicts_with_destination.repeat_safe);
+        assert!(!conflicts_with_destination.accepted);
+        let conflicts_with_destination_album =
+            evaluate_candidate(&route, 1, 4, &tracks, &matrix, &config, &reference).unwrap();
+        assert!(!conflicts_with_destination_album.repeat_safe);
+        assert!(!conflicts_with_destination_album.accepted);
+    }
     #[test]
     fn candidate_ranking_is_identical_with_one_and_four_workers() {
         let tracks = tracks();

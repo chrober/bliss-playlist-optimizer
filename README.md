@@ -228,25 +228,49 @@ Destination-route requests use `extension.mode=destination_route` together with
 `route.ordering_policy=queue_destination`, `route.start_track_id`, and
 `route.destination_track_id`. The final two source tracks must be the locked
 start and destination; any earlier source tracks are read-only acoustic and
-repeat context. Only the final gap is extended. `destination_mode=automatic`
-first accepts a qualified direct leg or searches one through `max_added_tracks`
-intermediates, stopping at the shortest route that meets
-`trigger_percentile`. That percentile is a quality target, not a command to
-discard every result. If the target cannot be met, a second bounded pass compares
-the direct route and every permitted intermediate count, then returns the
-repeat-safe route with the lowest achieved worst-leg percentile. Route objective
-and then the smaller intermediate count break ties deterministically.
+repeat context. Only the final gap is extended. `destination_mode=exact`
+requires exactly `additional_track_count` intermediates and remains all-or-
+nothing. Automatic and Exact counts are bounded from zero through eight.
 
-The exact-selection artifact reports `quality_target_met`,
-`achieved_max_leg_percentile`, and `best_effort` for automatic destination
-routes. This makes a target miss visible without withholding a usable result.
-`destination_mode=exact` still requires exactly `additional_track_count`
-intermediates and remains all-or-nothing. Both counts are bounded from zero
-through eight. Generated tracks remain unique and repeat-safe. The chosen
-destination is immutable user intent and is therefore exempt from artist/album
-rejection caused by recent queue history. Variation and the frozen
-provider-neutral evidence graph rerank candidates without weakening those hard
-membership and repeat constraints.
+Destination routes use a dedicated fixed-matrix layered path search rather than  
+the generic contextual gap-insertion search. It builds complete paths for the  
+permitted intermediate counts and ranks them by worst adjacent Bliss distance,  
+then adjacent-distance sum, semantic support, and deterministic identity. A  
+lower bound based on the remaining endpoint distance keeps the beam focused  
+without repeatedly rescoring the full library. Automatic returns the shortest  
+path whose measured adjacent percentiles meet `trigger_percentile`; if none  
+qualifies, it returns the lowest-bottleneck repeat-safe best effort. Exact uses  
+the same path objective for precisely `additional_track_count` intermediates.  
+
+`extension.search_effort` controls bounded search breadth independently from  
+the quality target and bridge budget: `fast` uses a 128-track shortlist, six  
+expansions per state, and beam width 32; `balanced` uses 256, eight, and 64; and  
+`thorough` uses 512, sixteen, and 192. Older schema-v1 requests without this  
+field retain `balanced` behavior. The distance index transforms every library  
+feature vector once and reuses O(23) pair lookups, so comparing more bridge  
+depths does not repeat O(23^2) matrix work.  
+
+Variation is applied only after complete routes have been ranked. It may choose  
+reproducibly inside a narrow band of the deterministic winner (within 2% of its  
+adjacent bottleneck and 5% of its adjacent sum), but it cannot alter graph  
+reachability or relax repeat constraints. Candidate discovery still uses one  
+bounded shortlist derived from the original destination gap; depth-specific  
+full-library candidate expansion remains a possible later quality enhancement.  
+
+Every feasible destination result publishes `selection_preview.route_quality`.  
+It covers only the requested path from the captured queue tail through generated  
+intermediates to the destination, not unrelated earlier context edges. Each  
+actual neighboring edge uses `fixed-matrix-adjacent-distance` and a matching  
+`source-relative-local-library-percentile`; the artifact also identifies the  
+effective learned-matrix or Static-weight role and SHA-256, adjacent-distance  
+sum, raw bottleneck, and worst adjacent percentile. Adaptive rolling-context  
+values remain secondary candidate diagnostics rather than adjacent quality.  
+Generated tracks remain unique and are checked against every artist and album
+inside the configured repeat windows, including the explicit destination. The
+destination itself remains immutable user intent: a conflict already present
+solely between the captured queue context and destination does not make bridge
+insertion impossible. Variation and the frozen provider-neutral evidence graph
+cannot bypass generated-track membership or repeat constraints.
 
 Exact-count requests may independently opt into
 `extension.allow_opening_track` and `extension.allow_closing_track`. Each

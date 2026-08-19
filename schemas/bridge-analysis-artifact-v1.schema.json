@@ -393,6 +393,7 @@
         "quality_target_met": { "type": "boolean" },
         "achieved_max_leg_percentile": { "type": "number", "minimum": 0 },
         "best_effort": { "type": "boolean" },
+        "route_quality": { "$ref": "#/$defs/destination_route_quality" },
         "search": { "$ref": "#/$defs/exact_search" },
         "infeasibility": {
           "anyOf": [
@@ -499,6 +500,49 @@
         "percentile": { "type": "number", "minimum": 0, "maximum": 1 }
       }
     },
+    "destination_route_quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "primary_metric", "reference_model", "matrix_role", "matrix_sha256",
+        "adjacent_legs", "adjacent_transition_sum",
+        "adjacent_worst_transition", "adjacent_worst_percentile"
+      ],
+      "properties": {
+        "primary_metric": { "const": "fixed-matrix-adjacent-distance" },
+        "reference_model": {
+          "const": "source-relative-local-library-percentile"
+        },
+        "matrix_role": { "enum": ["learned-matrix", "static-weights"] },
+        "matrix_sha256": { "$ref": "#/$defs/sha256" },
+        "adjacent_legs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "position", "left_track_id", "right_track_id", "distance",
+              "source_relative_percentile"
+            ],
+            "properties": {
+              "position": { "type": "integer", "minimum": 1 },
+              "left_track_id": { "type": "string", "minLength": 1 },
+              "right_track_id": { "type": "string", "minLength": 1 },
+              "distance": { "type": "number", "minimum": 0 },
+              "source_relative_percentile": {
+                "type": "number", "minimum": 0, "maximum": 1
+              }
+            }
+          }
+        },
+        "adjacent_transition_sum": { "type": "number", "minimum": 0 },
+        "adjacent_worst_transition": { "type": "number", "minimum": 0 },
+        "adjacent_worst_percentile": {
+          "type": "number", "minimum": 0, "maximum": 1
+        }
+      }
+    },
     "exact_search": {
       "type": "object",
       "additionalProperties": false,
@@ -509,6 +553,7 @@
       ],
       "properties": {
         "beam_width": { "type": "integer", "minimum": 1 },
+        "search_effort": { "enum": ["fast", "balanced", "thorough"] },
         "candidate_limit": { "type": "integer", "minimum": 1 },
         "max_tracks_per_gap": { "type": "integer", "minimum": 1, "maximum": 8 },
         "evaluated_states": { "type": "integer", "minimum": 1 },
