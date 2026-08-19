@@ -32,9 +32,9 @@ const LOCAL_CANDIDATE_INVENTORY_SCHEMA: &str =
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 const EXACT_COUNT_BEAM_WIDTH: usize = 64;
 const SEMANTIC_SHORTLIST_RESERVE: usize = 32;
-const LIBRARY_CACHE_VERSION: u8 = 1;
+const LIBRARY_CACHE_VERSION: u8 = 2;
 const MAX_LIBRARY_CACHE_BYTES: u64 = 512 * 1024 * 1024;
-const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v1\n";
+const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v2\n";
 #[derive(Clone, Copy)]
 struct DestinationSearchEffort {
     name: &'static str,
@@ -682,27 +682,50 @@ struct PreviewDecisionArtifact {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-struct LibraryTrack {
+struct LibraryMetadata {
     row_id: u64,
     file: String,
-    artist_key: String,
     title_key: String,
-    route_track: route::RouteTrack,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+struct Library {
+    metadata: Vec<LibraryMetadata>,
+    tracks: Vec<route::RouteTrack>,
+}
+
+impl Library {
+    fn len(&self) -> usize {
+        self.metadata.len()
+    }
+
+    fn is_consistent(&self) -> bool {
+        self.metadata.len() == self.tracks.len()
+    }
+
+    fn metadata(&self, index: usize) -> &LibraryMetadata {
+        &self.metadata[index]
+    }
+
+    fn track(&self, index: usize) -> &route::RouteTrack {
+        &self.tracks[index]
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 struct LibraryCache {
     format_version: u8,
     database_path: String,
     database_identity: String,
     database_sha256: String,
-    library: Vec<LibraryTrack>,
+    library: Library,
 }
 
 struct RuntimeOptions {
     timings: bool,
     cache_dir: Option<PathBuf>,
     progress_path: Option<PathBuf>,
+    validate_contracts: bool,
 }
 
 impl RuntimeOptions {
@@ -711,6 +734,7 @@ impl RuntimeOptions {
             timings: false,
             cache_dir: None,
             progress_path: None,
+            validate_contracts: true,
         }
     }
 }
@@ -899,7 +923,7 @@ struct ValidatedRequest {
     request: Request,
     learned_matrix: Option<Array2<f32>>,
     semantic_bundle: semantic::EvidenceBundle,
-    library: Option<Vec<LibraryTrack>>,
+    library: Option<Library>,
     local_candidate_rows: Option<HashSet<u64>>,
     database_cache: &'static str,
 }
@@ -989,7 +1013,7 @@ fn effective_adaptive_matrix(
     Ok((matrix, hash, 0))
 }
 fn usage() -> &'static str {
-    "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>\n  bliss-playlist-optimizer route --request <request.json> [--timings] [--cache-dir <directory>] [--progress <progress.json>]\n  bliss-playlist-optimizer bridge --request <request.json> [--timings] [--cache-dir <directory>] [--progress <progress.json>]"
+    "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>\n  bliss-playlist-optimizer route --request <request.json> [--timings] [--cache-dir <directory>] [--progress <progress.json>] [--trusted-request]\n  bliss-playlist-optimizer bridge --request <request.json> [--timings] [--cache-dir <directory>] [--progress <progress.json>] [--trusted-request]"
 }
 
 fn parse_request_command(args: &[String]) -> Option<(&str, &Path, RuntimeOptions)> {
@@ -1015,6 +1039,10 @@ fn parse_request_command(args: &[String]) -> Option<(&str, &Path, RuntimeOptions
             "--progress" if options.progress_path.is_none() && index + 1 < args.len() => {
                 options.progress_path = Some(PathBuf::from(&args[index + 1]));
                 index += 2;
+            }
+            "--trusted-request" if matches!(command, "route" | "bridge") => {
+                options.validate_contracts = false;
+                index += 1;
             }
             _ => return None,
         }
@@ -1116,6 +1144,7 @@ fn load_library_cache(cache_dir: &Path, artifact: &Artifact) -> Option<LibraryCa
     if cache.format_version != LIBRARY_CACHE_VERSION
         || cache.database_path != artifact.path
         || cache.database_identity != identity
+        || !cache.library.is_consistent()
         || verify_artifact_hash(artifact, "database", &cache.database_sha256).is_err()
     {
         return None;
@@ -1181,7 +1210,8 @@ fn read_artifact(
 fn load_local_candidate_inventory(
     artifact: &Artifact,
     database_artifact: &Artifact,
-    library: &[LibraryTrack],
+    library: &Library,
+    validate_contracts: bool,
 ) -> Result<(HashSet<u64>, String), CommandFailure> {
     if artifact.schema_identity.as_deref() != Some("lms-local-candidate-inventory-v1") {
         return Err(CommandFailure::new(
@@ -1197,11 +1227,13 @@ fn load_local_candidate_inventory(
     })?;
     let (bytes, hash) = read_artifact(artifact, "local candidate inventory")?;
     let value = parse_json(&bytes, "local candidate inventory")?;
-    validate_json(
-        &value,
-        LOCAL_CANDIDATE_INVENTORY_SCHEMA,
-        "local candidate inventory",
-    )?;
+    if validate_contracts {
+        validate_json(
+            &value,
+            LOCAL_CANDIDATE_INVENTORY_SCHEMA,
+            "local candidate inventory",
+        )?;
+    }
     let inventory: LocalCandidateInventory = serde_json::from_value(value).map_err(|error| {
         CommandFailure::new(
             "CANDIDATE_INVENTORY_INVALID",
@@ -1224,15 +1256,20 @@ fn load_local_candidate_inventory(
         .allowed_row_ids
         .into_iter()
         .collect::<HashSet<_>>();
-    let library_rows = library
-        .iter()
-        .map(|track| track.row_id)
-        .collect::<HashSet<_>>();
-    if let Some(unknown) = rows.iter().find(|row_id| !library_rows.contains(row_id)) {
-        return Err(CommandFailure::new(
-            "CANDIDATE_INVENTORY_UNKNOWN_ROW",
-            format!("local candidate inventory contains unknown or unusable Bliss row {unknown}"),
-        ));
+    if validate_contracts {
+        let library_rows = library
+            .metadata
+            .iter()
+            .map(|track| track.row_id)
+            .collect::<HashSet<_>>();
+        if let Some(unknown) = rows.iter().find(|row_id| !library_rows.contains(row_id)) {
+            return Err(CommandFailure::new(
+                "CANDIDATE_INVENTORY_UNKNOWN_ROW",
+                format!(
+                    "local candidate inventory contains unknown or unusable Bliss row {unknown}"
+                ),
+            ));
+        }
     }
     Ok((rows, hash))
 }
@@ -1279,7 +1316,10 @@ fn decode_request(path: &Path) -> Result<Request, CommandFailure> {
     })
 }
 
-fn decode_request_once(path: &Path) -> Result<(Request, String), CommandFailure> {
+fn decode_request_once(
+    path: &Path,
+    validate_contracts: bool,
+) -> Result<(Request, String), CommandFailure> {
     let request_bytes = fs::read(path).map_err(|error| {
         CommandFailure::new(
             "REQUEST_UNREADABLE",
@@ -1288,7 +1328,9 @@ fn decode_request_once(path: &Path) -> Result<(Request, String), CommandFailure>
     })?;
     let request_sha256 = format!("{:x}", Sha256::digest(&request_bytes));
     let request_value = parse_json(&request_bytes, "request")?;
-    validate_json(&request_value, REQUEST_SCHEMA, "request")?;
+    if validate_contracts {
+        validate_json(&request_value, REQUEST_SCHEMA, "request")?;
+    }
     let request = serde_json::from_value(request_value).map_err(|error| {
         CommandFailure::new("INVALID_REQUEST", format!("cannot decode request: {error}"))
     })?;
@@ -1308,7 +1350,7 @@ fn prepare_runtime_request(
         None,
     );
     let started = Instant::now();
-    let (request, request_sha256) = decode_request_once(path)?;
+    let (request, request_sha256) = decode_request_once(path, options.validate_contracts)?;
     timings.record("request_decode", started.elapsed());
 
     if let Some(identity) = &request.artifacts.database.schema_identity {
@@ -1405,8 +1447,9 @@ fn prepare_runtime_request(
                 inventory,
                 &request.artifacts.database,
                 library
-                    .as_deref()
+                    .as_ref()
                     .expect("runtime preparation always loads the library"),
+                options.validate_contracts,
             )?;
             (Some(rows), Some(hash))
         } else {
@@ -1457,7 +1500,9 @@ fn prepare_runtime_request(
     let (semantic_bytes, semantic_evidence_sha256) =
         read_artifact(&request.semantic_evidence, "semantic evidence")?;
     let semantic_value = parse_json(&semantic_bytes, "semantic evidence")?;
-    validate_json(&semantic_value, SEMANTIC_SCHEMA, "semantic evidence")?;
+    if options.validate_contracts {
+        validate_json(&semantic_value, SEMANTIC_SCHEMA, "semantic evidence")?;
+    }
     let semantic_bundle: semantic::EvidenceBundle = serde_json::from_value(semantic_value)
         .map_err(|error| {
             CommandFailure::new(
@@ -1482,6 +1527,7 @@ fn prepare_runtime_request(
     let started = Instant::now();
     let library = library.expect("runtime preparation always loads the library");
     let file_to_index = library
+        .metadata
         .iter()
         .enumerate()
         .map(|(index, track)| (track.file.as_str(), index))
@@ -1518,7 +1564,7 @@ fn prepare_runtime_request(
         };
         if local_candidate_rows
             .as_ref()
-            .is_some_and(|rows| !rows.contains(&library[library_index].row_id))
+            .is_some_and(|rows| !rows.contains(&library.metadata(library_index).row_id))
         {
             return Err(CommandFailure::new(
                 "SOURCE_NOT_IN_LOCAL_CANDIDATE_INVENTORY",
@@ -1582,15 +1628,16 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         .quick_check()
         .map_err(|error| CommandFailure::new("DATABASE_INTEGRITY_FAILED", error.to_string()))?;
 
-    let (local_candidate_rows, local_candidate_inventory_sha256) =
-        if let Some(inventory) = &request.artifacts.local_candidate_inventory {
-            let library = load_usable_library(&database)?;
-            let (rows, hash) =
-                load_local_candidate_inventory(inventory, &request.artifacts.database, &library)?;
-            (Some(rows), Some(hash))
-        } else {
-            (None, None)
-        };
+    let (local_candidate_rows, local_candidate_inventory_sha256) = if let Some(inventory) =
+        &request.artifacts.local_candidate_inventory
+    {
+        let library = load_usable_library(&database)?;
+        let (rows, hash) =
+            load_local_candidate_inventory(inventory, &request.artifacts.database, &library, true)?;
+        (Some(rows), Some(hash))
+    } else {
+        (None, None)
+    };
 
     let learned_matrix_sha256 = if let Some(matrix) = &request.artifacts.learned_matrix {
         let (_, hash) = read_artifact(matrix, "learned matrix")?;
@@ -1817,31 +1864,34 @@ fn score_request(path: &Path) -> Result<ScoringArtifact, CommandFailure> {
     })
 }
 
-fn load_usable_library(database: &BlissDatabase) -> Result<Vec<LibraryTrack>, CommandFailure> {
+fn load_usable_library(database: &BlissDatabase) -> Result<Library, CommandFailure> {
     let tracks = database
         .all_usable_tracks()
         .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?;
-    let mut library = Vec::with_capacity(tracks.len());
+    let mut metadata_rows = Vec::with_capacity(tracks.len());
+    let mut route_tracks = Vec::with_capacity(tracks.len());
     for track in tracks {
         let row_id = track.row_id;
         let features = track.features;
         let metadata = track.metadata;
-        let artist = metadata.artist.unwrap_or_default();
-        let album = metadata.album.unwrap_or_default();
-        let title = metadata.title.unwrap_or_default();
-        library.push(LibraryTrack {
+        let artist_key = repeat_key(&metadata.artist.unwrap_or_default());
+        let album_key = repeat_key(&metadata.album.unwrap_or_default());
+        let title_key = repeat_key(&metadata.title.unwrap_or_default());
+        metadata_rows.push(LibraryMetadata {
             row_id,
             file: metadata.file,
-            artist_key: repeat_key(&artist),
-            title_key: repeat_key(&title),
-            route_track: route::RouteTrack {
-                features,
-                artist_key: repeat_key(&artist),
-                album_key: repeat_key(&album),
-            },
+            title_key,
+        });
+        route_tracks.push(route::RouteTrack {
+            features,
+            artist_key,
+            album_key,
         });
     }
-    Ok(library)
+    Ok(Library {
+        metadata: metadata_rows,
+        tracks: route_tracks,
+    })
 }
 
 fn bridge_candidate_id(row_id: u64) -> String {
@@ -1850,13 +1900,14 @@ fn bridge_candidate_id(row_id: u64) -> String {
 
 fn source_semantic_identity(
     source: &SourceTrack,
-    library_track: &LibraryTrack,
+    metadata: &LibraryMetadata,
+    route_track: &route::RouteTrack,
 ) -> semantic::TrackIdentity {
     let artist_name = source
         .artist
         .as_deref()
         .map(semantic::normalize_identity)
-        .unwrap_or_else(|| library_track.artist_key.clone());
+        .unwrap_or_else(|| route_track.artist_key.clone());
     let mut artist_ids = source.artist_mbids.clone();
     artist_ids.push(semantic::canonical_artist_id(&artist_name));
     artist_ids.sort();
@@ -1868,7 +1919,7 @@ fn source_semantic_identity(
             .title
             .as_deref()
             .map(semantic::normalize_identity)
-            .unwrap_or_else(|| library_track.title_key.clone()),
+            .unwrap_or_else(|| metadata.title_key.clone()),
         artist_ids,
         artist_name,
     }
@@ -1876,16 +1927,18 @@ fn source_semantic_identity(
 
 fn candidate_semantic_identity(
     library_index: usize,
-    library_track: &LibraryTrack,
+    library: &Library,
 ) -> semantic::CandidateIdentity {
+    let metadata = library.metadata(library_index);
+    let route_track = library.track(library_index);
     semantic::CandidateIdentity {
         candidate: library_index,
         track: semantic::TrackIdentity {
-            recording_id: bridge_candidate_id(library_track.row_id),
+            recording_id: bridge_candidate_id(metadata.row_id),
             recording_mbid: None,
-            title_name: library_track.title_key.clone(),
-            artist_ids: vec![semantic::canonical_artist_id(&library_track.artist_key)],
-            artist_name: library_track.artist_key.clone(),
+            title_name: metadata.title_key.clone(),
+            artist_ids: vec![semantic::canonical_artist_id(&route_track.artist_key)],
+            artist_name: route_track.artist_key.clone(),
         },
     }
 }
@@ -1893,10 +1946,10 @@ fn candidate_semantic_identity(
 fn bridge_candidate_artifact(
     evaluation: &bridge::BridgeCandidateEvaluation,
     semantics: &semantic::CandidateSemantics,
-    library: &[LibraryTrack],
+    library: &Library,
 ) -> BridgeCandidateArtifact {
     BridgeCandidateArtifact {
-        candidate_id: bridge_candidate_id(library[evaluation.candidate].row_id),
+        candidate_id: bridge_candidate_id(library.metadata(evaluation.candidate).row_id),
         semantic_tier: semantics.tier,
         semantic_evidence: semantics.evidence.clone(),
         left_distance: evaluation.left_distance,
@@ -1910,10 +1963,10 @@ fn bridge_candidate_artifact(
 
 fn endpoint_candidate_artifact(
     selected: &preview::SelectedEndpoint,
-    library: &[LibraryTrack],
+    library: &Library,
 ) -> EndpointCandidateArtifact {
     EndpointCandidateArtifact {
-        candidate_id: bridge_candidate_id(library[selected.evaluation.candidate].row_id),
+        candidate_id: bridge_candidate_id(library.metadata(selected.evaluation.candidate).row_id),
         semantic_tier: selected.semantics.tier,
         semantic_evidence: selected.semantics.evidence.clone(),
         distance: selected.evaluation.distance,
@@ -2456,9 +2509,11 @@ fn optimize_route_request_with_options(
         validation.learned_matrix_sha256.as_ref(),
     )?;
     let library = library.expect("runtime validation always provides a decoded library");
-    let file_to_track = library
+    let file_to_index = library
+        .metadata
         .iter()
-        .map(|track| (track.file.as_str(), track))
+        .enumerate()
+        .map(|(index, track)| (track.file.as_str(), index))
         .collect::<HashMap<_, _>>();
     progress.update(
         "source_track_materialization",
@@ -2475,7 +2530,7 @@ fn optimize_route_request_with_options(
                 format!("source track '{}' has no database_file identity", source.id),
             )
         })?;
-        let library_track = file_to_track.get(database_file).ok_or_else(|| {
+        let library_index = file_to_index.get(database_file).copied().ok_or_else(|| {
             CommandFailure::new(
                 "TRACK_NOT_ANALYZED",
                 format!(
@@ -2484,16 +2539,17 @@ fn optimize_route_request_with_options(
                 ),
             )
         })?;
+        let route_track = library.track(library_index);
         let artist = source
             .artist
             .clone()
-            .unwrap_or_else(|| library_track.artist_key.clone());
+            .unwrap_or_else(|| route_track.artist_key.clone());
         let album = source
             .album
             .clone()
-            .unwrap_or_else(|| library_track.route_track.album_key.clone());
+            .unwrap_or_else(|| route_track.album_key.clone());
         tracks.push(route::RouteTrack {
-            features: library_track.route_track.features,
+            features: route_track.features,
             artist_key: repeat_key(&artist),
             album_key: repeat_key(&album),
         });
@@ -2623,7 +2679,7 @@ fn analyze_bridge_validated(
     learned_matrix: Array2<f32>,
     scoring_matrix_sha256: String,
     learned_percent: u16,
-    library: Vec<LibraryTrack>,
+    library: Library,
     local_candidate_rows: Option<HashSet<u64>>,
     timings: &mut StageTimings,
     progress: &mut ProgressReporter,
@@ -2721,7 +2777,7 @@ fn analyze_bridge_validated(
     );
     let started = Instant::now();
     let mut file_to_index = HashMap::with_capacity(library.len());
-    for (index, track) in library.iter().enumerate() {
+    for (index, track) in library.metadata.iter().enumerate() {
         if file_to_index.insert(track.file.clone(), index).is_some() {
             return Err(CommandFailure::new(
                 "DATABASE_INVALID",
@@ -2731,7 +2787,7 @@ fn analyze_bridge_validated(
     }
 
     let mut source_files = HashSet::new();
-    let mut source_identities = HashSet::new();
+    let mut source_identities = HashMap::<String, HashSet<String>>::new();
     let mut source_library_indices = Vec::with_capacity(request.source_tracks.len());
     let mut source_route_tracks = Vec::with_capacity(request.source_tracks.len());
     let mut source_semantic_identities = Vec::with_capacity(request.source_tracks.len());
@@ -2751,28 +2807,32 @@ fn analyze_bridge_validated(
                 ),
             )
         })?;
-        let library_track = &library[library_index];
+        let metadata = library.metadata(library_index);
+        let route_track = library.track(library_index);
         let artist_key = source
             .artist
             .as_deref()
             .map(repeat_key)
-            .unwrap_or_else(|| library_track.artist_key.clone());
+            .unwrap_or_else(|| route_track.artist_key.clone());
         let album_key = source
             .album
             .as_deref()
             .map(repeat_key)
-            .unwrap_or_else(|| library_track.route_track.album_key.clone());
+            .unwrap_or_else(|| route_track.album_key.clone());
         let title_key = source
             .title
             .as_deref()
             .map(repeat_key)
-            .unwrap_or_else(|| library_track.title_key.clone());
-        source_files.insert(library_track.file.clone());
-        source_identities.insert((artist_key.clone(), title_key));
+            .unwrap_or_else(|| metadata.title_key.clone());
+        source_files.insert(metadata.file.clone());
+        source_identities
+            .entry(artist_key.clone())
+            .or_default()
+            .insert(title_key);
         source_library_indices.push(library_index);
-        source_semantic_identities.push(source_semantic_identity(source, library_track));
+        source_semantic_identities.push(source_semantic_identity(source, metadata, route_track));
         source_route_tracks.push(route::RouteTrack {
-            features: library_track.route_track.features,
+            features: route_track.features,
             artist_key,
             album_key,
         });
@@ -2918,18 +2978,23 @@ fn analyze_bridge_validated(
     );
     let started = Instant::now();
     let eligible_candidates = library
+        .metadata
         .iter()
         .enumerate()
-        .filter(|(_, track)| {
+        .filter(|(index, metadata)| {
+            let route_track = library.track(*index);
             local_candidate_rows
                 .as_ref()
-                .is_none_or(|rows| rows.contains(&track.row_id))
-                && !source_files.contains(&track.file)
-                && !source_identities.contains(&(track.artist_key.clone(), track.title_key.clone()))
+                .is_none_or(|rows| rows.contains(&metadata.row_id))
+                && !source_files.contains(&metadata.file)
+                && !source_identities
+                    .get(&route_track.artist_key)
+                    .is_some_and(|titles| titles.contains(metadata.title_key.as_str()))
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let adjacent_reference_candidates = library
+        .metadata
         .iter()
         .enumerate()
         .filter(|(_, track)| {
@@ -2939,15 +3004,32 @@ fn analyze_bridge_validated(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    let semantic_candidates = eligible_candidates
-        .iter()
-        .map(|index| candidate_semantic_identity(*index, &library[*index]))
-        .collect::<Vec<_>>();
-    let semantic_candidate_lookup = semantic::CandidateLookup::new(&semantic_candidates);
-    let bridge_tracks = library
-        .iter()
-        .map(|track| track.route_track.clone())
-        .collect::<Vec<_>>();
+    let semantic_candidate_lookup = semantic::CandidateLookup::from_library_candidates(
+        &semantic_bundle,
+        eligible_candidates.iter().map(|index| {
+            let metadata = library.metadata(*index);
+            let route_track = library.track(*index);
+            (
+                *index,
+                metadata.row_id,
+                metadata.title_key.as_str(),
+                route_track.artist_key.as_str(),
+            )
+        }),
+    );
+    let materialize_semantic_candidates = request.extension.mode == "fixed_source_extension"
+        || (request.extension.mode == "exact_count"
+            && (request.extension.allow_opening_track.unwrap_or(false)
+                || request.extension.allow_closing_track.unwrap_or(false)));
+    let semantic_candidates = if materialize_semantic_candidates {
+        eligible_candidates
+            .iter()
+            .map(|index| candidate_semantic_identity(*index, &library))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let bridge_tracks = library.tracks.as_slice();
     let bridge_config = bridge::BridgeConfig {
         seed_limit,
         learned_percent,
@@ -2980,7 +3062,7 @@ fn analyze_bridge_validated(
     let mut reference = bridge::build_frozen_reference(
         &selected_library_route,
         &selected_library_route,
-        &bridge_tracks,
+        bridge_tracks,
         &learned_matrix,
         &bridge_config,
     )
@@ -2998,7 +3080,7 @@ fn analyze_bridge_validated(
         reference = bridge::build_frozen_reference(
             &selected_library_route,
             &library_reference_candidates,
-            &bridge_tracks,
+            bridge_tracks,
             &learned_matrix,
             &bridge_config,
         )
@@ -3043,7 +3125,7 @@ fn analyze_bridge_validated(
         let gap = bridge::evaluate_gap(
             &selected_library_route,
             position,
-            &bridge_tracks,
+            bridge_tracks,
             &learned_matrix,
             &bridge_config,
             &reference,
@@ -3090,7 +3172,7 @@ fn analyze_bridge_validated(
                 &remaining,
                 acoustic_limit,
                 bridge::ShortlistScoringContext {
-                    tracks: &bridge_tracks,
+                    tracks: bridge_tracks,
                     learned_matrix: &learned_matrix,
                     config: &bridge_config,
                     reference: &reference,
@@ -3141,7 +3223,7 @@ fn analyze_bridge_validated(
             &selected_library_route,
             position,
             &gap_candidate_indices,
-            &bridge_tracks,
+            bridge_tracks,
             &learned_matrix,
             &bridge_config,
             &reference,
@@ -3271,7 +3353,7 @@ fn analyze_bridge_validated(
                     PreviewSequenceEntryArtifact {
                         position,
                         kind: "bridge",
-                        track_id: bridge_candidate_id(library[*library_index].row_id),
+                        track_id: bridge_candidate_id(library.metadata(*library_index).row_id),
                     }
                 }
             })
@@ -3304,7 +3386,7 @@ fn analyze_bridge_validated(
                     variation_percent: request.selection.variation_percent,
                     generation_seed: request.selection.generation_seed,
                 },
-                &bridge_tracks,
+                bridge_tracks,
                 &learned_matrix,
                 &bridge_config,
                 &reference,
@@ -3425,7 +3507,7 @@ fn analyze_bridge_validated(
                     },
                     &endpoint_slots,
                     preview::ExactScoringContext {
-                        tracks: &bridge_tracks,
+                        tracks: bridge_tracks,
                         learned_matrix: &learned_matrix,
                         config: scoring_config,
                         reference: &reference,
@@ -3434,7 +3516,7 @@ fn analyze_bridge_validated(
                 .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))
             };
             let distance_index = destination_route
-                .then(|| FixedMatrixDistanceIndex::new(&bridge_tracks, &learned_matrix));
+                .then(|| FixedMatrixDistanceIndex::new(bridge_tracks, &learned_matrix));
             let evaluate_destination = |route: &[usize]| {
                 let path_start = route
                     .iter()
@@ -3475,7 +3557,7 @@ fn analyze_bridge_validated(
                     maximum,
                     &destination_config(maximum),
                     preview::ExactScoringContext {
-                        tracks: &bridge_tracks,
+                        tracks: bridge_tracks,
                         learned_matrix: &learned_matrix,
                         config: &relaxed_config,
                         reference: &reference,
@@ -3677,7 +3759,7 @@ fn analyze_bridge_validated(
                 original_ids_by_library
                     .get(&index)
                     .cloned()
-                    .unwrap_or_else(|| bridge_candidate_id(library[index].row_id))
+                    .unwrap_or_else(|| bridge_candidate_id(library.metadata(index).row_id))
             };
             let route_quality = route_quality.map(|quality| DestinationRouteQualityArtifact {
                 primary_metric: "fixed-matrix-adjacent-distance",
@@ -3837,7 +3919,7 @@ fn analyze_bridge_validated(
                     semantic_candidates: &semantic_candidates,
                     source_semantic_identities: &source_semantic_identities,
                     semantic_bundle: &semantic_bundle,
-                    tracks: &bridge_tracks,
+                    tracks: bridge_tracks,
                     learned_matrix: &learned_matrix,
                     route_config: &route_config,
                     selection: request.selection,
@@ -3875,7 +3957,7 @@ fn analyze_bridge_validated(
                 .all(|(candidate, _)| eligible_candidate_set.contains(candidate));
             let repeat_violations = route::repeat_violations(
                 &extension_result.final_route,
-                &bridge_tracks,
+                bridge_tracks,
                 &route_config,
             );
             let artist_repeat_window_satisfied = repeat_violations
@@ -3940,7 +4022,7 @@ fn analyze_bridge_validated(
                     .into_iter()
                     .map(
                         |(candidate, relevance_distance)| FixedSourceExtensionAdditionArtifact {
-                            candidate_id: bridge_candidate_id(library[candidate].row_id),
+                            candidate_id: bridge_candidate_id(library.metadata(candidate).row_id),
                             relevance_distance,
                         },
                     )
@@ -4392,7 +4474,7 @@ fn main() {
         [command] if command == "version" => println!("{PROGRAM} {VERSION}"),
         [command, format] if command == "version" && format == "--json" => {
             println!(
-                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true}}"
+                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true}}"
             );
         }
         _ => {
@@ -4416,9 +4498,30 @@ mod tests {
         assert!(usage().contains("--timings"));
         assert!(usage().contains("--cache-dir"));
         assert!(usage().contains("--progress"));
+        assert!(usage().contains("--trusted-request"));
         assert_eq!(default_parallel_workers(1), 1);
         assert_eq!(default_parallel_workers(2), 1);
         assert_eq!(default_parallel_workers(4), 3);
+    }
+
+    #[test]
+    fn trusted_request_is_explicit_and_limited_to_runtime_commands() {
+        let args = vec![
+            "bridge".to_owned(),
+            "--request".to_owned(),
+            "request.json".to_owned(),
+            "--trusted-request".to_owned(),
+        ];
+        let (_, _, options) = parse_request_command(&args).unwrap();
+        assert!(!options.validate_contracts);
+
+        let validate_args = vec![
+            "validate".to_owned(),
+            "--request".to_owned(),
+            "request.json".to_owned(),
+            "--trusted-request".to_owned(),
+        ];
+        assert!(parse_request_command(&validate_args).is_none());
     }
 
     #[test]
@@ -4432,6 +4535,7 @@ mod tests {
             timings: false,
             cache_dir: None,
             progress_path: Some(progress_path.clone()),
+            validate_contracts: true,
         };
 
         optimize_route_request_with_options(
@@ -4841,7 +4945,13 @@ mod tests {
         let loaded = load_library_cache(&cache_dir, &request.artifacts.database).unwrap();
         assert_eq!(loaded.database_sha256, database_sha256);
         assert_eq!(loaded.library.len(), library.len());
-        assert_eq!(loaded.library[0].file, library[0].file);
+        assert_eq!(loaded.library.metadata(0).file, library.metadata(0).file);
+
+        let mut inconsistent = cache.clone();
+        inconsistent.library.tracks.pop();
+        store_library_cache(&cache_dir, &request.artifacts.database, &inconsistent);
+        assert!(load_library_cache(&cache_dir, &request.artifacts.database).is_none());
+        store_library_cache(&cache_dir, &request.artifacts.database, &cache);
 
         let cache_path = library_cache_path(&cache_dir, &request.artifacts.database.path);
         let mut corrupted = fs::read(&cache_path).unwrap();
@@ -4874,7 +4984,7 @@ mod tests {
         request.artifacts.database.cache_identity = Some("inventory-fixture-v1".to_owned());
         let database = BlissDatabase::open_read_only(&request.artifacts.database.path).unwrap();
         let library = load_usable_library(&database).unwrap();
-        let allowed = vec![library[0].row_id, library[1].row_id];
+        let allowed = vec![library.metadata(0).row_id, library.metadata(1).row_id];
         let inventory_path = temporary_root.join("inventory.json");
         let inventory = serde_json::json!({
             "schema_version": 1,
@@ -4896,14 +5006,14 @@ mod tests {
         };
 
         let (rows, _) =
-            load_local_candidate_inventory(&artifact, &request.artifacts.database, &library)
+            load_local_candidate_inventory(&artifact, &request.artifacts.database, &library, true)
                 .unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows.contains(&library[0].row_id));
+        assert!(rows.contains(&library.metadata(0).row_id));
 
         request.artifacts.database.cache_identity = Some("changed".to_owned());
         let failure =
-            load_local_candidate_inventory(&artifact, &request.artifacts.database, &library)
+            load_local_candidate_inventory(&artifact, &request.artifacts.database, &library, true)
                 .unwrap_err();
         assert_eq!(failure.code, "CANDIDATE_INVENTORY_DATABASE_MISMATCH");
 
@@ -5007,6 +5117,7 @@ mod tests {
             timings: true,
             cache_dir: Some(cache_dir),
             progress_path: None,
+            validate_contracts: true,
         };
 
         let mut cold = analyze_bridge_request_with_options(&request_path, &options).unwrap();

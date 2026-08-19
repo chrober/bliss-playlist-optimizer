@@ -370,6 +370,66 @@ impl CandidateLookup {
         lookup
     }
 
+    pub fn from_library_candidates<'a, I>(bundle: &EvidenceBundle, candidates: I) -> Self
+    where
+        I: IntoIterator<Item = (usize, u64, &'a str, &'a str)>,
+    {
+        let required_recording = bundle
+            .edges
+            .iter()
+            .filter(|edge| edge.candidate.kind == EntityKind::Recording)
+            .flat_map(|edge| recording_keys_for_entity(&edge.candidate))
+            .collect::<HashSet<_>>();
+        let required_recording_rows = required_recording
+            .iter()
+            .filter_map(|key| key.strip_prefix("bliss-row-")?.parse::<u64>().ok())
+            .collect::<HashSet<_>>();
+        let required_artist = bundle
+            .edges
+            .iter()
+            .filter(|edge| edge.candidate.kind == EntityKind::Artist)
+            .flat_map(|edge| artist_keys_for_entity(&edge.candidate))
+            .collect::<HashSet<_>>();
+        let mut lookup = Self {
+            recording: HashMap::new(),
+            artist: HashMap::new(),
+        };
+        for (candidate, row_id, title_name, artist_name) in candidates {
+            if !required_recording.is_empty() {
+                if required_recording_rows.contains(&row_id) {
+                    lookup
+                        .recording
+                        .entry(format!("bliss-row-{row_id}"))
+                        .or_default()
+                        .push(candidate);
+                }
+                let title_artist = recording_title_artist_key(title_name, artist_name);
+                if required_recording.contains(&title_artist) {
+                    lookup
+                        .recording
+                        .entry(title_artist)
+                        .or_default()
+                        .push(candidate);
+                }
+            }
+            if !required_artist.is_empty() {
+                let artist_id = canonical_artist_id(artist_name);
+                if required_artist.contains(&artist_id) {
+                    lookup.artist.entry(artist_id).or_default().push(candidate);
+                }
+                let artist_name_key = artist_name_key(artist_name);
+                if required_artist.contains(&artist_name_key) {
+                    lookup
+                        .artist
+                        .entry(artist_name_key)
+                        .or_default()
+                        .push(candidate);
+                }
+            }
+        }
+        lookup
+    }
+
     fn candidates_for_entity(&self, entity: &Entity) -> Vec<usize> {
         let keys = match entity.kind {
             EntityKind::Recording => recording_keys_for_entity(entity),
@@ -1075,6 +1135,24 @@ mod tests {
             &[left.clone(), right.clone()],
             &CandidateLookup::new(&candidates),
         );
+        let scoped_lookup = CandidateLookup::from_library_candidates(
+            &bundle,
+            candidates.iter().enumerate().map(|(row_id, candidate)| {
+                (
+                    candidate.candidate,
+                    row_id as u64,
+                    candidate.track.title_name.as_str(),
+                    candidate.track.artist_name.as_str(),
+                )
+            }),
+        );
+        let scoped = select_gap_candidate_matches(
+            &bundle,
+            &left,
+            &right,
+            &[left.clone(), right.clone()],
+            &scoped_lookup,
+        );
         let legacy_supported = legacy
             .candidates
             .into_iter()
@@ -1082,6 +1160,44 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(indexed.pool, SemanticPool::EndpointLocal);
         assert_eq!(indexed.candidates, legacy_supported);
+        assert_eq!(scoped, indexed);
+    }
+
+    #[test]
+    fn scoped_lookup_keeps_two_hundred_thousand_candidates_memory_bounded() {
+        const MATCHING_ROW: usize = 123_456;
+        let bundle = EvidenceBundle {
+            schema_version: 1,
+            frozen_at: "2026-07-20T00:00:00Z".to_owned(),
+            providers: Vec::new(),
+            edges: vec![edge(
+                EntityKind::Recording,
+                "left",
+                EntityKind::Recording,
+                "bliss-row-123456",
+                EvidenceScope::EndpointLocal,
+                1,
+            )],
+        };
+
+        let lookup = CandidateLookup::from_library_candidates(
+            &bundle,
+            (0..200_000).map(|candidate| {
+                (
+                    candidate,
+                    candidate as u64,
+                    "unrelated title",
+                    "unrelated artist",
+                )
+            }),
+        );
+
+        assert_eq!(
+            lookup.recording.get("bliss-row-123456"),
+            Some(&vec![MATCHING_ROW])
+        );
+        assert_eq!(lookup.recording.values().map(Vec::len).sum::<usize>(), 1);
+        assert!(lookup.artist.is_empty());
     }
 
     #[test]

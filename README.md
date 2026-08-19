@@ -47,6 +47,16 @@ identity-bound decoded-library cache, and a live status sidecar:
 bliss-playlist-optimizer bridge --request request.json --timings --cache-dir cache --progress progress.json
 ```
 
+A caller that has already produced and validated the request through a trusted,
+version-matched integration can explicitly add `--trusted-request` to `route`
+or `bridge`. This skips repeated runtime JSON-Schema compilation and the
+O(library-size) inventory-to-database cross-check. It does **not** skip typed
+JSON decoding, declared artifact hashes, database/cache identity binding,
+source-track resolution, semantic-evidence validation, membership enforcement,
+or repeat constraints. The flag is intentionally unavailable to `validate` and
+must never be used for arbitrary user-supplied request files. Callers should
+feature-detect it through `version --json` rather than assume it exists.
+
 `--progress` atomically replaces a small JSON file while the command is running.
 It follows the same human-readable status-message idea as `bliss-analyser` and
 `bliss-learner`, but deliberately uses a local sidecar instead of LMS JSON-RPC
@@ -77,7 +87,18 @@ a result if that identity changes while the job is running. A cold job streams
 the database SHA-256, runs `quick_check`, reads every usable track with one bulk
 query, and atomically replaces the versioned cache. A warm job reuses the hash,
 integrity result, and decoded library only when the path and identity match.
-Cache corruption or an identity change is a safe miss.
+Cache corruption, inconsistent metadata/feature vector counts, or an identity
+change is a safe miss.
+
+Cache format v2 stores compact metadata separately from the route features and
+artist/album repeat keys. Destination jobs borrow those decoded route tracks
+instead of cloning the complete library for every optimizer process. Optional
+semantic lookup is evidence-scoped: it scans candidates once but retains index
+entries only for recording/artist keys actually named by the evidence bundle.
+Its retained memory is therefore proportional to evidence matches rather than
+the full library. A 200,000-candidate regression test protects this property.
+The remaining cold and warm setup passes are intentionally linear in library
+size; the benchmark command below should be used on representative hardware.
 
 Run a repeatable cold-then-warm benchmark with the server's Perl runtime:
 
