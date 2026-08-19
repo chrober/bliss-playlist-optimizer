@@ -16,16 +16,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
-        with:
-          targets: aarch64-unknown-linux-gnu
-      - name: Install ARM64 linker
+      - name: Install pinned cross toolchain
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes gcc-aarch64-linux-gnu
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cross.tar.gz"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz
+          echo "642375d1bcf3bd88272c32ba90e999f3d983050adf45e66bd2d3887e8e838bad  $archive" \
+            | sha256sum --check
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Build release binary
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+        run: cross build --release --locked --target aarch64-unknown-linux-gnu
       - name: Verify binary architecture
         run: file target/aarch64-unknown-linux-gnu/release/bliss-playlist-optimizer
       - uses: actions/upload-artifact@v4
