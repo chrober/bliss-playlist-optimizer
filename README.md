@@ -272,9 +272,10 @@ feature vector once and reuses O(23) pair lookups, so comparing more bridge
 depths does not repeat O(23^2) matrix work. Destination setup also reuses that
 index for the two-track reference population. Before the expensive contextual
 rerank, a deterministic prefilter retains tracks near the left endpoint, right
-endpoint, and acoustic midpoint. Its conservative 32x expansion is bounded by
-the profile shortlist, so contextual work no longer scales with every library
-track while endpoint and path coverage remain represented.
+endpoint, and acoustic midpoint. Fast, Balanced, and Thorough cap that coarse
+pool at 65,536, 131,072, and 262,144 candidates respectively. Libraries below
+the selected cap retain the prior full contextual shortlist; larger libraries
+bound the expensive work while preserving endpoint and path coverage.
 
 Variation is applied only after complete routes have been ranked. It may choose  
 reproducibly inside a narrow band of the deterministic winner (within 2% of its  

@@ -32,7 +32,6 @@ const LOCAL_CANDIDATE_INVENTORY_SCHEMA: &str =
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 const EXACT_COUNT_BEAM_WIDTH: usize = 64;
 const SEMANTIC_SHORTLIST_RESERVE: usize = 32;
-const DESTINATION_CONTEXTUAL_PREFILTER_MULTIPLIER: usize = 32;
 const LIBRARY_CACHE_VERSION: u8 = 2;
 const MAX_LIBRARY_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v2\n";
@@ -42,6 +41,7 @@ struct DestinationSearchEffort {
     candidate_limit: usize,
     beam_width: usize,
     shortlist_limit: usize,
+    contextual_prefilter_limit: usize,
 }
 
 fn destination_search_effort(value: Option<&str>) -> DestinationSearchEffort {
@@ -51,18 +51,21 @@ fn destination_search_effort(value: Option<&str>) -> DestinationSearchEffort {
             candidate_limit: 6,
             beam_width: 32,
             shortlist_limit: 128,
+            contextual_prefilter_limit: 65_536,
         },
         "thorough" => DestinationSearchEffort {
             name: "thorough",
             candidate_limit: 16,
             beam_width: 192,
             shortlist_limit: 512,
+            contextual_prefilter_limit: 262_144,
         },
         _ => DestinationSearchEffort {
             name: "balanced",
             candidate_limit: 8,
             beam_width: 64,
             shortlist_limit: 256,
+            contextual_prefilter_limit: 131_072,
         },
     }
 }
@@ -2712,6 +2715,9 @@ fn analyze_bridge_validated(
     let destination_beam_width = destination_effort
         .map(|effort| effort.beam_width)
         .unwrap_or(EXACT_COUNT_BEAM_WIDTH);
+    let destination_contextual_prefilter_limit = destination_effort
+        .map(|effort| effort.contextual_prefilter_limit)
+        .unwrap_or(usize::MAX);
     let (max_added_tracks, trigger_percentile, requested_exact_count) =
         match request.extension.mode.as_str() {
             "automatic" => (
@@ -3179,9 +3185,7 @@ fn analyze_bridge_validated(
                     selected_library_route[position - 1],
                     selected_library_route[position],
                     &remaining,
-                    acoustic_limit
-                        .saturating_mul(DESTINATION_CONTEXTUAL_PREFILTER_MULTIPLIER)
-                        .min(remaining.len()),
+                    destination_contextual_prefilter_limit.min(remaining.len()),
                 );
                 destination_prefilter.as_slice()
             } else {
