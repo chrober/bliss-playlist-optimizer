@@ -251,7 +251,10 @@ Destination-route requests use `extension.mode=destination_route` together with
 start and destination; any earlier source tracks are read-only acoustic and
 repeat context. Only the final gap is extended. `destination_mode=exact`
 requires exactly `additional_track_count` intermediates and remains all-or-
-nothing. Automatic and Exact counts are bounded from zero through eight.
+nothing. Automatic accepts optional `min_added_tracks` and required
+`max_added_tracks` bounds from zero through eight; the minimum must not exceed
+the maximum. A minimum of zero permits the direct destination. Exact counts are
+also bounded from zero through eight.
 
 Destination routes use a dedicated fixed-matrix layered path search rather than  
 the generic contextual gap-insertion search. It builds complete paths for the  
@@ -259,8 +262,9 @@ permitted intermediate counts and ranks them by worst adjacent Bliss distance,
 then adjacent-distance sum, semantic support, and deterministic identity. A  
 lower bound based on the remaining endpoint distance keeps the beam focused  
 without repeatedly rescoring the full library. Automatic returns the shortest  
-path whose measured adjacent percentiles meet `trigger_percentile`; if none  
-qualifies, it returns the lowest-bottleneck repeat-safe best effort. Exact uses  
+permitted path whose measured adjacent percentiles meet `trigger_percentile`;  
+if none qualifies, it returns the lowest-bottleneck repeat-safe best effort  
+within the configured minimum and maximum. Exact uses  
 the same path objective for precisely `additional_track_count` intermediates.  
 
 `extension.search_effort` controls bounded search breadth independently from  

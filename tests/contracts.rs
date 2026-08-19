@@ -252,6 +252,8 @@ fn destination_route_requires_locked_endpoints_and_exact_count_when_requested() 
 
     request["extension"]["search_effort"] = Value::String("fast".to_owned());
     assert!(validator.is_valid(&request));
+    request["extension"]["min_added_tracks"] = Value::from(2);
+    assert!(validator.is_valid(&request));
     let mut invalid_effort = request.clone();
     invalid_effort["extension"]["search_effort"] = Value::String("unbounded".to_owned());
     assert!(!validator.is_valid(&invalid_effort));
@@ -271,6 +273,11 @@ fn destination_route_requires_locked_endpoints_and_exact_count_when_requested() 
     exact_without_count["extension"]["destination_mode"] = Value::String("exact".to_owned());
     assert!(!validator.is_valid(&exact_without_count));
 
+    exact_without_count["extension"]
+        .as_object_mut()
+        .unwrap()
+        .remove("min_added_tracks");
+    assert!(!validator.is_valid(&exact_without_count));
     exact_without_count["extension"]["additional_track_count"] = Value::from(2);
     assert!(validator.is_valid(&exact_without_count));
 

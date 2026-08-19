@@ -158,6 +158,7 @@
         "target_track_count": { "type": "integer", "minimum": 2 },
         "candidate_limit": { "type": "integer", "minimum": 1 },
         "max_tracks_per_gap": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "min_added_tracks": { "type": "integer", "minimum": 0, "maximum": 8 },
         "max_added_tracks": { "type": "integer", "minimum": 0 },
         "trigger_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
         "shortlist_limit": { "type": "integer", "minimum": 1, "maximum": 10000 }
@@ -190,7 +191,10 @@
             "allOf": [
               {
                 "if": { "properties": { "destination_mode": { "const": "exact" } } },
-                "then": { "required": ["additional_track_count"] }
+                "then": {
+                  "required": ["additional_track_count"],
+                  "not": { "required": ["min_added_tracks"] }
+                }
               }
             ]
           }

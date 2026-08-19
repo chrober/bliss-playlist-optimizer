@@ -186,6 +186,7 @@ struct ExtensionSettings {
     allow_closing_track: Option<bool>,
     candidate_limit: Option<usize>,
     max_tracks_per_gap: Option<usize>,
+    min_added_tracks: Option<usize>,
     max_added_tracks: Option<usize>,
     trigger_percentile: Option<f64>,
     shortlist_limit: Option<usize>,
@@ -3599,6 +3600,7 @@ fn analyze_bridge_validated(
             ) = if destination_automatic {
                 let threshold = trigger_percentile
                     .expect("automatic destination route has a validated threshold");
+                let minimum = request.extension.min_added_tracks.unwrap_or(0);
                 let direct_selection = search_destination(0)?
                     .into_iter()
                     .next()
@@ -3610,7 +3612,7 @@ fn analyze_bridge_validated(
                         .as_deref()
                         .expect("the direct destination route is feasible"),
                 )?;
-                if direct_quality.worst_percentile <= threshold {
+                if minimum == 0 && direct_quality.worst_percentile <= threshold {
                     (
                         0,
                         direct_selection.selection,
@@ -3625,17 +3627,17 @@ fn analyze_bridge_validated(
                     progress.update(
                         "bridge_selection",
                         format!(
-                            "Searching adjacent destination paths with up to {maximum} intermediate tracks"
+                            "Searching adjacent destination paths with {minimum} through {maximum} intermediate tracks"
                         ),
                         Some(0),
                         Some(maximum),
                     );
                     let options = search_destination(maximum)?;
                     let mut qualifying = None;
-                    let mut fallback = Some((direct_selection, direct_quality));
+                    let mut fallback = (minimum == 0).then_some((direct_selection, direct_quality));
                     for option in options
                         .into_iter()
-                        .filter(|option| option.added_track_count > 0)
+                        .filter(|option| option.added_track_count >= minimum.max(1))
                     {
                         progress.update(
                             "bridge_selection",
@@ -4239,6 +4241,7 @@ fn analyze_bridge_request_with_options(
             ));
         }
         let maximum = request.extension.max_added_tracks.unwrap_or(0);
+        let minimum = request.extension.min_added_tracks.unwrap_or(0);
         if maximum > preview::MAX_EXACT_TRACKS_PER_GAP {
             return Err(CommandFailure::new(
                 "DESTINATION_ROUTE_MAX_UNSUPPORTED",
@@ -4246,6 +4249,18 @@ fn analyze_bridge_request_with_options(
                     "destination routes support at most {} intermediate tracks",
                     preview::MAX_EXACT_TRACKS_PER_GAP
                 ),
+            ));
+        }
+        if minimum > maximum {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_MIN_INVALID",
+                "minimum intermediate count exceeds the configured destination-route maximum",
+            ));
+        }
+        if destination_mode == "exact" && request.extension.min_added_tracks.is_some() {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_MIN_UNSUPPORTED",
+                "minimum intermediate count applies only to automatic destination routing",
             ));
         }
         if request.extension.destination_mode.as_deref() == Some("exact")
@@ -4793,7 +4808,7 @@ mod tests {
 
         fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
         let result = analyze_bridge_request(&temporary).unwrap();
-        let _ = fs::remove_file(temporary);
+        let _ = fs::remove_file(&temporary);
 
         assert_eq!(result.ordering_policy, "queue_destination");
         let SelectionPreviewArtifact::Exact(preview) = result.selection_preview else {
@@ -4807,6 +4822,16 @@ mod tests {
         assert_eq!(preview.search.search_effort, Some("fast"));
         assert_eq!(preview.search.beam_width, 32);
         assert_eq!(preview.search.candidate_limit, 6);
+        request["job_id"] = Value::String("destination-route-minimum-test".to_owned());
+        request["extension"]["min_added_tracks"] = Value::from(2);
+        fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+        let result = analyze_bridge_request(&temporary).unwrap();
+        let _ = fs::remove_file(temporary);
+        let SelectionPreviewArtifact::Exact(preview) = result.selection_preview else {
+            panic!("destination route must return an exact-selection preview");
+        };
+        assert_eq!(preview.added_track_count, 2);
+        assert_eq!(preview.requested_added_tracks, 2);
     }
 
     #[test]
