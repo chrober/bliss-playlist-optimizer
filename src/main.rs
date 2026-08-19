@@ -32,6 +32,7 @@ const LOCAL_CANDIDATE_INVENTORY_SCHEMA: &str =
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 const EXACT_COUNT_BEAM_WIDTH: usize = 64;
 const SEMANTIC_SHORTLIST_RESERVE: usize = 32;
+const DESTINATION_CONTEXTUAL_PREFILTER_MULTIPLIER: usize = 32;
 const LIBRARY_CACHE_VERSION: u8 = 2;
 const MAX_LIBRARY_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v2\n";
@@ -2977,33 +2978,25 @@ fn analyze_bridge_validated(
         None,
     );
     let started = Instant::now();
-    let eligible_candidates = library
-        .metadata
-        .iter()
-        .enumerate()
-        .filter(|(index, metadata)| {
-            let route_track = library.track(*index);
-            local_candidate_rows
-                .as_ref()
-                .is_none_or(|rows| rows.contains(&metadata.row_id))
-                && !source_files.contains(&metadata.file)
-                && !source_identities
-                    .get(&route_track.artist_key)
-                    .is_some_and(|titles| titles.contains(metadata.title_key.as_str()))
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let adjacent_reference_candidates = library
-        .metadata
-        .iter()
-        .enumerate()
-        .filter(|(_, track)| {
-            local_candidate_rows
-                .as_ref()
-                .is_none_or(|rows| rows.contains(&track.row_id))
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
+    let mut eligible_candidates = Vec::with_capacity(library.len());
+    let mut adjacent_reference_candidates = Vec::with_capacity(library.len());
+    for (index, metadata) in library.metadata.iter().enumerate() {
+        if local_candidate_rows
+            .as_ref()
+            .is_some_and(|rows| !rows.contains(&metadata.row_id))
+        {
+            continue;
+        }
+        adjacent_reference_candidates.push(index);
+        let route_track = library.track(index);
+        if !source_files.contains(&metadata.file)
+            && !source_identities
+                .get(&route_track.artist_key)
+                .is_some_and(|titles| titles.contains(metadata.title_key.as_str()))
+        {
+            eligible_candidates.push(index);
+        }
+    }
     let semantic_candidate_lookup = semantic::CandidateLookup::from_library_candidates(
         &semantic_bundle,
         eligible_candidates.iter().map(|index| {
@@ -3042,6 +3035,8 @@ fn analyze_bridge_validated(
         },
         max_detour_percentile: bridge::DEFAULT_MAX_DETOUR_PERCENTILE,
     };
+    let distance_index = (request.extension.mode == "destination_route")
+        .then(|| FixedMatrixDistanceIndex::new(bridge_tracks, &learned_matrix));
     timings.record("candidate_preparation", started.elapsed());
     progress.update(
         "candidate_preparation",
@@ -3077,13 +3072,25 @@ fn analyze_bridge_validated(
         library_reference_candidates.extend(selected_library_route.iter().copied());
         library_reference_candidates.sort_unstable();
         library_reference_candidates.dedup();
-        reference = bridge::build_frozen_reference(
-            &selected_library_route,
-            &library_reference_candidates,
-            bridge_tracks,
-            &learned_matrix,
-            &bridge_config,
-        )
+        reference = if let Some(distance_index) = distance_index.as_ref() {
+            let left = selected_library_route[selected_library_route.len() - 2];
+            bridge::FrozenReference::from_distances(
+                library_reference_candidates
+                    .par_iter()
+                    .copied()
+                    .filter(|candidate| *candidate != left)
+                    .map(|candidate| distance_index.distance(left, candidate))
+                    .collect(),
+            )
+        } else {
+            bridge::build_frozen_reference(
+                &selected_library_route,
+                &library_reference_candidates,
+                bridge_tracks,
+                &learned_matrix,
+                &bridge_config,
+            )
+        }
         .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
     }
     timings.record("frozen_reference", started.elapsed());
@@ -3166,10 +3173,24 @@ fn analyze_bridge_validated(
             } else {
                 remaining.len()
             };
+            let destination_prefilter;
+            let acoustic_candidates = if let Some(distance_index) = distance_index.as_ref() {
+                destination_prefilter = distance_index.destination_prefilter(
+                    selected_library_route[position - 1],
+                    selected_library_route[position],
+                    &remaining,
+                    acoustic_limit
+                        .saturating_mul(DESTINATION_CONTEXTUAL_PREFILTER_MULTIPLIER)
+                        .min(remaining.len()),
+                );
+                destination_prefilter.as_slice()
+            } else {
+                remaining.as_slice()
+            };
             let acoustic = bridge::shortlist_candidates(
                 &selected_library_route,
                 position,
-                &remaining,
+                acoustic_candidates,
                 acoustic_limit,
                 bridge::ShortlistScoringContext {
                     tracks: bridge_tracks,
@@ -3515,8 +3536,6 @@ fn analyze_bridge_validated(
                 )
                 .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))
             };
-            let distance_index = destination_route
-                .then(|| FixedMatrixDistanceIndex::new(bridge_tracks, &learned_matrix));
             let evaluate_destination = |route: &[usize]| {
                 let path_start = route
                     .iter()
@@ -4356,6 +4375,119 @@ impl<'a> FixedMatrixDistanceIndex<'a> {
         )
     }
 
+    fn destination_prefilter(
+        &self,
+        left: usize,
+        right: usize,
+        candidates: &[usize],
+        limit: usize,
+    ) -> Vec<usize> {
+        if limit == 0 || candidates.is_empty() {
+            return Vec::new();
+        }
+        if candidates.len() <= limit {
+            return candidates.to_vec();
+        }
+
+        #[derive(Clone, Copy)]
+        struct CandidateScore {
+            candidate: usize,
+            left: f64,
+            right: f64,
+        }
+
+        let mut scores = candidates
+            .par_iter()
+            .map(|candidate| CandidateScore {
+                candidate: *candidate,
+                left: self.distance(left, *candidate),
+                right: self.distance(*candidate, right),
+            })
+            .collect::<Vec<_>>();
+        let endpoint_quota = (limit / 4).max(1).min(scores.len());
+        let mut selected = HashSet::with_capacity(limit);
+        let mut result = Vec::with_capacity(limit);
+
+        let mut left_order = (0..scores.len()).collect::<Vec<_>>();
+        left_order.select_nth_unstable_by(endpoint_quota, |left_index, right_index| {
+            scores[*left_index]
+                .left
+                .total_cmp(&scores[*right_index].left)
+                .then_with(|| {
+                    scores[*left_index]
+                        .candidate
+                        .cmp(&scores[*right_index].candidate)
+                })
+        });
+        left_order.truncate(endpoint_quota);
+        left_order.sort_unstable_by(|left_index, right_index| {
+            scores[*left_index]
+                .left
+                .total_cmp(&scores[*right_index].left)
+                .then_with(|| {
+                    scores[*left_index]
+                        .candidate
+                        .cmp(&scores[*right_index].candidate)
+                })
+        });
+        for index in left_order {
+            let candidate = scores[index].candidate;
+            if selected.insert(candidate) {
+                result.push(candidate);
+            }
+        }
+
+        let mut right_order = (0..scores.len()).collect::<Vec<_>>();
+        right_order.select_nth_unstable_by(endpoint_quota, |left_index, right_index| {
+            scores[*left_index]
+                .right
+                .total_cmp(&scores[*right_index].right)
+                .then_with(|| {
+                    scores[*left_index]
+                        .candidate
+                        .cmp(&scores[*right_index].candidate)
+                })
+        });
+        right_order.truncate(endpoint_quota);
+        right_order.sort_unstable_by(|left_index, right_index| {
+            scores[*left_index]
+                .right
+                .total_cmp(&scores[*right_index].right)
+                .then_with(|| {
+                    scores[*left_index]
+                        .candidate
+                        .cmp(&scores[*right_index].candidate)
+                })
+        });
+        for index in right_order {
+            let candidate = scores[index].candidate;
+            if selected.insert(candidate) {
+                result.push(candidate);
+            }
+        }
+
+        scores.par_sort_unstable_by(|left_score, right_score| {
+            left_score
+                .left
+                .max(left_score.right)
+                .total_cmp(&right_score.left.max(right_score.right))
+                .then_with(|| {
+                    (left_score.left + left_score.right)
+                        .total_cmp(&(right_score.left + right_score.right))
+                })
+                .then_with(|| left_score.candidate.cmp(&right_score.candidate))
+        });
+        for score in scores {
+            if result.len() == limit {
+                break;
+            }
+            if selected.insert(score.candidate) {
+                result.push(score.candidate);
+            }
+        }
+        result
+    }
+
     fn source_relative_percentile(
         &self,
         left: usize,
@@ -4585,6 +4717,33 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn destination_prefilter_keeps_endpoint_and_midpoint_coverage() {
+        let tracks = (0..10)
+            .map(|position| route::RouteTrack {
+                features: std::array::from_fn(
+                    |feature| {
+                        if feature == 0 {
+                            position as f32
+                        } else {
+                            0.0
+                        }
+                    },
+                ),
+                artist_key: format!("artist-{position}"),
+                album_key: format!("album-{position}"),
+            })
+            .collect::<Vec<_>>();
+        let matrix = Array2::<f32>::eye(FEATURE_COUNT);
+        let index = FixedMatrixDistanceIndex::new(&tracks, &matrix);
+        let candidates = (1..9).collect::<Vec<_>>();
+
+        let selected = index.destination_prefilter(0, 9, &candidates, 4);
+
+        assert_eq!(selected, vec![1, 8, 4, 5]);
+        assert_eq!(selected, index.destination_prefilter(0, 9, &candidates, 4));
+    }
+
     #[test]
     fn automatic_destination_route_accepts_a_qualified_direct_transition() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"));

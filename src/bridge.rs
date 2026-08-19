@@ -109,6 +109,14 @@ impl std::error::Error for BridgeError {
 }
 
 impl FrozenReference {
+    pub fn from_distances(mut distances: Vec<f64>) -> Result<Self, BridgeError> {
+        if distances.is_empty() {
+            return Err(BridgeError::EmptyReference);
+        }
+        distances.sort_by(f64::total_cmp);
+        Ok(Self { distances })
+    }
+
     pub fn len(&self) -> usize {
         self.distances.len()
     }
@@ -239,11 +247,7 @@ pub fn build_frozen_reference(
     for chunk in chunks {
         distances.extend(chunk?);
     }
-    if distances.is_empty() {
-        return Err(BridgeError::EmptyReference);
-    }
-    distances.sort_by(f64::total_cmp);
-    Ok(FrozenReference { distances })
+    FrozenReference::from_distances(distances)
 }
 
 pub fn evaluate_gap(

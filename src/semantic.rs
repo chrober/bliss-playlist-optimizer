@@ -374,56 +374,110 @@ impl CandidateLookup {
     where
         I: IntoIterator<Item = (usize, u64, &'a str, &'a str)>,
     {
-        let required_recording = bundle
-            .edges
-            .iter()
-            .filter(|edge| edge.candidate.kind == EntityKind::Recording)
-            .flat_map(|edge| recording_keys_for_entity(&edge.candidate))
-            .collect::<HashSet<_>>();
-        let required_recording_rows = required_recording
-            .iter()
-            .filter_map(|key| key.strip_prefix("bliss-row-")?.parse::<u64>().ok())
-            .collect::<HashSet<_>>();
-        let required_artist = bundle
-            .edges
-            .iter()
-            .filter(|edge| edge.candidate.kind == EntityKind::Artist)
-            .flat_map(|edge| artist_keys_for_entity(&edge.candidate))
-            .collect::<HashSet<_>>();
+        let mut required_recording_rows = HashSet::new();
+        let mut required_recording_pairs = HashMap::<String, HashMap<String, String>>::new();
+        let mut required_artist_keys = HashMap::<String, Vec<String>>::new();
+
+        for edge in &bundle.edges {
+            match edge.candidate.kind {
+                EntityKind::Recording => {
+                    for key in recording_keys_for_entity(&edge.candidate) {
+                        if let Some(row_id) = key
+                            .strip_prefix("bliss-row-")
+                            .and_then(|value| value.parse::<u64>().ok())
+                        {
+                            required_recording_rows.insert(row_id);
+                        }
+                        if let Some(pair) = key.strip_prefix("title_artist:") {
+                            if let Some((title, artist)) = pair.split_once('\0') {
+                                required_recording_pairs
+                                    .entry(artist.to_owned())
+                                    .or_default()
+                                    .insert(title.to_owned(), key);
+                            }
+                        }
+                    }
+                }
+                EntityKind::Artist => {
+                    for key in artist_keys_for_entity(&edge.candidate) {
+                        let normalized_name = key
+                            .strip_prefix("artist:")
+                            .or_else(|| key.strip_prefix("artist_name:"));
+                        if let Some(normalized_name) = normalized_name {
+                            required_artist_keys
+                                .entry(normalized_name.to_owned())
+                                .or_default()
+                                .push(key);
+                        }
+                    }
+                }
+            }
+        }
+        for keys in required_artist_keys.values_mut() {
+            keys.sort();
+            keys.dedup();
+        }
+
         let mut lookup = Self {
             recording: HashMap::new(),
             artist: HashMap::new(),
         };
-        for (candidate, row_id, title_name, artist_name) in candidates {
-            if !required_recording.is_empty() {
-                if required_recording_rows.contains(&row_id) {
-                    lookup
-                        .recording
-                        .entry(format!("bliss-row-{row_id}"))
-                        .or_default()
-                        .push(candidate);
-                }
-                let title_artist = recording_title_artist_key(title_name, artist_name);
-                if required_recording.contains(&title_artist) {
-                    lookup
-                        .recording
-                        .entry(title_artist)
-                        .or_default()
-                        .push(candidate);
-                }
+        for (candidate, row_id, title_key, artist_key) in candidates {
+            if required_recording_rows.contains(&row_id) {
+                lookup
+                    .recording
+                    .entry(format!("bliss-row-{row_id}"))
+                    .or_default()
+                    .push(candidate);
             }
-            if !required_artist.is_empty() {
-                let artist_id = canonical_artist_id(artist_name);
-                if required_artist.contains(&artist_id) {
-                    lookup.artist.entry(artist_id).or_default().push(candidate);
-                }
-                let artist_name_key = artist_name_key(artist_name);
-                if required_artist.contains(&artist_name_key) {
-                    lookup
-                        .artist
-                        .entry(artist_name_key)
-                        .or_default()
-                        .push(candidate);
+            let recording_key = if required_recording_pairs.is_empty() {
+                None
+            } else {
+                required_recording_pairs
+                    .get(artist_key)
+                    .and_then(|titles| titles.get(title_key))
+                    .cloned()
+                    .or_else(|| {
+                        (identity_key_needs_normalization(artist_key)
+                            || identity_key_needs_normalization(title_key))
+                        .then(|| {
+                            let normalized_artist = normalize_identity(artist_key);
+                            let normalized_title = normalize_identity(title_key);
+                            required_recording_pairs
+                                .get(&normalized_artist)
+                                .and_then(|titles| titles.get(&normalized_title))
+                                .cloned()
+                        })
+                        .flatten()
+                    })
+            };
+            if let Some(recording_key) = recording_key {
+                lookup
+                    .recording
+                    .entry(recording_key)
+                    .or_default()
+                    .push(candidate);
+            }
+            if !required_artist_keys.is_empty() {
+                if let Some(keys) = required_artist_keys.get(artist_key) {
+                    for key in keys {
+                        lookup
+                            .artist
+                            .entry(key.clone())
+                            .or_default()
+                            .push(candidate);
+                    }
+                } else if identity_key_needs_normalization(artist_key) {
+                    let normalized_artist = normalize_identity(artist_key);
+                    if let Some(keys) = required_artist_keys.get(&normalized_artist) {
+                        for key in keys {
+                            lookup
+                                .artist
+                                .entry(key.clone())
+                                .or_default()
+                                .push(candidate);
+                        }
+                    }
                 }
             }
         }
@@ -523,6 +577,27 @@ fn artist_keys_for_entity(entity: &Entity) -> Vec<String> {
     keys.sort();
     keys.dedup();
     keys
+}
+
+fn identity_key_needs_normalization(value: &str) -> bool {
+    if value.trim() != value {
+        return true;
+    }
+    let mut previous_space = false;
+    for character in value.chars() {
+        if character.is_whitespace() {
+            if character != ' ' || previous_space {
+                return true;
+            }
+            previous_space = true;
+        } else {
+            if character.is_uppercase() {
+                return true;
+            }
+            previous_space = false;
+        }
+    }
+    false
 }
 
 pub fn normalize_identity(value: &str) -> String {

@@ -267,9 +267,14 @@ the same path objective for precisely `additional_track_count` intermediates.
 the quality target and bridge budget: `fast` uses a 128-track shortlist, six  
 expansions per state, and beam width 32; `balanced` uses 256, eight, and 64; and  
 `thorough` uses 512, sixteen, and 192. Older schema-v1 requests without this  
-field retain `balanced` behavior. The distance index transforms every library  
+field retain `balanced` behavior. The distance index transforms every library
 feature vector once and reuses O(23) pair lookups, so comparing more bridge  
-depths does not repeat O(23^2) matrix work.  
+depths does not repeat O(23^2) matrix work. Destination setup also reuses that
+index for the two-track reference population. Before the expensive contextual
+rerank, a deterministic prefilter retains tracks near the left endpoint, right
+endpoint, and acoustic midpoint. Its conservative 32x expansion is bounded by
+the profile shortlist, so contextual work no longer scales with every library
+track while endpoint and path coverage remain represented.
 
 Variation is applied only after complete routes have been ranked. It may choose  
 reproducibly inside a narrow band of the deterministic winner (within 2% of its  
