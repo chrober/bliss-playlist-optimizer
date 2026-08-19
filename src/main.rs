@@ -471,7 +471,7 @@ struct AutomaticSelectionArtifact {
 #[serde(untagged)]
 enum SelectionPreviewArtifact {
     Automatic(AutomaticSelectionArtifact),
-    Exact(ExactSelectionArtifact),
+    Exact(Box<ExactSelectionArtifact>),
     FixedSourceExtension(FixedSourceExtensionSelectionArtifact),
 }
 
@@ -4004,7 +4004,7 @@ fn analyze_bridge_validated(
                 maximum_additions_found: selection.stats.maximum_additions_found,
                 structural_upper_bound: selection.stats.structural_upper_bound,
             });
-            SelectionPreviewArtifact::Exact(ExactSelectionArtifact {
+            SelectionPreviewArtifact::Exact(Box::new(ExactSelectionArtifact {
                 mode: "exact_count",
                 processing_order: if destination_route {
                     "fixed-adjacent-layered-destination-beam-search"
@@ -4044,7 +4044,7 @@ fn analyze_bridge_validated(
                     structural_upper_bound: selection.stats.structural_upper_bound,
                 },
                 infeasibility,
-            })
+            }))
         }
         "fixed_source_extension" => {
             let target_track_count = request.extension.target_track_count.ok_or_else(|| {
