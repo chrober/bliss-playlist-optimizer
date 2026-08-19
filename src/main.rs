@@ -41,7 +41,6 @@ struct DestinationSearchEffort {
     candidate_limit: usize,
     beam_width: usize,
     shortlist_limit: usize,
-    contextual_prefilter_limit: usize,
 }
 
 fn destination_search_effort(value: Option<&str>) -> DestinationSearchEffort {
@@ -51,21 +50,18 @@ fn destination_search_effort(value: Option<&str>) -> DestinationSearchEffort {
             candidate_limit: 6,
             beam_width: 32,
             shortlist_limit: 128,
-            contextual_prefilter_limit: 65_536,
         },
         "thorough" => DestinationSearchEffort {
             name: "thorough",
             candidate_limit: 16,
             beam_width: 192,
             shortlist_limit: 512,
-            contextual_prefilter_limit: 262_144,
         },
         _ => DestinationSearchEffort {
             name: "balanced",
             candidate_limit: 8,
             beam_width: 64,
             shortlist_limit: 256,
-            contextual_prefilter_limit: 131_072,
         },
     }
 }
@@ -247,10 +243,51 @@ struct DestinationRouteQualityArtifact {
     reference_model: &'static str,
     matrix_role: &'static str,
     matrix_sha256: String,
+    model_selection: DestinationModelSelectionArtifact,
     adjacent_legs: Vec<AdjacentTransitionArtifact>,
     adjacent_transition_sum: f64,
     adjacent_worst_transition: f64,
     adjacent_worst_percentile: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DestinationModelSelectionArtifact {
+    policy: &'static str,
+    selected_matrix_role: &'static str,
+    direct_edge_models: Vec<DestinationDirectModelArtifact>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DestinationDirectModelArtifact {
+    matrix_role: &'static str,
+    matrix_sha256: String,
+    distance: f64,
+    source_relative_percentile: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DestinationMatrixRole {
+    Learned,
+    Static,
+}
+
+impl DestinationMatrixRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Learned => "learned-matrix",
+            Self::Static => "static-weights",
+        }
+    }
+}
+
+fn protective_destination_matrix_role(
+    static_percentile: f64,
+    learned_percentile: Option<f64>,
+) -> DestinationMatrixRole {
+    match learned_percentile {
+        Some(learned) if learned >= static_percentile => DestinationMatrixRole::Learned,
+        _ => DestinationMatrixRole::Static,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -262,6 +299,7 @@ struct AdjacentTransitionArtifact {
     source_relative_percentile: f64,
 }
 
+#[derive(Clone, Debug)]
 struct AdjacentRouteQuality {
     legs: Vec<(usize, usize, f64, f64)>,
     transition_sum: f64,
@@ -2716,9 +2754,6 @@ fn analyze_bridge_validated(
     let destination_beam_width = destination_effort
         .map(|effort| effort.beam_width)
         .unwrap_or(EXACT_COUNT_BEAM_WIDTH);
-    let destination_contextual_prefilter_limit = destination_effort
-        .map(|effort| effort.contextual_prefilter_limit)
-        .unwrap_or(usize::MAX);
     let (max_added_tracks, trigger_percentile, requested_exact_count) =
         match request.extension.mode.as_str() {
             "automatic" => (
@@ -3042,8 +3077,91 @@ fn analyze_bridge_validated(
         },
         max_detour_percentile: bridge::DEFAULT_MAX_DETOUR_PERCENTILE,
     };
-    let distance_index = (request.extension.mode == "destination_route")
-        .then(|| FixedMatrixDistanceIndex::new(bridge_tracks, &learned_matrix));
+    let destination_route = request.extension.mode == "destination_route";
+    let static_destination_matrix = if destination_route {
+        Some(static_weight_matrix(&request)?)
+    } else {
+        None
+    };
+    let static_distance_index = static_destination_matrix
+        .as_ref()
+        .map(|(matrix, _)| FixedMatrixDistanceIndex::new(bridge_tracks, matrix));
+    let learned_distance_index = (destination_route
+        && request.scoring.algorithm == "adaptive"
+        && request.artifacts.learned_matrix.is_some())
+    .then(|| FixedMatrixDistanceIndex::new(bridge_tracks, &learned_matrix));
+    let destination_distance_selection = if destination_route {
+        let left = selected_library_route[selected_library_route.len() - 2];
+        let right = selected_library_route[selected_library_route.len() - 1];
+        let direct_route = [left, right];
+        let static_index = static_distance_index
+            .as_ref()
+            .expect("destination routes always construct the Static distance index");
+        let static_quality =
+            static_index.evaluate_route(&direct_route, &adjacent_reference_candidates)?;
+        let learned_quality = learned_distance_index
+            .as_ref()
+            .map(|index| index.evaluate_route(&direct_route, &adjacent_reference_candidates))
+            .transpose()?;
+        let selected_role = protective_destination_matrix_role(
+            static_quality.worst_percentile,
+            learned_quality
+                .as_ref()
+                .map(|quality| quality.worst_percentile),
+        );
+        let static_hash = static_destination_matrix
+            .as_ref()
+            .expect("destination routes always construct the Static matrix")
+            .1
+            .clone();
+        let selected_hash = match selected_role {
+            DestinationMatrixRole::Learned => scoring_matrix_sha256.clone(),
+            DestinationMatrixRole::Static => static_hash.clone(),
+        };
+        let selected_quality = match selected_role {
+            DestinationMatrixRole::Learned => learned_quality
+                .as_ref()
+                .expect("the learned role is selected only when its matrix is available")
+                .clone(),
+            DestinationMatrixRole::Static => static_quality.clone(),
+        };
+        let mut direct_edge_models = vec![DestinationDirectModelArtifact {
+            matrix_role: DestinationMatrixRole::Static.as_str(),
+            matrix_sha256: static_hash,
+            distance: static_quality.worst_transition,
+            source_relative_percentile: static_quality.worst_percentile,
+        }];
+        if let Some(quality) = learned_quality {
+            direct_edge_models.push(DestinationDirectModelArtifact {
+                matrix_role: DestinationMatrixRole::Learned.as_str(),
+                matrix_sha256: scoring_matrix_sha256.clone(),
+                distance: quality.worst_transition,
+                source_relative_percentile: quality.worst_percentile,
+            });
+        }
+        Some((
+            selected_role,
+            selected_hash,
+            selected_quality,
+            DestinationModelSelectionArtifact {
+                policy: "highest-direct-risk-percentile",
+                selected_matrix_role: selected_role.as_str(),
+                direct_edge_models,
+            },
+        ))
+    } else {
+        None
+    };
+    let distance_index = destination_distance_selection
+        .as_ref()
+        .map(|(selected_role, _, _, _)| match selected_role {
+            DestinationMatrixRole::Learned => learned_distance_index
+                .as_ref()
+                .expect("the learned destination role has a distance index"),
+            DestinationMatrixRole::Static => static_distance_index
+                .as_ref()
+                .expect("the Static destination role has a distance index"),
+        });
     timings.record("candidate_preparation", started.elapsed());
     progress.update(
         "candidate_preparation",
@@ -3145,6 +3263,16 @@ fn analyze_bridge_validated(
             &reference,
         )
         .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
+        let (direct_distance, direct_percentile) = destination_distance_selection
+            .as_ref()
+            .map(|(_, _, quality, _)| {
+                let leg = quality
+                    .legs
+                    .first()
+                    .expect("the destination direct route always contains one edge");
+                (leg.2, leg.3)
+            })
+            .unwrap_or((gap.direct_distance, gap.direct_percentile));
         let left_source_index = selected_local_route[position - 1];
         let right_source_index = selected_local_route[position];
         let semantic_started = Instant::now();
@@ -3180,31 +3308,30 @@ fn analyze_bridge_validated(
             } else {
                 remaining.len()
             };
-            let destination_prefilter;
-            let acoustic_candidates = if let Some(distance_index) = distance_index.as_ref() {
-                destination_prefilter = distance_index.destination_prefilter(
+            let acoustic = if let Some(distance_index) = distance_index.as_ref() {
+                distance_index.destination_prefilter(
                     selected_library_route[position - 1],
                     selected_library_route[position],
                     &remaining,
-                    destination_contextual_prefilter_limit.min(remaining.len()),
-                );
-                destination_prefilter.as_slice()
+                    acoustic_limit,
+                )
             } else {
-                remaining.as_slice()
+                bridge::shortlist_candidates(
+                    &selected_library_route,
+                    position,
+                    &remaining,
+                    acoustic_limit,
+                    bridge::ShortlistScoringContext {
+                        tracks: bridge_tracks,
+                        learned_matrix: &learned_matrix,
+                        config: &bridge_config,
+                        reference: &reference,
+                    },
+                )
+                .map_err(|error| {
+                    CommandFailure::new("BRIDGE_SHORTLIST_FAILED", error.to_string())
+                })?
             };
-            let acoustic = bridge::shortlist_candidates(
-                &selected_library_route,
-                position,
-                acoustic_candidates,
-                acoustic_limit,
-                bridge::ShortlistScoringContext {
-                    tracks: bridge_tracks,
-                    learned_matrix: &learned_matrix,
-                    config: &bridge_config,
-                    reference: &reference,
-                },
-            )
-            .map_err(|error| CommandFailure::new("BRIDGE_SHORTLIST_FAILED", error.to_string()))?;
             selected.extend(acoustic);
             gap_semantics
                 .candidates
@@ -3230,8 +3357,8 @@ fn analyze_bridge_validated(
             original_position: position,
             left: selected_library_route[position - 1],
             right: selected_library_route[position],
-            direct_distance: gap.direct_distance,
-            direct_percentile: gap.direct_percentile,
+            direct_distance,
+            direct_percentile,
             semantics: gap_semantics.clone(),
         });
         let semantics_by_candidate = gap_semantics
@@ -3320,9 +3447,9 @@ fn analyze_bridge_validated(
             position,
             left_track_id: selected_track_ids[position - 1].clone(),
             right_track_id: selected_track_ids[position].clone(),
-            direct_distance: gap.direct_distance,
-            direct_percentile: gap.direct_percentile,
-            triggering: trigger_percentile.map(|threshold| gap.direct_percentile > threshold),
+            direct_distance,
+            direct_percentile,
+            triggering: trigger_percentile.map(|threshold| direct_percentile > threshold),
             semantic_pool: gap_semantics.pool,
             semantic_candidate_count,
             semantic_excluded_count: eligible_candidates.len() - semantic_candidate_count,
@@ -3605,13 +3732,11 @@ fn analyze_bridge_validated(
                     .into_iter()
                     .next()
                     .expect("a direct destination option is always available");
-                let direct_quality = evaluate_destination(
-                    direct_selection
-                        .selection
-                        .final_route
-                        .as_deref()
-                        .expect("the direct destination route is feasible"),
-                )?;
+                let direct_quality = destination_distance_selection
+                    .as_ref()
+                    .expect("destination routes have direct model evidence")
+                    .2
+                    .clone();
                 if minimum == 0 && direct_quality.worst_percentile <= threshold {
                     (
                         0,
@@ -3786,32 +3911,35 @@ fn analyze_bridge_validated(
                     .cloned()
                     .unwrap_or_else(|| bridge_candidate_id(library.metadata(index).row_id))
             };
-            let route_quality = route_quality.map(|quality| DestinationRouteQualityArtifact {
-                primary_metric: "fixed-matrix-adjacent-distance",
-                reference_model: "source-relative-local-library-percentile",
-                matrix_role: if request.scoring.algorithm == "static" || learned_percent == 0 {
-                    "static-weights"
-                } else {
-                    "learned-matrix"
-                },
-                matrix_sha256: scoring_matrix_sha256.clone(),
-                adjacent_legs: quality
-                    .legs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(position, (left, right, distance, percentile))| {
-                        AdjacentTransitionArtifact {
-                            position: position + 1,
-                            left_track_id: track_id(left),
-                            right_track_id: track_id(right),
-                            distance,
-                            source_relative_percentile: percentile,
-                        }
-                    })
-                    .collect(),
-                adjacent_transition_sum: quality.transition_sum,
-                adjacent_worst_transition: quality.worst_transition,
-                adjacent_worst_percentile: quality.worst_percentile,
+            let route_quality = route_quality.map(|quality| {
+                let (selected_role, selected_hash, _, model_selection) =
+                    destination_distance_selection
+                        .as_ref()
+                        .expect("destination quality has model-selection evidence");
+                DestinationRouteQualityArtifact {
+                    primary_metric: "fixed-matrix-adjacent-distance",
+                    reference_model: "source-relative-local-library-percentile",
+                    matrix_role: selected_role.as_str(),
+                    matrix_sha256: selected_hash.clone(),
+                    model_selection: model_selection.clone(),
+                    adjacent_legs: quality
+                        .legs
+                        .into_iter()
+                        .enumerate()
+                        .map(|(position, (left, right, distance, percentile))| {
+                            AdjacentTransitionArtifact {
+                                position: position + 1,
+                                left_track_id: track_id(left),
+                                right_track_id: track_id(right),
+                                distance,
+                                source_relative_percentile: percentile,
+                            }
+                        })
+                        .collect(),
+                    adjacent_transition_sum: quality.transition_sum,
+                    adjacent_worst_transition: quality.worst_transition,
+                    adjacent_worst_percentile: quality.worst_percentile,
+                }
             });
             let decisions = selection
                 .decisions
@@ -4640,6 +4768,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn protective_destination_model_uses_the_higher_direct_risk() {
+        assert_eq!(
+            protective_destination_matrix_role(0.77, Some(0.48)),
+            DestinationMatrixRole::Static
+        );
+        assert_eq!(
+            protective_destination_matrix_role(0.48, Some(0.77)),
+            DestinationMatrixRole::Learned
+        );
+        assert_eq!(
+            protective_destination_matrix_role(0.77, None),
+            DestinationMatrixRole::Static
+        );
+        assert_eq!(
+            protective_destination_matrix_role(0.50, Some(0.50)),
+            DestinationMatrixRole::Learned
+        );
+    }
+
+    #[test]
     fn usage_mentions_the_supported_commands() {
         assert!(usage().contains("version"));
         assert!(usage().contains("validate"));
@@ -4909,6 +5057,27 @@ mod tests {
             quality.reference_model,
             "source-relative-local-library-percentile"
         );
+        assert_eq!(
+            quality.model_selection.policy,
+            "highest-direct-risk-percentile"
+        );
+        assert_eq!(
+            quality.model_selection.selected_matrix_role,
+            quality.matrix_role
+        );
+        assert_eq!(quality.model_selection.direct_edge_models.len(), 2);
+        let selected_direct = quality
+            .model_selection
+            .direct_edge_models
+            .iter()
+            .find(|model| model.matrix_role == quality.matrix_role)
+            .unwrap();
+        assert!(quality
+            .model_selection
+            .direct_edge_models
+            .iter()
+            .all(|model| selected_direct.source_relative_percentile
+                >= model.source_relative_percentile));
         assert_eq!(
             quality.adjacent_legs.len(),
             preview.final_sequence.as_ref().unwrap().len() - 1

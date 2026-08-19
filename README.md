@@ -257,7 +257,16 @@ the maximum. A minimum of zero permits the direct destination. Exact counts are
 also bounded from zero through eight.
 
 Destination routes use a dedicated fixed-matrix layered path search rather than  
-the generic contextual gap-insertion search. It builds complete paths for the  
+the generic contextual gap-insertion search. When Adaptive scoring and a learned  
+matrix are available, the engine evaluates the direct endpoint jump under both  
+the learned matrix and the current Static BlissMixer weights. The view assigning  
+the higher source-relative risk percentile governs candidate discovery, complete  
+path scoring, and the quality decision. This conservative selection prevents a  
+single-seed learned model from silently accepting a transition that the broader  
+Static acoustic view considers difficult; Static-only requests and installations  
+without a learned matrix continue to use Static weights alone.  
+
+The search builds complete paths for the  
 permitted intermediate counts and ranks them by worst adjacent Bliss distance,  
 then adjacent-distance sum, semantic support, and deterministic identity. A  
 lower bound based on the remaining endpoint distance keeps the beam focused  
@@ -272,14 +281,14 @@ the quality target and bridge budget: `fast` uses a 128-track shortlist, six
 expansions per state, and beam width 32; `balanced` uses 256, eight, and 64; and  
 `thorough` uses 512, sixteen, and 192. Older schema-v1 requests without this  
 field retain `balanced` behavior. The distance index transforms every library
-feature vector once and reuses O(23) pair lookups, so comparing more bridge  
+feature vector once per evaluated acoustic view and reuses O(23) pair lookups,  
+so comparing more bridge  
 depths does not repeat O(23^2) matrix work. Destination setup also reuses that
-index for the two-track reference population. Before the expensive contextual
-rerank, a deterministic prefilter retains tracks near the left endpoint, right
-endpoint, and acoustic midpoint. Fast, Balanced, and Thorough cap that coarse
-pool at 65,536, 131,072, and 262,144 candidates respectively. Libraries below
-the selected cap retain the prior full contextual shortlist; larger libraries
-bound the expensive work while preserving endpoint and path coverage.
+index for the source-relative reference population. Candidate discovery uses
+the governing view directly to retain tracks near the left endpoint, right
+endpoint, and acoustic midpoint. Fast, Balanced, and Thorough keep 128, 256,
+and 512 candidates respectively, bounding both memory and route-search work in
+large libraries without a conflicting contextual prefilter.
 
 Variation is applied only after complete routes have been ranked. It may choose  
 reproducibly inside a narrow band of the deterministic winner (within 2% of its  
@@ -293,9 +302,12 @@ It covers only the requested path from the captured queue tail through generated
 intermediates to the destination, not unrelated earlier context edges. Each  
 actual neighboring edge uses `fixed-matrix-adjacent-distance` and a matching  
 `source-relative-local-library-percentile`; the artifact also identifies the  
-effective learned-matrix or Static-weight role and SHA-256, adjacent-distance  
+governing learned-matrix or Static-weight role and SHA-256, adjacent-distance  
 sum, raw bottleneck, and worst adjacent percentile. Adaptive rolling-context  
-values remain secondary candidate diagnostics rather than adjacent quality.  
+values remain secondary candidate diagnostics rather than adjacent quality. If  
+both acoustic views were available, `model_selection` records each direct-edge  
+distance and percentile, the selected role, and the conservative selection  
+policy so callers can explain the decision.  
 Generated tracks remain unique and are checked against every artist and album
 inside the configured repeat windows, including the explicit destination. The
 destination itself remains immutable user intent: a conflict already present

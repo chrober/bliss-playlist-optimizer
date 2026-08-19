@@ -515,6 +515,42 @@
         },
         "matrix_role": { "enum": ["learned-matrix", "static-weights"] },
         "matrix_sha256": { "$ref": "#/$defs/sha256" },
+        "model_selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "policy", "selected_matrix_role", "direct_edge_models"
+          ],
+          "properties": {
+            "policy": { "const": "highest-direct-risk-percentile" },
+            "selected_matrix_role": {
+              "enum": ["learned-matrix", "static-weights"]
+            },
+            "direct_edge_models": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 2,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "matrix_role", "matrix_sha256", "distance",
+                  "source_relative_percentile"
+                ],
+                "properties": {
+                  "matrix_role": {
+                    "enum": ["learned-matrix", "static-weights"]
+                  },
+                  "matrix_sha256": { "$ref": "#/$defs/sha256" },
+                  "distance": { "type": "number", "minimum": 0 },
+                  "source_relative_percentile": {
+                    "type": "number", "minimum": 0, "maximum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
         "adjacent_legs": {
           "type": "array",
           "minItems": 1,
