@@ -132,6 +132,12 @@ pub struct ExactScoringContext<'a> {
     pub reference: &'a FrozenReference,
 }
 
+#[derive(Clone, Copy)]
+pub struct DestinationRepeatContext<'a> {
+    pub history_route: &'a [usize],
+    pub track_window: usize,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionReason {
@@ -865,8 +871,7 @@ pub fn select_destination_bridge_routes<F>(
     gap: &AutomaticGap,
     max_added_tracks: usize,
     selection_config: &ExactSelectionConfig,
-    history_route: &[usize],
-    track_window: usize,
+    repeat: DestinationRepeatContext<'_>,
     scoring: ExactScoringContext<'_>,
     adjacent_distance: F,
 ) -> Result<Vec<DestinationRouteOption>, PreviewError>
@@ -896,7 +901,7 @@ where
     let config = scoring.config;
     let destination = gap.right;
     let prefix = &original_route[..original_route.len() - 1];
-    let mut repeat_prefix = history_route.to_vec();
+    let mut repeat_prefix = repeat.history_route.to_vec();
     repeat_prefix.extend(prefix.iter().copied());
     let first_generated = repeat_prefix.len();
     let mut candidates = gap
@@ -988,7 +993,7 @@ where
                                 1,
                                 tracks,
                                 config,
-                                track_window,
+                                repeat.track_window,
                             ) {
                                 return None;
                             }
@@ -1046,7 +1051,7 @@ where
                     requested,
                     tracks,
                     config,
-                    track_window,
+                    repeat.track_window,
                 ) {
                     return None;
                 }

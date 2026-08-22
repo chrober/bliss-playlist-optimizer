@@ -3893,8 +3893,10 @@ fn analyze_bridge_validated(
                     &preview_gaps[0],
                     maximum,
                     &destination_config(maximum),
-                    &history_library_indices,
-                    request.repeat_windows.track,
+                    preview::DestinationRepeatContext {
+                        history_route: &history_library_indices,
+                        track_window: request.repeat_windows.track,
+                    },
                     preview::ExactScoringContext {
                         tracks: bridge_tracks,
                         learned_matrix: &learned_matrix,
