@@ -844,9 +844,17 @@ fn destination_route_repeat_safe(
     generated_count: usize,
     tracks: &[RouteTrack],
     config: &BridgeConfig,
+    track_window: usize,
 ) -> bool {
-    (first_generated..first_generated.saturating_add(generated_count))
-        .all(|position| crate::bridge::repeat_safe_at(route, tracks, config, position))
+    (first_generated..first_generated.saturating_add(generated_count)).all(|position| {
+        crate::bridge::repeat_safe_at(route, tracks, config, position)
+            && (track_window == 0
+                || route.iter().enumerate().all(|(other, track)| {
+                    other == position
+                        || other.abs_diff(position) > track_window
+                        || *track != route[position]
+                }))
+    })
 }
 
 /// Searches the final source transition as a bounded, fixed-matrix path.
@@ -857,6 +865,8 @@ pub fn select_destination_bridge_routes<F>(
     gap: &AutomaticGap,
     max_added_tracks: usize,
     selection_config: &ExactSelectionConfig,
+    history_route: &[usize],
+    track_window: usize,
     scoring: ExactScoringContext<'_>,
     adjacent_distance: F,
 ) -> Result<Vec<DestinationRouteOption>, PreviewError>
@@ -886,7 +896,9 @@ where
     let config = scoring.config;
     let destination = gap.right;
     let prefix = &original_route[..original_route.len() - 1];
-    let first_generated = prefix.len();
+    let mut repeat_prefix = history_route.to_vec();
+    repeat_prefix.extend(prefix.iter().copied());
+    let first_generated = repeat_prefix.len();
     let mut candidates = gap
         .semantics
         .candidates
@@ -967,14 +979,16 @@ where
                             if conflicts_with_destination {
                                 return None;
                             }
-                            let mut partial = prefix.to_vec();
+                            let mut partial = repeat_prefix.clone();
                             partial.extend(state.bridges.iter().copied());
                             partial.push(candidate);
-                            if !crate::bridge::repeat_safe_at(
+                            if !destination_route_repeat_safe(
                                 &partial,
+                                partial.len() - 1,
+                                1,
                                 tracks,
                                 config,
-                                partial.len() - 1,
+                                track_window,
                             ) {
                                 return None;
                             }
@@ -1023,7 +1037,7 @@ where
         let mut complete = frontier
             .into_iter()
             .filter_map(|mut state| {
-                let mut route = prefix.to_vec();
+                let mut route = repeat_prefix.clone();
                 route.extend(state.bridges.iter().copied());
                 route.push(destination);
                 if !destination_route_repeat_safe(
@@ -1032,6 +1046,7 @@ where
                     requested,
                     tracks,
                     config,
+                    track_window,
                 ) {
                     return None;
                 }
@@ -1728,6 +1743,36 @@ mod tests {
                 candidates: vec![semantics(candidate)],
             },
         }
+    }
+
+    #[test]
+    fn destination_repeat_checks_ignore_existing_history_duplicates() {
+        let tracks = vec![track(0.0, "a"), track(1.0, "b"), track(2.0, "c")];
+        let config = BridgeConfig {
+            seed_limit: 2,
+            learned_percent: 20,
+            artist_window: 0,
+            album_window: 0,
+            max_leg_percentile: 0.70,
+            max_detour_percentile: 1.30,
+        };
+
+        assert!(destination_route_repeat_safe(
+            &[0, 1, 0, 2],
+            3,
+            1,
+            &tracks,
+            &config,
+            4
+        ));
+        assert!(!destination_route_repeat_safe(
+            &[0, 1, 0, 0],
+            3,
+            1,
+            &tracks,
+            &config,
+            4
+        ));
     }
 
     #[test]

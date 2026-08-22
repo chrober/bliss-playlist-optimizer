@@ -358,7 +358,8 @@
         "processing_order": {
           "enum": [
             "left-to-right-original-gaps-beam-search",
-            "bounded-endpoints-and-original-gaps-beam-search"
+            "bounded-endpoints-and-original-gaps-beam-search",
+            "fixed-adjacent-layered-destination-beam-search"
           ]
         },
         "requested_added_tracks": { "type": "integer", "minimum": 0 },
@@ -393,6 +394,10 @@
         "quality_target_met": { "type": "boolean" },
         "achieved_max_leg_percentile": { "type": "number", "minimum": 0 },
         "best_effort": { "type": "boolean" },
+        "history_track_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
         "route_quality": { "$ref": "#/$defs/destination_route_quality" },
         "search": { "$ref": "#/$defs/exact_search" },
         "infeasibility": {
@@ -519,7 +524,9 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "policy", "selected_matrix_role", "direct_edge_models"
+            "policy", "selected_matrix_role", "direct_edge_models",
+            "direct_transition_caution", "model_disagreement_percentile",
+            "disagreement_triggered_search"
           ],
           "properties": {
             "policy": { "const": "highest-direct-risk-percentile" },
@@ -548,9 +555,57 @@
                   }
                 }
               }
+            },
+            "direct_transition_caution": { "enum": ["normal", "cautious"] },
+            "model_disagreement_percentile": {
+              "type": "number", "minimum": 0, "maximum": 1
+            },
+            "disagreement_triggered_search": { "type": "boolean" }
+          }
+        },
+        "adjacent_legs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "position", "left_track_id", "right_track_id", "distance",
+              "source_relative_percentile"
+            ],
+            "properties": {
+              "position": { "type": "integer", "minimum": 1 },
+              "left_track_id": { "type": "string", "minLength": 1 },
+              "right_track_id": { "type": "string", "minLength": 1 },
+              "distance": { "type": "number", "minimum": 0 },
+              "source_relative_percentile": {
+                "type": "number", "minimum": 0, "maximum": 1
+              }
             }
           }
         },
+        "adjacent_transition_sum": { "type": "number", "minimum": 0 },
+        "adjacent_worst_transition": { "type": "number", "minimum": 0 },
+        "adjacent_worst_percentile": {
+          "type": "number", "minimum": 0, "maximum": 1
+        },
+        "secondary_models": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/destination_secondary_model" }
+        }
+      }
+    },
+    "destination_secondary_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "matrix_role", "matrix_sha256", "adjacent_legs",
+        "adjacent_transition_sum", "adjacent_worst_transition",
+        "adjacent_worst_percentile"
+      ],
+      "properties": {
+        "matrix_role": { "enum": ["learned-matrix", "static-weights"] },
+        "matrix_sha256": { "$ref": "#/$defs/sha256" },
         "adjacent_legs": {
           "type": "array",
           "minItems": 1,

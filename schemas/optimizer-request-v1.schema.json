@@ -34,6 +34,11 @@
       "minItems": 2,
       "items": { "$ref": "#/$defs/trackIdentity" }
     },
+    "history_tracks": {
+      "type": "array",
+      "description": "Ordered immutable listening history, oldest to newest. Repeated identities are allowed and constrain only newly generated destination-route members.",
+      "items": { "$ref": "#/$defs/trackIdentity" }
+    },
     "scoring": {
       "type": "object",
       "additionalProperties": false,
@@ -161,6 +166,7 @@
         "min_added_tracks": { "type": "integer", "minimum": 0, "maximum": 8 },
         "max_added_tracks": { "type": "integer", "minimum": 0 },
         "trigger_percentile": { "type": "number", "minimum": 0, "maximum": 1 },
+        "direct_transition_caution": { "enum": ["normal", "cautious"] },
         "shortlist_limit": { "type": "integer", "minimum": 1, "maximum": 10000 }
       },
       "allOf": [
@@ -193,7 +199,12 @@
                 "if": { "properties": { "destination_mode": { "const": "exact" } } },
                 "then": {
                   "required": ["additional_track_count"],
-                  "not": { "required": ["min_added_tracks"] }
+                  "not": {
+                    "anyOf": [
+                      { "required": ["min_added_tracks"] },
+                      { "required": ["direct_transition_caution"] }
+                    ]
+                  }
                 }
               }
             ]
@@ -288,6 +299,7 @@
       },
       "else": {
         "properties": {
+          "history_tracks": { "maxItems": 0 },
           "route": {
             "not": {
               "anyOf": [

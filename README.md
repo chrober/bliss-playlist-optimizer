@@ -3,7 +3,7 @@
 **bliss-playlist-optimizer** is the network-free Rust engine behind the Lyrion
 plugin [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss).
 It turns a frozen playlist request, Bliss feature database, repeat rules, the
-current learned similarity matrix, and optional semantic evidence into an
+optional learned similarity matrix, and optional semantic evidence into an
 auditable proposed route. It can reorder fixed membership, analyze and select
 bridge tracks, preserve source anchors, extend a fixed source set to an exact
 target, or build a destination-locked route from a live queue tail.
@@ -112,7 +112,8 @@ script exits unless `--cache-dir` is supplied.
 
 `validate` checks both JSON schemas, declared artifact hashes, SQLite integrity
 and `TracksV2` compatibility, the learned matrix when supplied, semantic
-evidence, and exact usable Bliss identities for every unique source track.
+evidence, and exact usable Bliss identities for every source or immutable
+history track.
 Relative artifact paths are resolved against the process working directory;
 production callers should pass absolute paths.
 
@@ -247,24 +248,37 @@ the semantic pool frozen for the original anchor endpoints.
 
 Destination-route requests use `extension.mode=destination_route` together with
 `route.ordering_policy=queue_destination`, `route.start_track_id`, and
-`route.destination_track_id`. The final two source tracks must be the locked
-start and destination; any earlier source tracks are read-only acoustic and
-repeat context. Only the final gap is extended. `destination_mode=exact`
-requires exactly `additional_track_count` intermediates and remains all-or-
-nothing. Automatic accepts optional `min_added_tracks` and required
-`max_added_tracks` bounds from zero through eight; the minimum must not exceed
-the maximum. A minimum of zero permits the direct destination. Exact counts are
-also bounded from zero through eight.
+`route.destination_track_id`. `source_tracks` contains the locked start and
+destination and therefore remains unique route membership. Optional
+`history_tracks` is ordered, immutable listening history preceding the start;
+it may contain repeats or overlap route identities because it is never emitted
+as part of the result. It supplies acoustic and repeat context, while repeat
+windows constrain only newly generated intermediates. Only the final gap is
+extended. `destination_mode=exact` requires exactly `additional_track_count`
+intermediates and remains all-or-nothing. Automatic accepts optional
+`min_added_tracks` and required `max_added_tracks` bounds from zero through
+eight; the minimum must not exceed the maximum. A minimum of zero permits the
+direct destination. Exact counts are also bounded from zero through eight.
 
 Destination routes use a dedicated fixed-matrix layered path search rather than  
 the generic contextual gap-insertion search. When Adaptive scoring and a learned  
 matrix are available, the engine evaluates the direct endpoint jump under both  
 the learned matrix and the current Static BlissMixer weights. The view assigning  
-the higher source-relative risk percentile governs candidate discovery, complete  
-path scoring, and the quality decision. This conservative selection prevents a  
-single-seed learned model from silently accepting a transition that the broader  
-Static acoustic view considers difficult; Static-only requests and installations  
-without a learned matrix continue to use Static weights alone.  
+the higher source-relative risk percentile governs candidate discovery. Static-  
+only requests and installations without a learned matrix continue to use Static  
+weights alone.  
+
+Automatic destination requests may set `direct_transition_caution` to `normal`  
+or `cautious`; omission preserves the wire-level `normal` default. Normal uses  
+the governing model for route scoring and accepts a direct transition when that  
+model meets the target. Cautious additionally treats a direct-edge disagreement  
+of at least 25 percentile points between learned and Static views as a reason to  
+search. Every candidate path is then measured under both models, and its worse  
+model controls target acceptance and best-effort ranking. When disagreement  
+triggered the search and the bridge budget is non-zero, a direct fallback is not  
+silently selected if any repeat-safe bridge route exists. Exact-count routing  
+already expresses the required bridge count and therefore rejects this automatic-  
+only option.  
 
 The search builds complete paths for the  
 permitted intermediate counts and ranks them by worst adjacent Bliss distance,  
@@ -307,8 +321,16 @@ sum, raw bottleneck, and worst adjacent percentile. Adaptive rolling-context
 values remain secondary candidate diagnostics rather than adjacent quality. If  
 both acoustic views were available, `model_selection` records each direct-edge  
 distance and percentile, the selected role, and the conservative selection  
-policy so callers can explain the decision.  
-Generated tracks remain unique and are checked against every artist and album
+policy, configured caution, disagreement magnitude, and whether disagreement  
+triggered a search. After selection, the engine also  
+measures the unchanged final destination path under the non-governing acoustic  
+view and publishes it in `route_quality.secondary_models`, including every  
+adjacent leg, distance sum, raw bottleneck, and worst percentile. Under Normal  
+caution these secondary measurements are advisory. Under Cautious they are part  
+of whole-route acceptance and ranking, making the quality consequence of model  
+agreement or disagreement both effective and observable to callers such as  
+Better Call Bliss.  
+Generated tracks remain unique and are checked against every track, artist, and album
 inside the configured repeat windows, including the explicit destination. The
 destination itself remains immutable user intent: a conflict already present
 solely between the captured queue context and destination does not make bridge

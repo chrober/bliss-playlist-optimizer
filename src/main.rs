@@ -70,6 +70,8 @@ fn destination_search_effort(value: Option<&str>) -> DestinationSearchEffort {
 struct Request {
     job_id: String,
     artifacts: Artifacts,
+    #[serde(default)]
+    history_tracks: Vec<SourceTrack>,
     source_tracks: Vec<SourceTrack>,
     scoring: Scoring,
     #[serde(default)]
@@ -185,6 +187,7 @@ struct ExtensionSettings {
     min_added_tracks: Option<usize>,
     max_added_tracks: Option<usize>,
     trigger_percentile: Option<f64>,
+    direct_transition_caution: Option<String>,
     shortlist_limit: Option<usize>,
 }
 #[derive(Debug, Serialize)]
@@ -244,6 +247,17 @@ struct DestinationRouteQualityArtifact {
     matrix_role: &'static str,
     matrix_sha256: String,
     model_selection: DestinationModelSelectionArtifact,
+    secondary_models: Vec<DestinationSecondaryModelArtifact>,
+    adjacent_legs: Vec<AdjacentTransitionArtifact>,
+    adjacent_transition_sum: f64,
+    adjacent_worst_transition: f64,
+    adjacent_worst_percentile: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct DestinationSecondaryModelArtifact {
+    matrix_role: &'static str,
+    matrix_sha256: String,
     adjacent_legs: Vec<AdjacentTransitionArtifact>,
     adjacent_transition_sum: f64,
     adjacent_worst_transition: f64,
@@ -252,6 +266,9 @@ struct DestinationRouteQualityArtifact {
 
 #[derive(Clone, Debug, Serialize)]
 struct DestinationModelSelectionArtifact {
+    direct_transition_caution: String,
+    model_disagreement_percentile: f64,
+    disagreement_triggered_search: bool,
     policy: &'static str,
     selected_matrix_role: &'static str,
     direct_edge_models: Vec<DestinationDirectModelArtifact>,
@@ -280,6 +297,18 @@ impl DestinationMatrixRole {
     }
 }
 
+const DESTINATION_MODEL_DISAGREEMENT_THRESHOLD: f64 = 0.25;
+
+fn destination_model_disagreement(static_percentile: f64, learned_percentile: Option<f64>) -> f64 {
+    learned_percentile
+        .map(|learned| (static_percentile - learned).abs())
+        .unwrap_or(0.0)
+}
+
+fn cautious_disagreement_trigger(caution: &str, disagreement: f64) -> bool {
+    caution == "cautious" && disagreement >= DESTINATION_MODEL_DISAGREEMENT_THRESHOLD
+}
+
 fn protective_destination_matrix_role(
     static_percentile: f64,
     learned_percentile: Option<f64>,
@@ -288,6 +317,13 @@ fn protective_destination_matrix_role(
         Some(learned) if learned >= static_percentile => DestinationMatrixRole::Learned,
         _ => DestinationMatrixRole::Static,
     }
+}
+
+#[derive(Clone, Debug)]
+struct DestinationConsensusQuality {
+    governing: AdjacentRouteQuality,
+    worst_percentile: f64,
+    percentile_sum: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -639,6 +675,8 @@ struct ExactSelectionArtifact {
     best_effort: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     route_quality: Option<DestinationRouteQualityArtifact>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    history_track_ids: Vec<String>,
     search: ExactSearchArtifact,
     infeasibility: Option<ExactInfeasibilityArtifact>,
 }
@@ -1618,6 +1656,35 @@ fn prepare_runtime_request(
             ));
         }
     }
+    for track in &request.history_tracks {
+        let database_file = track.database_file.as_deref().ok_or_else(|| {
+            CommandFailure::new(
+                "TRACK_IDENTITY_INCOMPLETE",
+                format!("history track '{}' has no database_file identity", track.id),
+            )
+        })?;
+        let Some(library_index) = file_to_index.get(database_file).copied() else {
+            return Err(CommandFailure::new(
+                "TRACK_NOT_ANALYZED",
+                format!(
+                    "history track '{}' is absent or ignored in the Bliss database",
+                    track.id
+                ),
+            ));
+        };
+        if local_candidate_rows
+            .as_ref()
+            .is_some_and(|rows| !rows.contains(&library.metadata(library_index).row_id))
+        {
+            return Err(CommandFailure::new(
+                "SOURCE_NOT_IN_LOCAL_CANDIDATE_INVENTORY",
+                format!(
+                    "history track '{}' is not present in the frozen LMS-local inventory",
+                    track.id
+                ),
+            ));
+        }
+    }
     timings.record("source_resolution", started.elapsed());
 
     let summary = ValidationSummary {
@@ -1754,6 +1821,38 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
                 "SOURCE_NOT_IN_LOCAL_CANDIDATE_INVENTORY",
                 format!(
                     "source track '{}' is not present in the frozen LMS-local inventory",
+                    track.id
+                ),
+            ));
+        }
+    }
+    for track in &request.history_tracks {
+        let database_file = track.database_file.as_deref().ok_or_else(|| {
+            CommandFailure::new(
+                "TRACK_IDENTITY_INCOMPLETE",
+                format!("history track '{}' has no database_file identity", track.id),
+            )
+        })?;
+        let row_id = database
+            .usable_row_id_for_file(database_file)
+            .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?;
+        let Some(row_id) = row_id else {
+            return Err(CommandFailure::new(
+                "TRACK_NOT_ANALYZED",
+                format!(
+                    "history track '{}' is absent or ignored in the Bliss database",
+                    track.id
+                ),
+            ));
+        };
+        if local_candidate_rows
+            .as_ref()
+            .is_some_and(|rows| !rows.contains(&row_id))
+        {
+            return Err(CommandFailure::new(
+                "SOURCE_NOT_IN_LOCAL_CANDIDATE_INVENTORY",
+                format!(
+                    "history track '{}' is not present in the frozen LMS-local inventory",
                     track.id
                 ),
             ));
@@ -2880,6 +2979,39 @@ fn analyze_bridge_validated(
             album_key,
         });
     }
+    let mut history_library_indices = Vec::with_capacity(request.history_tracks.len());
+    let mut history_semantic_identities = Vec::with_capacity(request.history_tracks.len());
+    for history in &request.history_tracks {
+        let database_file = history.database_file.as_deref().ok_or_else(|| {
+            CommandFailure::new(
+                "TRACK_IDENTITY_INCOMPLETE",
+                format!(
+                    "history track '{}' has no database_file identity",
+                    history.id
+                ),
+            )
+        })?;
+        let library_index = file_to_index.get(database_file).copied().ok_or_else(|| {
+            CommandFailure::new(
+                "TRACK_NOT_ANALYZED",
+                format!(
+                    "history track '{}' is absent from the Bliss database",
+                    history.id
+                ),
+            )
+        })?;
+        history_library_indices.push(library_index);
+        history_semantic_identities.push(source_semantic_identity(
+            history,
+            library.metadata(library_index),
+            library.track(library_index),
+        ));
+    }
+    let all_semantic_identities = history_semantic_identities
+        .iter()
+        .chain(source_semantic_identities.iter())
+        .cloned()
+        .collect::<Vec<_>>();
     timings.record("source_track_materialization", started.elapsed());
 
     let route_config = route::SearchConfig {
@@ -3131,7 +3263,7 @@ fn analyze_bridge_validated(
             distance: static_quality.worst_transition,
             source_relative_percentile: static_quality.worst_percentile,
         }];
-        if let Some(quality) = learned_quality {
+        if let Some(quality) = learned_quality.as_ref() {
             direct_edge_models.push(DestinationDirectModelArtifact {
                 matrix_role: DestinationMatrixRole::Learned.as_str(),
                 matrix_sha256: scoring_matrix_sha256.clone(),
@@ -3139,11 +3271,25 @@ fn analyze_bridge_validated(
                 source_relative_percentile: quality.worst_percentile,
             });
         }
+        let caution = request
+            .extension
+            .direct_transition_caution
+            .as_deref()
+            .unwrap_or("normal");
+        let disagreement = destination_model_disagreement(
+            static_quality.worst_percentile,
+            learned_quality
+                .as_ref()
+                .map(|quality| quality.worst_percentile),
+        );
         Some((
             selected_role,
             selected_hash,
             selected_quality,
             DestinationModelSelectionArtifact {
+                direct_transition_caution: caution.to_owned(),
+                model_disagreement_percentile: disagreement,
+                disagreement_triggered_search: cautious_disagreement_trigger(caution, disagreement),
                 policy: "highest-direct-risk-percentile",
                 selected_matrix_role: selected_role.as_str(),
                 direct_edge_models,
@@ -3280,7 +3426,7 @@ fn analyze_bridge_validated(
             &semantic_bundle,
             &source_semantic_identities[left_source_index],
             &source_semantic_identities[right_source_index],
-            &source_semantic_identities,
+            &all_semantic_identities,
             &semantic_candidate_lookup,
         );
         semantic_selection_elapsed += semantic_started.elapsed();
@@ -3683,6 +3829,46 @@ fn analyze_bridge_validated(
                     .expect("destination routes build a fixed distance index")
                     .evaluate_route(&route[path_start..], &adjacent_reference_candidates)
             };
+            let direct_caution = request
+                .extension
+                .direct_transition_caution
+                .as_deref()
+                .unwrap_or("normal");
+            let evaluate_consensus = |route: &[usize]| {
+                let governing = evaluate_destination(route)?;
+                let mut percentiles = vec![governing.worst_percentile];
+                if direct_caution == "cautious" {
+                    match destination_distance_selection
+                        .as_ref()
+                        .expect("destination routes have model-selection evidence")
+                        .0
+                    {
+                        DestinationMatrixRole::Learned => {
+                            percentiles.push(
+                                static_distance_index
+                                    .as_ref()
+                                    .expect("destination routes always construct the Static index")
+                                    .evaluate_route(route, &adjacent_reference_candidates)?
+                                    .worst_percentile,
+                            );
+                        }
+                        DestinationMatrixRole::Static => {
+                            if let Some(index) = learned_distance_index.as_ref() {
+                                percentiles.push(
+                                    index
+                                        .evaluate_route(route, &adjacent_reference_candidates)?
+                                        .worst_percentile,
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok::<DestinationConsensusQuality, CommandFailure>(DestinationConsensusQuality {
+                    governing,
+                    worst_percentile: percentiles.iter().copied().fold(0.0_f64, f64::max),
+                    percentile_sum: percentiles.iter().sum(),
+                })
+            };
             let relaxed_config = bridge::BridgeConfig {
                 max_leg_percentile: f64::MAX,
                 max_detour_percentile: f64::MAX,
@@ -3707,6 +3893,8 @@ fn analyze_bridge_validated(
                     &preview_gaps[0],
                     maximum,
                     &destination_config(maximum),
+                    &history_library_indices,
+                    request.repeat_windows.track,
                     preview::ExactScoringContext {
                         tracks: bridge_tracks,
                         learned_matrix: &learned_matrix,
@@ -3728,27 +3916,36 @@ fn analyze_bridge_validated(
                 let threshold = trigger_percentile
                     .expect("automatic destination route has a validated threshold");
                 let minimum = request.extension.min_added_tracks.unwrap_or(0);
+                let maximum =
+                    max_added_tracks.expect("automatic destination route has a validated maximum");
                 let direct_selection = search_destination(0)?
                     .into_iter()
                     .next()
                     .expect("a direct destination option is always available");
-                let direct_quality = destination_distance_selection
+                let direct_route = direct_selection
+                    .selection
+                    .final_route
+                    .as_deref()
+                    .expect("the direct destination option is feasible");
+                let direct_quality = evaluate_consensus(direct_route)?;
+                let disagreement_triggered = destination_distance_selection
                     .as_ref()
                     .expect("destination routes have direct model evidence")
-                    .2
-                    .clone();
-                if minimum == 0 && direct_quality.worst_percentile <= threshold {
+                    .3
+                    .disagreement_triggered_search;
+                if minimum == 0
+                    && direct_quality.worst_percentile <= threshold
+                    && !disagreement_triggered
+                {
                     (
                         0,
                         direct_selection.selection,
                         Some(true),
                         Some(direct_quality.worst_percentile),
                         Some(false),
-                        Some(direct_quality),
+                        Some(direct_quality.governing),
                     )
                 } else {
-                    let maximum = max_added_tracks
-                        .expect("automatic destination route has a validated maximum");
                     progress.update(
                         "bridge_selection",
                         format!(
@@ -3759,7 +3956,8 @@ fn analyze_bridge_validated(
                     );
                     let options = search_destination(maximum)?;
                     let mut qualifying = None;
-                    let mut fallback = (minimum == 0).then_some((direct_selection, direct_quality));
+                    let mut fallback = (minimum == 0 && (!disagreement_triggered || maximum == 0))
+                        .then_some((direct_selection, direct_quality));
                     for option in options
                         .into_iter()
                         .filter(|option| option.added_track_count >= minimum.max(1))
@@ -3773,7 +3971,7 @@ fn analyze_bridge_validated(
                             Some(option.added_track_count),
                             Some(maximum),
                         );
-                        let quality = evaluate_destination(
+                        let quality = evaluate_consensus(
                             option
                                 .selection
                                 .final_route
@@ -3784,33 +3982,36 @@ fn analyze_bridge_validated(
                         let replace_fallback = fallback.as_ref().is_none_or(
                             |(best_option, best_quality): &(
                                 preview::DestinationRouteOption,
-                                AdjacentRouteQuality,
+                                DestinationConsensusQuality,
                             )| {
                                 quality
-                                    .worst_transition
-                                    .total_cmp(&best_quality.worst_transition)
+                                    .worst_percentile
+                                    .total_cmp(&best_quality.worst_percentile)
                                     .is_lt()
-                                    || (quality.worst_transition == best_quality.worst_transition
+                                    || (quality.worst_percentile == best_quality.worst_percentile
                                         && (quality
-                                            .transition_sum
-                                            .total_cmp(&best_quality.transition_sum)
+                                            .percentile_sum
+                                            .total_cmp(&best_quality.percentile_sum)
                                             .is_lt()
-                                            || (quality.transition_sum
-                                                == best_quality.transition_sum
-                                                && option.added_track_count
-                                                    < best_option.added_track_count)))
+                                            || (quality.percentile_sum
+                                                == best_quality.percentile_sum
+                                                && (quality
+                                                    .governing
+                                                    .worst_transition
+                                                    .total_cmp(
+                                                        &best_quality.governing.worst_transition,
+                                                    )
+                                                    .is_lt()
+                                                    || (quality.governing.worst_transition
+                                                        == best_quality
+                                                            .governing
+                                                            .worst_transition
+                                                        && option.added_track_count
+                                                            < best_option.added_track_count)))))
                             },
                         );
                         if replace_fallback {
-                            fallback = Some((
-                                option.clone(),
-                                AdjacentRouteQuality {
-                                    legs: quality.legs.clone(),
-                                    transition_sum: quality.transition_sum,
-                                    worst_transition: quality.worst_transition,
-                                    worst_percentile: quality.worst_percentile,
-                                },
-                            ));
+                            fallback = Some((option.clone(), quality.clone()));
                         }
                         if met {
                             qualifying = Some((option, quality));
@@ -3830,7 +4031,7 @@ fn analyze_bridge_validated(
                         Some(met),
                         Some(quality.worst_percentile),
                         Some(!met),
-                        Some(quality),
+                        Some(quality.governing),
                     )
                 }
             } else if destination_route {
@@ -3911,36 +4112,116 @@ fn analyze_bridge_validated(
                     .cloned()
                     .unwrap_or_else(|| bridge_candidate_id(library.metadata(index).row_id))
             };
-            let route_quality = route_quality.map(|quality| {
-                let (selected_role, selected_hash, _, model_selection) =
-                    destination_distance_selection
-                        .as_ref()
-                        .expect("destination quality has model-selection evidence");
-                DestinationRouteQualityArtifact {
-                    primary_metric: "fixed-matrix-adjacent-distance",
-                    reference_model: "source-relative-local-library-percentile",
-                    matrix_role: selected_role.as_str(),
-                    matrix_sha256: selected_hash.clone(),
-                    model_selection: model_selection.clone(),
-                    adjacent_legs: quality
-                        .legs
-                        .into_iter()
-                        .enumerate()
-                        .map(|(position, (left, right, distance, percentile))| {
-                            AdjacentTransitionArtifact {
-                                position: position + 1,
-                                left_track_id: track_id(left),
-                                right_track_id: track_id(right),
-                                distance,
-                                source_relative_percentile: percentile,
+            let route_quality = route_quality
+                .map(
+                    |quality| -> Result<DestinationRouteQualityArtifact, CommandFailure> {
+                        let (selected_role, selected_hash, _, model_selection) =
+                            destination_distance_selection
+                                .as_ref()
+                                .expect("destination quality has model-selection evidence");
+                        let final_route = selection.final_route.as_deref().ok_or_else(|| {
+                            CommandFailure::new(
+                        "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
+                        "the selected destination route is absent from its quality artifact",
+                    )
+                        })?;
+                        let path_start = final_route
+                            .iter()
+                            .position(|track| *track == preview_gaps[0].left)
+                            .ok_or_else(|| {
+                                CommandFailure::new(
+                                    "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
+                                    "the destination path start is absent from the selected route",
+                                )
+                            })?;
+                        let destination_path = &final_route[path_start..];
+                        let mut secondary_models = Vec::new();
+                        let mut push_secondary =
+                            |role: DestinationMatrixRole,
+                             hash: String,
+                             quality: AdjacentRouteQuality| {
+                                secondary_models.push(DestinationSecondaryModelArtifact {
+                                    matrix_role: role.as_str(),
+                                    matrix_sha256: hash,
+                                    adjacent_legs: quality
+                                        .legs
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(position, (left, right, distance, percentile))| {
+                                            AdjacentTransitionArtifact {
+                                                position: position + 1,
+                                                left_track_id: track_id(left),
+                                                right_track_id: track_id(right),
+                                                distance,
+                                                source_relative_percentile: percentile,
+                                            }
+                                        })
+                                        .collect(),
+                                    adjacent_transition_sum: quality.transition_sum,
+                                    adjacent_worst_transition: quality.worst_transition,
+                                    adjacent_worst_percentile: quality.worst_percentile,
+                                });
+                            };
+                        match selected_role {
+                            DestinationMatrixRole::Learned => {
+                                let static_quality = static_distance_index
+                            .as_ref()
+                            .expect("destination routes always construct the Static distance index")
+                            .evaluate_route(destination_path, &adjacent_reference_candidates)?;
+                                push_secondary(
+                                    DestinationMatrixRole::Static,
+                                    static_destination_matrix
+                                        .as_ref()
+                                        .expect(
+                                            "destination routes always construct the Static matrix",
+                                        )
+                                        .1
+                                        .clone(),
+                                    static_quality,
+                                );
                             }
+                            DestinationMatrixRole::Static => {
+                                if let Some(index) = learned_distance_index.as_ref() {
+                                    let learned_quality = index.evaluate_route(
+                                        destination_path,
+                                        &adjacent_reference_candidates,
+                                    )?;
+                                    push_secondary(
+                                        DestinationMatrixRole::Learned,
+                                        scoring_matrix_sha256.clone(),
+                                        learned_quality,
+                                    );
+                                }
+                            }
+                        }
+                        Ok(DestinationRouteQualityArtifact {
+                            primary_metric: "fixed-matrix-adjacent-distance",
+                            reference_model: "source-relative-local-library-percentile",
+                            matrix_role: selected_role.as_str(),
+                            matrix_sha256: selected_hash.clone(),
+                            model_selection: model_selection.clone(),
+                            secondary_models,
+                            adjacent_legs: quality
+                                .legs
+                                .into_iter()
+                                .enumerate()
+                                .map(|(position, (left, right, distance, percentile))| {
+                                    AdjacentTransitionArtifact {
+                                        position: position + 1,
+                                        left_track_id: track_id(left),
+                                        right_track_id: track_id(right),
+                                        distance,
+                                        source_relative_percentile: percentile,
+                                    }
+                                })
+                                .collect(),
+                            adjacent_transition_sum: quality.transition_sum,
+                            adjacent_worst_transition: quality.worst_transition,
+                            adjacent_worst_percentile: quality.worst_percentile,
                         })
-                        .collect(),
-                    adjacent_transition_sum: quality.transition_sum,
-                    adjacent_worst_transition: quality.worst_transition,
-                    adjacent_worst_percentile: quality.worst_percentile,
-                }
-            });
+                    },
+                )
+                .transpose()?;
             let decisions = selection
                 .decisions
                 .iter()
@@ -4033,6 +4314,15 @@ fn analyze_bridge_validated(
                 achieved_max_leg_percentile,
                 best_effort,
                 route_quality,
+                history_track_ids: if destination_route {
+                    request
+                        .history_tracks
+                        .iter()
+                        .map(|track| track.id.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 search: ExactSearchArtifact {
                     beam_width: destination_beam_width,
                     search_effort: destination_effort.map(|effort| effort.name),
@@ -4318,6 +4608,23 @@ fn analyze_bridge_request_with_options(
                 "destination_route requires extension.destination_mode=automatic or exact",
             ));
         }
+        let caution = request
+            .extension
+            .direct_transition_caution
+            .as_deref()
+            .unwrap_or("normal");
+        if !matches!(caution, "normal" | "cautious") {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_CAUTION_INVALID",
+                "direct_transition_caution must be normal or cautious",
+            ));
+        }
+        if destination_mode == "exact" && request.extension.direct_transition_caution.is_some() {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_CAUTION_UNSUPPORTED",
+                "direct_transition_caution applies only to automatic destination routing",
+            ));
+        }
         if request.route.ordering_policy != "queue_destination" {
             return Err(CommandFailure::new(
                 "DESTINATION_ROUTE_POLICY_REQUIRED",
@@ -4399,14 +4706,22 @@ fn analyze_bridge_request_with_options(
                 "exact intermediate count exceeds the configured destination-route maximum",
             ));
         }
-    } else if request.route.ordering_policy == "queue_destination"
-        || request.route.start_track_id.is_some()
-        || request.route.destination_track_id.is_some()
-    {
-        return Err(CommandFailure::new(
-            "ROUTE_LOCK_UNSUPPORTED",
-            "queue_destination and endpoint locks are supported only by destination_route",
-        ));
+    } else {
+        if !request.history_tracks.is_empty() {
+            return Err(CommandFailure::new(
+                "LISTENING_HISTORY_UNSUPPORTED",
+                "history_tracks is supported only by destination_route",
+            ));
+        }
+        if request.route.ordering_policy == "queue_destination"
+            || request.route.start_track_id.is_some()
+            || request.route.destination_track_id.is_some()
+        {
+            return Err(CommandFailure::new(
+                "ROUTE_LOCK_UNSUPPORTED",
+                "queue_destination and endpoint locks are supported only by destination_route",
+            ));
+        }
     }
     if request.route.search.time_budget_ms.is_some() {
         return Err(CommandFailure::new(
@@ -4788,6 +5103,19 @@ mod tests {
     }
 
     #[test]
+    fn cautious_destination_trigger_detects_strong_model_disagreement() {
+        let disagreement = destination_model_disagreement(0.597, Some(0.184));
+        assert!((disagreement - 0.413).abs() < 1e-12);
+        assert!(cautious_disagreement_trigger("cautious", disagreement));
+        assert!(!cautious_disagreement_trigger("normal", disagreement));
+        assert!(cautious_disagreement_trigger(
+            "cautious",
+            DESTINATION_MODEL_DISAGREEMENT_THRESHOLD
+        ));
+        assert_eq!(destination_model_disagreement(0.597, None), 0.0);
+    }
+
+    #[test]
     fn usage_mentions_the_supported_commands() {
         assert!(usage().contains("version"));
         assert!(usage().contains("validate"));
@@ -4983,8 +5311,63 @@ mod tests {
     }
 
     #[test]
-    fn two_track_destination_uses_library_reference_for_automatic_trigger() {
+    fn destination_history_and_two_track_reference_are_supported() {
+        fn destination_route_accepts_repeated_immutable_history() {
+            let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let request_path = repository.join("fixtures/synthetic/automatic-bridge-request.json");
+            let mut request: Value =
+                serde_json::from_slice(&fs::read(request_path).unwrap()).unwrap();
+            request["job_id"] = Value::String("destination-route-history-test".to_owned());
+            let all_sources = request["source_tracks"].as_array().unwrap().clone();
+            let endpoints = all_sources[all_sources.len() - 2..].to_vec();
+            let mut history = all_sources[..all_sources.len() - 2].to_vec();
+            history.push(history[0].clone());
+            request["source_tracks"] = Value::Array(endpoints.clone());
+            request["history_tracks"] = Value::Array(history.clone());
+            request["route"]["ordering_policy"] = Value::String("queue_destination".to_owned());
+            request["route"]["start_track_id"] = endpoints[0]["id"].clone();
+            request["route"]["destination_track_id"] = endpoints[1]["id"].clone();
+            request["route"]["search"]["restart_count"] = Value::from(0);
+            request["extension"] = serde_json::json!({
+                "mode": "destination_route",
+                "destination_mode": "automatic",
+                "candidate_limit": 8,
+                "search_effort": "fast",
+                "shortlist_limit": 256,
+                "min_added_tracks": 0,
+                "max_added_tracks": 4,
+                "trigger_percentile": 1.0,
+                "direct_transition_caution": "normal"
+            });
+            request["selection"] = serde_json::json!({
+                "variation_percent": 25,
+                "generation_seed": 1234,
+                "lastfm_track_guidance_percent": 0,
+                "lastfm_artist_guidance_percent": 0
+            });
+
+            let temporary = std::env::temp_dir().join(format!(
+                "bliss-playlist-optimizer-history-{}.json",
+                std::process::id()
+            ));
+            fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+            let result = analyze_bridge_request(&temporary).unwrap();
+            let _ = fs::remove_file(temporary);
+
+            let SelectionPreviewArtifact::Exact(preview) = result.selection_preview else {
+                panic!("destination route must return an exact-selection preview");
+            };
+            assert_eq!(preview.added_track_count, 0);
+            assert_eq!(preview.final_sequence.unwrap().len(), 2);
+            assert_eq!(preview.history_track_ids.len(), history.len());
+            assert_eq!(
+                preview.history_track_ids.first(),
+                preview.history_track_ids.last(),
+                "duplicate history identities are preserved rather than rejected"
+            );
+        }
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        destination_route_accepts_repeated_immutable_history();
         let request_path = repository.join("fixtures/synthetic/automatic-bridge-request.json");
         let mut request: Value = serde_json::from_slice(&fs::read(request_path).unwrap()).unwrap();
         request["job_id"] = Value::String("two-track-destination-reference-test".to_owned());
@@ -5082,6 +5465,11 @@ mod tests {
             quality.adjacent_legs.len(),
             preview.final_sequence.as_ref().unwrap().len() - 1
         );
+        assert_eq!(quality.secondary_models.len(), 1);
+        let secondary = &quality.secondary_models[0];
+        assert_ne!(secondary.matrix_role, quality.matrix_role);
+        assert_eq!(secondary.adjacent_legs.len(), quality.adjacent_legs.len());
+        assert!(secondary.adjacent_worst_percentile.is_finite());
         assert_eq!(preview.quality_target_met, Some(true));
         assert_eq!(preview.best_effort, Some(false));
         assert_eq!(preview.search.search_effort, Some("balanced"));
