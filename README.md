@@ -261,24 +261,34 @@ eight; the minimum must not exceed the maximum. A minimum of zero permits the
 direct destination. Exact counts are also bounded from zero through eight.
 
 Destination routes use a dedicated fixed-matrix layered path search rather than  
-the generic contextual gap-insertion search. When Adaptive scoring and a learned  
-matrix are available, the engine evaluates the direct endpoint jump under both  
-the learned matrix and the current Static BlissMixer weights. The view assigning  
-the higher source-relative risk percentile governs candidate discovery. Static-  
-only requests and installations without a learned matrix continue to use Static  
-weights alone.  
+the generic contextual gap-insertion search. Static requests govern that search  
+with the diagonal matrix built from the captured BlissMixer feature weights.  
+Adaptive requests build one per-run context from the bounded suffix of analyzed  
+`history_tracks` followed by the locked start track. The destination is never an  
+Adaptive seed. The optimizer passes those features, the optional learned matrix,  
+and `scoring.adaptive.learned_percent` to the same `bliss-mixer-core` selector  
+used by BlissMixer: one seed plus learned uses learned; two or more seeds use  
+variance and blend learned at the configured percentage; variance failure falls  
+back to learned when available; and insufficient context without learned falls  
+back to the captured Static matrix.  
+
+The selected context matrix is frozen for candidate discovery and the complete  
+layered search. This preserves comparable adjacent-edge costs and indexed  
+large-library performance; candidate intermediates do not become new matrix  
+seeds during the job.  
 
 Automatic destination requests may set `direct_transition_caution` to `normal`  
 or `cautious`; omission preserves the wire-level `normal` default. Normal uses  
 the governing model for route scoring and accepts a direct transition when that  
-model meets the target. Cautious additionally treats a direct-edge disagreement  
-of at least 25 percentile points between learned and Static views as a reason to  
-search. Every candidate path is then measured under both models, and its worse  
-model controls target acceptance and best-effort ranking. When disagreement  
-triggered the search and the bridge budget is non-zero, a direct fallback is not  
-silently selected if any repeat-safe bridge route exists. Exact-count routing  
-already expresses the required bridge count and therefore rejects this automatic-  
-only option.  
+model meets the target. Cautious additionally measures distinct available Static  
+and learned-only views. A direct-edge disagreement of at least 25 percentile  
+points between the governing matrix and any secondary view is a reason to search.  
+Every candidate path is then measured under all distinct available views, and  
+its worst model controls target acceptance and best-effort ranking. When  
+disagreement triggered the search and the bridge budget is non-zero, a direct  
+fallback is not silently selected if any repeat-safe bridge route exists. Exact-  
+count routing already expresses the required bridge count and therefore rejects  
+this automatic-only option.  
 
 The search builds complete paths for the  
 permitted intermediate counts and ranks them by worst adjacent Bliss distance,  
@@ -315,21 +325,19 @@ Every feasible destination result publishes `selection_preview.route_quality`.
 It covers only the requested path from the captured queue tail through generated  
 intermediates to the destination, not unrelated earlier context edges. Each  
 actual neighboring edge uses `fixed-matrix-adjacent-distance` and a matching  
-`source-relative-local-library-percentile`; the artifact also identifies the  
-governing learned-matrix or Static-weight role and SHA-256, adjacent-distance  
-sum, raw bottleneck, and worst adjacent percentile. Adaptive rolling-context  
-values remain secondary candidate diagnostics rather than adjacent quality. If  
-both acoustic views were available, `model_selection` records each direct-edge  
-distance and percentile, the selected role, and the conservative selection  
-policy, configured caution, disagreement magnitude, and whether disagreement  
-triggered a search. After selection, the engine also  
-measures the unchanged final destination path under the non-governing acoustic  
-view and publishes it in `route_quality.secondary_models`, including every  
-adjacent leg, distance sum, raw bottleneck, and worst percentile. Under Normal  
-caution these secondary measurements are advisory. Under Cautious they are part  
-of whole-route acceptance and ranking, making the quality consequence of model  
-agreement or disagreement both effective and observable to callers such as  
-Better Call Bliss.  
+`source-relative-local-library-percentile`; the artifact identifies the  
+governing Adaptive-context or Static role and SHA-256, adjacent-distance sum,  
+raw bottleneck, and worst adjacent percentile. `model_selection` records the  
+effective Adaptive algorithm, seed track identities, seed limit, configured  
+learned share, variance failure, fallback reason, each distinct direct-edge  
+measurement, configured caution, disagreement magnitude, and whether  
+disagreement triggered a search. After selection, the engine measures the  
+unchanged final destination path under distinct non-governing Static and  
+learned-only views and publishes them in `route_quality.secondary_models`. Under  
+Normal caution these secondary measurements are advisory. Under Cautious they  
+are part of whole-route acceptance and ranking, making the quality consequence  
+of model agreement or disagreement both effective and observable to callers  
+such as Better Call Bliss.  
 Generated tracks remain unique and are checked against every track, artist, and album
 inside the configured repeat windows, including the explicit destination. The
 destination itself remains immutable user intent: a conflict already present

@@ -518,7 +518,9 @@
         "reference_model": {
           "const": "source-relative-local-library-percentile"
         },
-        "matrix_role": { "enum": ["learned-matrix", "static-weights"] },
+        "matrix_role": {
+          "enum": ["adaptive-context", "learned-matrix", "static-weights"]
+        },
         "matrix_sha256": { "$ref": "#/$defs/sha256" },
         "model_selection": {
           "type": "object",
@@ -526,17 +528,25 @@
           "required": [
             "policy", "selected_matrix_role", "direct_edge_models",
             "direct_transition_caution", "model_disagreement_percentile",
-            "disagreement_triggered_search"
+            "disagreement_triggered_search", "adaptive_algorithm",
+            "adaptive_seed_track_ids", "adaptive_seed_limit",
+            "configured_learned_percent", "adaptive_variance_failure",
+            "fallback_reason"
           ],
           "properties": {
-            "policy": { "const": "highest-direct-risk-percentile" },
+            "policy": {
+              "enum": [
+                "configured-adaptive-with-blissmixer-fallback",
+                "configured-static"
+              ]
+            },
             "selected_matrix_role": {
-              "enum": ["learned-matrix", "static-weights"]
+              "enum": ["adaptive-context", "learned-matrix", "static-weights"]
             },
             "direct_edge_models": {
               "type": "array",
               "minItems": 1,
-              "maxItems": 2,
+              "maxItems": 3,
               "items": {
                 "type": "object",
                 "additionalProperties": false,
@@ -546,7 +556,9 @@
                 ],
                 "properties": {
                   "matrix_role": {
-                    "enum": ["learned-matrix", "static-weights"]
+                    "enum": [
+                      "adaptive-context", "learned-matrix", "static-weights"
+                    ]
                   },
                   "matrix_sha256": { "$ref": "#/$defs/sha256" },
                   "distance": { "type": "number", "minimum": 0 },
@@ -555,6 +567,28 @@
                   }
                 }
               }
+            },
+            "adaptive_algorithm": {
+              "type": ["string", "null"]
+            },
+            "adaptive_seed_track_ids": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "adaptive_seed_limit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "configured_learned_percent": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "adaptive_variance_failure": {
+              "type": ["string", "null"]
+            },
+            "fallback_reason": {
+              "type": ["string", "null"]
             },
             "direct_transition_caution": { "enum": ["normal", "cautious"] },
             "model_disagreement_percentile": {
@@ -604,7 +638,9 @@
         "adjacent_worst_percentile"
       ],
       "properties": {
-        "matrix_role": { "enum": ["learned-matrix", "static-weights"] },
+        "matrix_role": {
+          "enum": ["adaptive-context", "learned-matrix", "static-weights"]
+        },
         "matrix_sha256": { "$ref": "#/$defs/sha256" },
         "adjacent_legs": {
           "type": "array",
