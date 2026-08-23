@@ -2,17 +2,25 @@
 
 use std::fmt;
 
+use bliss_mixer_core::FeatureVector;
 use ndarray::Array2;
 use rayon::prelude::*;
 
 use crate::contextual::{
-    adaptive_distance_from_seeds, prepare_adaptive_context, ContextualError,
-    PreparedAdaptiveContext,
+    adaptive_distance_from_seeds, adaptive_distance_with_matrix, prepare_adaptive_context,
+    ContextualError, PreparedAdaptiveContext,
 };
 use crate::route::RouteTrack;
 
 pub const DEFAULT_MAX_LEG_PERCENTILE: f64 = 0.70;
 pub const DEFAULT_MAX_DETOUR_PERCENTILE: f64 = 1.30;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GapContextMode {
+    #[default]
+    Rolling,
+    Frozen,
+}
 
 #[derive(Clone, Debug)]
 pub struct BridgeConfig {
@@ -22,6 +30,7 @@ pub struct BridgeConfig {
     pub album_window: usize,
     pub max_leg_percentile: f64,
     pub max_detour_percentile: f64,
+    pub gap_context_mode: GapContextMode,
 }
 
 pub struct ShortlistScoringContext<'a> {
@@ -29,6 +38,14 @@ pub struct ShortlistScoringContext<'a> {
     pub learned_matrix: &'a Array2<f32>,
     pub config: &'a BridgeConfig,
     pub reference: &'a FrozenReference,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CandidateScoringContext<'a> {
+    pub learned_matrix: &'a Array2<f32>,
+    pub config: &'a BridgeConfig,
+    pub reference: &'a FrozenReference,
+    pub frozen_matrix: Option<&'a Array2<f32>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -136,25 +153,48 @@ impl FrozenReference {
     }
 }
 
-fn contextual_distance(
+fn recent_context(
+    prefix: &[usize],
+    tracks: &[RouteTrack],
+    config: &BridgeConfig,
+) -> Result<Vec<FeatureVector>, BridgeError> {
+    validate_indices(prefix, tracks.len())?;
+    let seed_start = prefix.len().saturating_sub(config.seed_limit);
+    Ok(prefix[seed_start..]
+        .iter()
+        .map(|index| tracks[*index].features)
+        .collect())
+}
+
+pub(crate) fn contextual_distance(
     prefix: &[usize],
     candidate: usize,
     tracks: &[RouteTrack],
     learned_matrix: &Array2<f32>,
     config: &BridgeConfig,
 ) -> Result<f64, BridgeError> {
-    validate_indices(prefix, tracks.len())?;
     validate_indices(&[candidate], tracks.len())?;
-    let seed_start = prefix.len().saturating_sub(config.seed_limit);
-    let seeds = prefix[seed_start..]
-        .iter()
-        .map(|index| tracks[*index].features)
-        .collect::<Vec<_>>();
     adaptive_distance_from_seeds(
-        &seeds,
+        &recent_context(prefix, tracks, config)?,
         &tracks[candidate].features,
         learned_matrix,
         config.learned_percent,
+    )
+    .map_err(BridgeError::Scoring)
+}
+
+pub(crate) fn contextual_distance_with_matrix(
+    prefix: &[usize],
+    candidate: usize,
+    tracks: &[RouteTrack],
+    matrix: &Array2<f32>,
+    config: &BridgeConfig,
+) -> Result<f64, BridgeError> {
+    validate_indices(&[candidate], tracks.len())?;
+    adaptive_distance_with_matrix(
+        &recent_context(prefix, tracks, config)?,
+        &tracks[candidate].features,
+        matrix,
     )
     .map_err(BridgeError::Scoring)
 }
@@ -165,14 +205,32 @@ fn prepared_context(
     learned_matrix: &Array2<f32>,
     config: &BridgeConfig,
 ) -> Result<PreparedAdaptiveContext, BridgeError> {
-    validate_indices(prefix, tracks.len())?;
-    let seed_start = prefix.len().saturating_sub(config.seed_limit);
-    let seeds = prefix[seed_start..]
-        .iter()
-        .map(|index| tracks[*index].features)
-        .collect::<Vec<_>>();
-    prepare_adaptive_context(&seeds, learned_matrix, config.learned_percent)
-        .map_err(BridgeError::Scoring)
+    prepare_adaptive_context(
+        &recent_context(prefix, tracks, config)?,
+        learned_matrix,
+        config.learned_percent,
+    )
+    .map_err(BridgeError::Scoring)
+}
+
+pub fn gap_context_matrix(
+    route: &[usize],
+    position: usize,
+    tracks: &[RouteTrack],
+    learned_matrix: &Array2<f32>,
+    config: &BridgeConfig,
+) -> Result<Option<Array2<f32>>, BridgeError> {
+    if config.gap_context_mode == GapContextMode::Rolling {
+        return Ok(None);
+    }
+    if position == 0 || position >= route.len() {
+        return Err(BridgeError::InvalidGap);
+    }
+    Ok(Some(
+        prepared_context(&route[..position], tracks, learned_matrix, config)?
+            .matrix()
+            .clone(),
+    ))
 }
 
 pub fn shortlist_candidates(
@@ -316,6 +374,33 @@ pub fn evaluate_candidate(
     config: &BridgeConfig,
     reference: &FrozenReference,
 ) -> Result<BridgeCandidateEvaluation, BridgeError> {
+    evaluate_candidate_in_context(
+        route,
+        position,
+        candidate,
+        tracks,
+        CandidateScoringContext {
+            learned_matrix,
+            config,
+            reference,
+            frozen_matrix: None,
+        },
+    )
+}
+
+pub(crate) fn evaluate_candidate_in_context(
+    route: &[usize],
+    position: usize,
+    candidate: usize,
+    tracks: &[RouteTrack],
+    scoring: CandidateScoringContext<'_>,
+) -> Result<BridgeCandidateEvaluation, BridgeError> {
+    let CandidateScoringContext {
+        learned_matrix,
+        config,
+        reference,
+        frozen_matrix,
+    } = scoring;
     validate_indices(route, tracks.len())?;
     validate_indices(&[candidate], tracks.len())?;
     if position == 0 || position >= route.len() {
@@ -323,20 +408,12 @@ pub fn evaluate_candidate(
     }
     let mut tentative = route.to_vec();
     tentative.insert(position, candidate);
-    let left_distance = contextual_distance(
-        &tentative[..position],
-        candidate,
-        tracks,
-        learned_matrix,
-        config,
-    )?;
-    let right_distance = contextual_distance(
-        &tentative[..=position],
-        tentative[position + 1],
-        tracks,
-        learned_matrix,
-        config,
-    )?;
+    let distance = |prefix: &[usize], candidate| match frozen_matrix {
+        Some(matrix) => contextual_distance_with_matrix(prefix, candidate, tracks, matrix, config),
+        None => contextual_distance(prefix, candidate, tracks, learned_matrix, config),
+    };
+    let left_distance = distance(&tentative[..position], candidate)?;
+    let right_distance = distance(&tentative[..=position], tentative[position + 1])?;
     let left_percentile = reference.percentile(left_distance)?;
     let right_percentile = reference.percentile(right_distance)?;
     let max_percentile = left_percentile.max(right_percentile);
@@ -368,25 +445,76 @@ pub fn rank_candidates(
     config: &BridgeConfig,
     reference: &FrozenReference,
 ) -> Result<Vec<BridgeCandidateEvaluation>, BridgeError> {
+    rank_candidates_in_context(
+        route,
+        position,
+        candidates,
+        tracks,
+        CandidateScoringContext {
+            learned_matrix,
+            config,
+            reference,
+            frozen_matrix: None,
+        },
+    )
+}
+
+pub(crate) fn rank_candidates_in_context(
+    route: &[usize],
+    position: usize,
+    candidates: &[usize],
+    tracks: &[RouteTrack],
+    scoring: CandidateScoringContext<'_>,
+) -> Result<Vec<BridgeCandidateEvaluation>, BridgeError> {
+    let CandidateScoringContext {
+        learned_matrix,
+        config,
+        reference,
+        frozen_matrix,
+    } = scoring;
     validate_indices(route, tracks.len())?;
     validate_indices(candidates, tracks.len())?;
     if position == 0 || position >= route.len() {
         return Err(BridgeError::InvalidGap);
     }
-    let left_context = prepared_context(&route[..position], tracks, learned_matrix, config)?;
+    let left_context = frozen_matrix
+        .is_none()
+        .then(|| prepared_context(&route[..position], tracks, learned_matrix, config))
+        .transpose()?;
     let attempts = candidates
         .par_iter()
         .map(|candidate| {
             let mut tentative = route.to_vec();
             tentative.insert(position, *candidate);
-            let left_distance = left_context.distance_to(&tracks[*candidate].features);
-            let right_distance = contextual_distance(
-                &tentative[..=position],
-                tentative[position + 1],
-                tracks,
-                learned_matrix,
-                config,
-            )?;
+            let left_distance = match frozen_matrix {
+                Some(matrix) => contextual_distance_with_matrix(
+                    &tentative[..position],
+                    *candidate,
+                    tracks,
+                    matrix,
+                    config,
+                )?,
+                None => left_context
+                    .as_ref()
+                    .expect("rolling scoring prepares a left context")
+                    .distance_to(&tracks[*candidate].features),
+            };
+            let right_distance = match frozen_matrix {
+                Some(matrix) => contextual_distance_with_matrix(
+                    &tentative[..=position],
+                    tentative[position + 1],
+                    tracks,
+                    matrix,
+                    config,
+                )?,
+                None => contextual_distance(
+                    &tentative[..=position],
+                    tentative[position + 1],
+                    tracks,
+                    learned_matrix,
+                    config,
+                )?,
+            };
             let left_percentile = reference.percentile(left_distance)?;
             let right_percentile = reference.percentile(right_distance)?;
             let max_percentile = left_percentile.max(right_percentile);
@@ -524,6 +652,7 @@ mod tests {
             album_window: 1,
             max_leg_percentile: DEFAULT_MAX_LEG_PERCENTILE,
             max_detour_percentile: DEFAULT_MAX_DETOUR_PERCENTILE,
+            gap_context_mode: GapContextMode::Rolling,
         }
     }
 
@@ -564,6 +693,69 @@ mod tests {
     }
 
     #[test]
+    fn frozen_gap_context_reuses_one_matrix_while_the_rolling_mode_reselects_it() {
+        let mut tracks = tracks();
+        tracks[0].features = std::array::from_fn(|index| if index % 2 == 0 { 0.2 } else { 2.0 });
+        tracks[2].features = std::array::from_fn(|index| if index % 3 == 0 { 3.0 } else { 0.4 });
+        tracks[1].features = std::array::from_fn(|index| if index % 5 == 0 { 1.5 } else { 4.0 });
+        tracks[4].features = std::array::from_fn(|index| index as f32 / 7.0);
+        let route = [0, 2, 4];
+        let matrix = Array2::eye(23);
+        let reference = FrozenReference::from_distances(vec![0.0, 100.0]).unwrap();
+        let rolling_config = BridgeConfig {
+            seed_limit: 3,
+            learned_percent: 20,
+            artist_window: 0,
+            album_window: 0,
+            max_leg_percentile: 1.0,
+            max_detour_percentile: 2.0,
+            gap_context_mode: GapContextMode::Rolling,
+        };
+        let frozen_config = BridgeConfig {
+            gap_context_mode: GapContextMode::Frozen,
+            ..rolling_config.clone()
+        };
+        let frozen_matrix = gap_context_matrix(&route, 2, &tracks, &matrix, &frozen_config)
+            .unwrap()
+            .unwrap();
+
+        let rolling = evaluate_candidate_in_context(
+            &route,
+            2,
+            1,
+            &tracks,
+            CandidateScoringContext {
+                learned_matrix: &matrix,
+                config: &rolling_config,
+                reference: &reference,
+                frozen_matrix: None,
+            },
+        )
+        .unwrap();
+        let frozen = evaluate_candidate_in_context(
+            &route,
+            2,
+            1,
+            &tracks,
+            CandidateScoringContext {
+                learned_matrix: &matrix,
+                config: &frozen_config,
+                reference: &reference,
+                frozen_matrix: Some(&frozen_matrix),
+            },
+        )
+        .unwrap();
+
+        assert!((rolling.left_distance - frozen.left_distance).abs() < 1e-6);
+        assert!((rolling.right_distance - frozen.right_distance).abs() > 1e-6);
+        assert!(
+            gap_context_matrix(&route, 2, &tracks, &matrix, &rolling_config)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn destination_candidate_cannot_use_explicit_destination_repeat_exemption() {
         let tracks = vec![
             track(0.0, "same-artist", "source-album"),
@@ -581,6 +773,7 @@ mod tests {
             album_window: 5,
             max_leg_percentile: 1.0,
             max_detour_percentile: 2.0,
+            gap_context_mode: GapContextMode::Rolling,
         };
         let reference =
             build_frozen_reference(&route, &[0, 1, 2, 3, 4], &tracks, &matrix, &config).unwrap();
@@ -723,6 +916,7 @@ mod tests {
             album_window: 0,
             max_leg_percentile: 1.0,
             max_detour_percentile: 2.0,
+            gap_context_mode: GapContextMode::Rolling,
         };
         let candidates = (64..tracks.len()).collect::<Vec<_>>();
         let mut retained = 0usize;

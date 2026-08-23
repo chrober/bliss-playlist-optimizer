@@ -15,7 +15,7 @@
     "usable_library_track_count", "eligible_candidate_count",
     "frozen_reference_count", "trigger_percentile", "max_leg_percentile",
     "max_detour_percentile", "retained_candidate_limit", "semantic_mode",
-    "provider_states", "gaps", "selection_preview"
+    "provider_states", "gaps", "selection_preview", "scoring_provenance"
   ],
   "properties": {
     "schema_version": { "const": 1 },
@@ -84,6 +84,26 @@
         { "$ref": "#/$defs/exact_selection_preview" },
         { "$ref": "#/$defs/fixed_source_extension_selection_preview" }
       ]
+    },
+    "scoring_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "context_policy", "seed_policy", "configured_algorithm",
+        "configured_learned_percent", "effective_base_learned_percent",
+        "learned_matrix_available", "base_matrix_sha256", "fallback_policy"
+      ],
+      "properties": {
+        "context_policy": { "type": "string", "minLength": 1 },
+        "seed_policy": { "type": "string", "minLength": 1 },
+        "configured_algorithm": { "enum": ["adaptive", "static"] },
+        "configured_learned_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "effective_base_learned_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "learned_matrix_available": { "type": "boolean" },
+        "base_matrix_sha256": { "$ref": "#/$defs/sha256" },
+        "fallback_policy": { "type": "string", "minLength": 1 },
+        "gap_context_mode": { "enum": ["rolling", "frozen"] }
+      }
     }
   },
   "$defs": {

@@ -8,8 +8,9 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::bridge::{
-    rank_candidates, rank_endpoint_candidates, BridgeCandidateEvaluation, BridgeConfig,
-    BridgeError, EndpointCandidateEvaluation, EndpointSlot, FrozenReference,
+    gap_context_matrix, rank_candidates_in_context, rank_endpoint_candidates,
+    BridgeCandidateEvaluation, BridgeConfig, BridgeError, CandidateScoringContext,
+    EndpointCandidateEvaluation, EndpointSlot, FrozenReference,
 };
 use crate::route::{self, RouteTrack};
 use crate::semantic::{CandidateSemantics, GapEvidence, SemanticPool};
@@ -130,6 +131,12 @@ pub struct ExactScoringContext<'a> {
     pub learned_matrix: &'a Array2<f32>,
     pub config: &'a BridgeConfig,
     pub reference: &'a FrozenReference,
+}
+
+#[derive(Clone, Copy)]
+struct GapRankingContext<'a> {
+    scoring: ExactScoringContext<'a>,
+    frozen_matrix: Option<&'a Array2<f32>>,
 }
 
 #[derive(Clone, Copy)]
@@ -300,17 +307,21 @@ fn rank_for_evolving_route(
     route: &[usize],
     position: usize,
     semantics: &[CandidateSemantics],
-    scoring: ExactScoringContext<'_>,
+    context: GapRankingContext<'_>,
     guidance: GuidanceConfig,
     variation: VariationConfig,
     acceptance: EvolvingAcceptance,
 ) -> Result<Vec<BridgeCandidateEvaluation>, PreviewError> {
-    let ExactScoringContext {
-        tracks,
-        learned_matrix,
-        config,
-        reference,
-    } = scoring;
+    let GapRankingContext {
+        scoring:
+            ExactScoringContext {
+                tracks,
+                learned_matrix,
+                config,
+                reference,
+            },
+        frozen_matrix,
+    } = context;
     let semantics_by_candidate = semantics
         .iter()
         .map(|candidate| (candidate.candidate, candidate))
@@ -319,14 +330,17 @@ fn rank_for_evolving_route(
         .iter()
         .map(|candidate| candidate.candidate)
         .collect::<Vec<_>>();
-    let mut evaluations = rank_candidates(
+    let mut evaluations = rank_candidates_in_context(
         route,
         position,
         &candidates,
         tracks,
-        learned_matrix,
-        config,
-        reference,
+        CandidateScoringContext {
+            learned_matrix,
+            config,
+            reference,
+            frozen_matrix,
+        },
     )
     .map_err(PreviewError::Scoring)?;
     evaluations.sort_by(|left, right| {
@@ -383,6 +397,69 @@ fn local_objective(distance_sum: f64, worst_distance: f64) -> f64 {
     distance_sum + 2.0 * worst_distance
 }
 
+fn gap_search_objective(
+    route: &[usize],
+    original_route: &[usize],
+    tracks: &[RouteTrack],
+    learned_matrix: &Array2<f32>,
+    config: &BridgeConfig,
+) -> Result<f64, PreviewError> {
+    if config.gap_context_mode == crate::bridge::GapContextMode::Rolling {
+        return route::evaluate_adaptive_sequence(
+            route,
+            tracks,
+            learned_matrix,
+            config.seed_limit,
+            config.learned_percent,
+        )
+        .map(|metrics| metrics.objective)
+        .map_err(PreviewError::RouteScoring);
+    }
+
+    let mut gap_matrices = Vec::with_capacity(original_route.len().saturating_sub(1));
+    for anchors in original_route.windows(2) {
+        let left_position = route.iter().position(|track| *track == anchors[0]).ok_or(
+            PreviewError::FinalRouteInvalid("source gap left anchor is absent"),
+        )?;
+        let right_position = route.iter().position(|track| *track == anchors[1]).ok_or(
+            PreviewError::FinalRouteInvalid("source gap right anchor is absent"),
+        )?;
+        let matrix = gap_context_matrix(route, left_position + 1, tracks, learned_matrix, config)
+            .map_err(PreviewError::Scoring)?
+            .expect("frozen gap mode always prepares a matrix");
+        gap_matrices.push((left_position, right_position, matrix));
+    }
+
+    let mut distance_sum = 0.0_f64;
+    let mut worst_distance = 0.0_f64;
+    for position in 1..route.len() {
+        let frozen_matrix = gap_matrices
+            .iter()
+            .find(|(left, right, _)| *left < position && position <= *right)
+            .map(|(_, _, matrix)| matrix);
+        let distance = match frozen_matrix {
+            Some(matrix) => crate::bridge::contextual_distance_with_matrix(
+                &route[..position],
+                route[position],
+                tracks,
+                matrix,
+                config,
+            ),
+            None => crate::bridge::contextual_distance(
+                &route[..position],
+                route[position],
+                tracks,
+                learned_matrix,
+                config,
+            ),
+        }
+        .map_err(PreviewError::Scoring)?;
+        distance_sum += distance;
+        worst_distance = worst_distance.max(distance);
+    }
+    Ok(local_objective(distance_sum, worst_distance))
+}
+
 pub fn select_automatic_bridges(
     original_route: &[usize],
     gaps: &[AutomaticGap],
@@ -416,15 +493,21 @@ pub fn select_automatic_bridges(
             && added < selection_config.max_added_tracks
             && !gap.semantics.candidates.is_empty()
         {
+            let frozen_matrix =
+                gap_context_matrix(&final_route, position, tracks, learned_matrix, config)
+                    .map_err(PreviewError::Scoring)?;
             let evaluations = rank_for_evolving_route(
                 &final_route,
                 position,
                 &gap.semantics.candidates,
-                ExactScoringContext {
-                    tracks,
-                    learned_matrix,
-                    config,
-                    reference,
+                GapRankingContext {
+                    scoring: ExactScoringContext {
+                        tracks,
+                        learned_matrix,
+                        config,
+                        reference,
+                    },
+                    frozen_matrix: frozen_matrix.as_ref(),
                 },
                 selection_config.guidance(),
                 selection_config.variation(),
@@ -585,15 +668,30 @@ fn final_exact_decisions(
                 .clone();
             let mut route_without_candidate = final_route.to_vec();
             route_without_candidate.remove(position);
+            let left_position = route_without_candidate
+                .iter()
+                .position(|track| *track == gap.left)
+                .ok_or(PreviewError::InvalidOriginalGap(gap.original_position))?;
+            let frozen_matrix = gap_context_matrix(
+                &route_without_candidate,
+                left_position + 1,
+                tracks,
+                learned_matrix,
+                config,
+            )
+            .map_err(PreviewError::Scoring)?;
             let evaluation = rank_for_evolving_route(
                 &route_without_candidate,
                 position,
                 std::slice::from_ref(&semantics),
-                ExactScoringContext {
-                    tracks,
-                    learned_matrix,
-                    config,
-                    reference,
+                GapRankingContext {
+                    scoring: ExactScoringContext {
+                        tracks,
+                        learned_matrix,
+                        config,
+                        reference,
+                    },
+                    frozen_matrix: frozen_matrix.as_ref(),
                 },
                 selection_config.guidance(),
                 selection_config.variation(),
@@ -644,18 +742,17 @@ fn select_exact_count_multi_gap_bridges(
         .len()
         .saturating_mul(selection_config.max_tracks_per_gap)
         .min(unique_candidates);
-    let initial_metrics = route::evaluate_adaptive_sequence(
+    let initial_objective = gap_search_objective(
+        original_route,
         original_route,
         tracks,
         learned_matrix,
-        config.seed_limit,
-        config.learned_percent,
-    )
-    .map_err(PreviewError::RouteScoring)?;
+        config,
+    )?;
     let mut states = vec![MultiExactState {
         route: original_route.to_vec(),
         gap_selections: Vec::with_capacity(ordered_gaps.len()),
-        objective: initial_metrics.objective,
+        objective: initial_objective,
     }];
     let mut evaluated_states = 1usize;
     let mut retained_states = 1usize;
@@ -664,6 +761,19 @@ fn select_exact_count_multi_gap_bridges(
         let batches = states
             .par_iter()
             .map(|state| {
+                let left_position = state
+                    .route
+                    .iter()
+                    .position(|track| *track == gap.left)
+                    .ok_or(PreviewError::InvalidOriginalGap(gap.original_position))?;
+                let frozen_matrix = gap_context_matrix(
+                    &state.route,
+                    left_position + 1,
+                    tracks,
+                    learned_matrix,
+                    config,
+                )
+                .map_err(PreviewError::Scoring)?;
                 let already_added = state.route.len() - original_route.len();
                 let depth_limit = selection_config
                     .requested_added_tracks
@@ -692,11 +802,14 @@ fn select_exact_count_multi_gap_bridges(
                             &variant.route,
                             position,
                             &gap.semantics.candidates,
-                            ExactScoringContext {
-                                tracks,
-                                learned_matrix,
-                                config,
-                                reference,
+                            GapRankingContext {
+                                scoring: ExactScoringContext {
+                                    tracks,
+                                    learned_matrix,
+                                    config,
+                                    reference,
+                                },
+                                frozen_matrix: frozen_matrix.as_ref(),
                             },
                             selection_config.guidance(),
                             selection_config.variation(),
@@ -711,15 +824,13 @@ fn select_exact_count_multi_gap_bridges(
                         {
                             let mut inserted = variant.clone();
                             inserted.route.insert(position, evaluation.candidate);
-                            inserted.objective = route::evaluate_adaptive_sequence(
+                            inserted.objective = gap_search_objective(
                                 &inserted.route,
+                                original_route,
                                 tracks,
                                 learned_matrix,
-                                config.seed_limit,
-                                config.learned_percent,
-                            )
-                            .map_err(PreviewError::RouteScoring)?
-                            .objective;
+                                config,
+                            )?;
                             let mut inserted_selection = selected.clone();
                             inserted_selection.push(evaluation.candidate);
                             next.push((inserted, inserted_selection, evaluation.accepted));
@@ -1412,14 +1523,13 @@ pub fn select_exact_count_bridges_with_endpoints(
                             selected: closing.clone(),
                         });
                     }
-                    let metrics = route::evaluate_adaptive_sequence(
+                    let objective = gap_search_objective(
                         &route,
+                        original_route,
                         tracks,
                         learned_matrix,
-                        config.seed_limit,
-                        config.learned_percent,
-                    )
-                    .map_err(PreviewError::RouteScoring)?;
+                        config,
+                    )?;
                     let gap_selections = ordered_gaps
                         .iter()
                         .map(|gap| {
@@ -1457,7 +1567,7 @@ pub fn select_exact_count_bridges_with_endpoints(
                         route,
                         decisions,
                         endpoint_decisions: candidate_decisions,
-                        objective: metrics.objective,
+                        objective,
                     });
                 }
             }
@@ -1548,18 +1658,17 @@ fn select_exact_count_single_gap_bridges(
     let structural_upper_bound = ordered_gaps.len().min(unique_candidates);
     let prune_unreachable_states =
         selection_config.requested_added_tracks <= structural_upper_bound;
-    let initial_metrics = route::evaluate_adaptive_sequence(
+    let initial_objective = gap_search_objective(
+        original_route,
         original_route,
         tracks,
         learned_matrix,
-        config.seed_limit,
-        config.learned_percent,
-    )
-    .map_err(PreviewError::RouteScoring)?;
+        config,
+    )?;
     let mut states = vec![ExactState {
         route: original_route.to_vec(),
         decisions: Vec::with_capacity(ordered_gaps.len()),
-        objective: initial_metrics.objective,
+        objective: initial_objective,
     }];
     let mut evaluated_states = 1usize;
     let mut retained_states = 1usize;
@@ -1592,15 +1701,21 @@ fn select_exact_count_single_gap_bridges(
                 if added < selection_config.requested_added_tracks
                     && !gap.semantics.candidates.is_empty()
                 {
+                    let frozen_matrix =
+                        gap_context_matrix(&state.route, position, tracks, learned_matrix, config)
+                            .map_err(PreviewError::Scoring)?;
                     let evaluations = rank_for_evolving_route(
                         &state.route,
                         position,
                         &gap.semantics.candidates,
-                        ExactScoringContext {
-                            tracks,
-                            learned_matrix,
-                            config,
-                            reference,
+                        GapRankingContext {
+                            scoring: ExactScoringContext {
+                                tracks,
+                                learned_matrix,
+                                config,
+                                reference,
+                            },
+                            frozen_matrix: frozen_matrix.as_ref(),
                         },
                         selection_config.guidance(),
                         selection_config.variation(),
@@ -1622,15 +1737,13 @@ fn select_exact_count_single_gap_bridges(
                         inserted.route.insert(position, evaluation.candidate);
                         local_max_added =
                             local_max_added.max(inserted.route.len() - original_route.len());
-                        inserted.objective = route::evaluate_adaptive_sequence(
+                        inserted.objective = gap_search_objective(
                             &inserted.route,
+                            original_route,
                             tracks,
                             learned_matrix,
-                            config.seed_limit,
-                            config.learned_percent,
-                        )
-                        .map_err(PreviewError::RouteScoring)?
-                        .objective;
+                            config,
+                        )?;
                         inserted.decisions.push(exact_decision(
                             gap,
                             position,
@@ -1760,6 +1873,7 @@ mod tests {
             album_window: 0,
             max_leg_percentile: 0.70,
             max_detour_percentile: 1.30,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
         };
 
         assert!(destination_route_repeat_safe(
@@ -1827,6 +1941,7 @@ mod tests {
             album_window: 1,
             max_leg_percentile: 0.70,
             max_detour_percentile: 1.30,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
         };
         let reference = build_frozen_reference(&route, &route, &tracks, &matrix, &config).unwrap();
         let gaps = [gap(1, 0, 2, 1), gap(2, 2, 4, 3)];
@@ -1897,6 +2012,7 @@ mod tests {
             album_window: 1,
             max_leg_percentile: 0.70,
             max_detour_percentile: 1.30,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
         };
         let reference = build_frozen_reference(&route, &route, &tracks, &matrix, &config).unwrap();
         let mut smooth = gap(1, 0, 2, 1);
@@ -1941,6 +2057,7 @@ mod tests {
             album_window: 1,
             max_leg_percentile: 0.70,
             max_detour_percentile: 1.30,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
         };
         let reference = build_frozen_reference(&route, &route, &tracks, &matrix, &config).unwrap();
         let gaps = [gap(1, 0, 2, 1), gap(2, 2, 4, 3)];
@@ -2020,6 +2137,7 @@ mod tests {
             album_window: 1,
             max_leg_percentile: 1.0,
             max_detour_percentile: 2.0,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
         };
         let reference =
             build_frozen_reference(&route, &[0, 1, 2, 3], &tracks, &matrix, &config).unwrap();
@@ -2126,6 +2244,7 @@ mod tests {
             album_window: 1,
             max_leg_percentile: 0.25,
             max_detour_percentile: 0.50,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
         };
         let reference =
             build_frozen_reference(&route, &[0, 1, 2, 3], &tracks, &matrix, &config).unwrap();
@@ -2191,6 +2310,7 @@ mod tests {
             album_window: 1,
             max_leg_percentile: 1.0,
             max_detour_percentile: 2.0,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
         };
         let reference =
             build_frozen_reference(&route, &[0, 1, 2, 3], &tracks, &matrix, &config).unwrap();

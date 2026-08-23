@@ -136,7 +136,10 @@ fixed starts and seeded greedy restarts are improved with reversal and relocatio
 moves. A separately searched energy-arc candidate is selected only when its
 primary objective remains within 8% and its arc error improves by at least 10%.
 The JSON artifact records both candidates, the selected strategy, hashes,
-settings, and repeat validation.
+settings, repeat validation, and scoring provenance. Provenance identifies the  
+context/seed policy, configured and effective learned shares, learned-matrix  
+availability, base matrix hash, and fallback contract so callers do not have to  
+infer the actual scoring setup from request fields alone.  
 
 Requests may include the strategy-neutral `selection` block with
 `variation_percent`, `generation_seed`, `lastfm_track_guidance_percent`, and
@@ -178,6 +181,17 @@ local candidate inventory plus the source anchors. It emits opaque row IDs bound
 to the database hash, aggregate rejection counts, and a bounded list of accepted
 candidates per gap; it exposes no library paths. Independent candidates are
 ranked deterministically with Rayon.
+Adaptive automatic and exact gap requests may set  
+`extension.gap_context_mode` to `rolling` (the compatibility default) or  
+`frozen`. Rolling recalculates the Adaptive matrix after an inserted candidate  
+enters the context. Frozen derives one matrix from the route prefix ending at  
+the original gap's left anchor and reuses it for every leg inside that source  
+gap, including native multi-track gap routes. The context mean and repeat checks  
+still evolve as tracks are inserted; only the feature-weight matrix is frozen.  
+The complete-route objective uses the same policy as candidate ranking, so a  
+rolling objective cannot silently overturn a frozen-gap decision. Static  
+requests already use one fixed matrix and therefore do not accept frozen mode.  
+
 
 Large libraries may set `extension.shortlist_limit` to bound the candidates
 that enter strict contextual bridge scoring and exact-count search. The

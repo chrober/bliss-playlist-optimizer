@@ -187,6 +187,7 @@ struct ExtensionSettings {
     allow_closing_track: Option<bool>,
     candidate_limit: Option<usize>,
     max_tracks_per_gap: Option<usize>,
+    gap_context_mode: Option<String>,
     min_added_tracks: Option<usize>,
     max_added_tracks: Option<usize>,
     trigger_percentile: Option<f64>,
@@ -377,6 +378,7 @@ struct RouteArtifact {
     primary: RouteCandidateArtifact,
     arc: RouteCandidateArtifact,
     repeat_validation: RepeatValidationArtifact,
+    scoring_provenance: ScoringProvenanceArtifact,
     #[serde(skip_serializing_if = "Option::is_none")]
     performance: Option<PerformanceArtifact>,
 }
@@ -444,8 +446,71 @@ struct BridgeAnalysisArtifact {
     provider_states: Vec<semantic::ProviderState>,
     gaps: Vec<BridgeGapArtifact>,
     selection_preview: SelectionPreviewArtifact,
+    scoring_provenance: ScoringProvenanceArtifact,
     #[serde(skip_serializing_if = "Option::is_none")]
     performance: Option<PerformanceArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScoringProvenanceArtifact {
+    context_policy: &'static str,
+    seed_policy: &'static str,
+    configured_algorithm: String,
+    configured_learned_percent: u16,
+    effective_base_learned_percent: u16,
+    learned_matrix_available: bool,
+    base_matrix_sha256: String,
+    fallback_policy: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gap_context_mode: Option<&'static str>,
+}
+
+#[derive(Clone, Copy)]
+struct ScoringProvenanceInput<'a> {
+    context_policy: &'static str,
+    seed_policy: &'static str,
+    effective_base_learned_percent: u16,
+    base_matrix_sha256: &'a str,
+    gap_context_mode: Option<&'static str>,
+}
+
+fn build_scoring_provenance(
+    request: &Request,
+    validation: &ValidationSummary,
+    input: ScoringProvenanceInput<'_>,
+) -> ScoringProvenanceArtifact {
+    let static_scoring = request.scoring.algorithm == "static";
+    ScoringProvenanceArtifact {
+        context_policy: if static_scoring {
+            "fixed-static-weight-context"
+        } else {
+            input.context_policy
+        },
+        seed_policy: if static_scoring {
+            "preceding context tracks averaged under one static matrix"
+        } else {
+            input.seed_policy
+        },
+        configured_algorithm: request.scoring.algorithm.clone(),
+        configured_learned_percent: request
+            .scoring
+            .adaptive
+            .as_ref()
+            .map_or(0, |adaptive| adaptive.learned_percent),
+        effective_base_learned_percent: if static_scoring {
+            0
+        } else {
+            input.effective_base_learned_percent
+        },
+        learned_matrix_available: validation.learned_matrix_sha256.is_some(),
+        base_matrix_sha256: input.base_matrix_sha256.to_owned(),
+        fallback_policy: if static_scoring {
+            "static feature weights are used directly; adaptive fallback is not applicable"
+        } else {
+            "two-or-more seeds use variance/blend; shorter contexts use learned matrix; absent learned matrix falls back to static weights"
+        },
+        gap_context_mode: input.gap_context_mode,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2793,6 +2858,18 @@ fn optimize_route_request_with_options(
         })
         .collect();
 
+    let scoring_provenance = build_scoring_provenance(
+        &request,
+        &validation,
+        ScoringProvenanceInput {
+            context_policy: "rolling-recent-track-context",
+            seed_policy: "up-to-seed-limit preceding selected route tracks",
+            effective_base_learned_percent: learned_percent,
+            base_matrix_sha256: &scoring_matrix_sha256,
+            gap_context_mode: None,
+        },
+    );
+
     let mut artifact = RouteArtifact {
         schema_version: 1,
         artifact_kind: "adaptive-route-v1",
@@ -2820,6 +2897,7 @@ fn optimize_route_request_with_options(
             track_window_satisfied_by_unique_membership,
             violations,
         },
+        scoring_provenance,
         performance: None,
     };
     artifact.performance = timings.finish(options.timings, overall_started, database_cache);
@@ -3222,6 +3300,11 @@ fn analyze_bridge_validated(
             bridge::DEFAULT_MAX_LEG_PERCENTILE
         },
         max_detour_percentile: bridge::DEFAULT_MAX_DETOUR_PERCENTILE,
+        gap_context_mode: match request.extension.gap_context_mode.as_deref() {
+            Some("frozen") => bridge::GapContextMode::Frozen,
+            Some("rolling") | None => bridge::GapContextMode::Rolling,
+            Some(_) => unreachable!("gap context mode was validated"),
+        },
     };
     let destination_route = request.extension.mode == "destination_route";
     let static_destination_matrix = if destination_route {
@@ -4604,6 +4687,51 @@ fn analyze_bridge_validated(
         None,
     );
 
+    let gap_context_mode = if matches!(request.extension.mode.as_str(), "automatic" | "exact_count")
+        && request.scoring.algorithm == "adaptive"
+    {
+        Some(match request.extension.gap_context_mode.as_deref() {
+            Some("frozen") => "frozen",
+            Some("rolling") | None => "rolling",
+            Some(_) => unreachable!("gap context mode was validated"),
+        })
+    } else {
+        None
+    };
+    let (context_policy, seed_policy) = match request.extension.mode.as_str() {
+        "destination_route" => (
+            "frozen-destination-route-context",
+            "recent immutable listening history plus the locked queue tail",
+        ),
+        "fixed_source_extension" => (
+            "fixed-source-relevance-then-rolling-route-context",
+            "complete immutable source set for relevance; preceding selected tracks for routing",
+        ),
+        "automatic" | "exact_count" if gap_context_mode == Some("frozen") => (
+            "frozen-per-source-gap-context",
+            "preceding route context ending at each original gap's left anchor",
+        ),
+        "automatic" | "exact_count" => (
+            "rolling-evolving-gap-context",
+            "up-to-seed-limit preceding tracks, including additions already placed",
+        ),
+        _ => (
+            "rolling-recent-track-context",
+            "up-to-seed-limit preceding tracks",
+        ),
+    };
+    let scoring_provenance = build_scoring_provenance(
+        &request,
+        &validation,
+        ScoringProvenanceInput {
+            context_policy,
+            seed_policy,
+            effective_base_learned_percent: learned_percent,
+            base_matrix_sha256: &scoring_matrix_sha256,
+            gap_context_mode,
+        },
+    );
+
     Ok(BridgeAnalysisArtifact {
         schema_version: 1,
         artifact_kind: "contextual-bridge-analysis-v1",
@@ -4656,6 +4784,7 @@ fn analyze_bridge_validated(
         provider_states: semantic_bundle.providers,
         gaps,
         selection_preview,
+        scoring_provenance,
         performance: None,
     })
 }
@@ -4862,6 +4991,26 @@ fn analyze_bridge_request_with_options(
                 request.extension.mode
             ),
         ));
+    }
+    if let Some(mode) = request.extension.gap_context_mode.as_deref() {
+        if !matches!(mode, "rolling" | "frozen") {
+            return Err(CommandFailure::new(
+                "GAP_CONTEXT_MODE_INVALID",
+                format!("unsupported extension.gap_context_mode '{mode}'"),
+            ));
+        }
+        if !matches!(request.extension.mode.as_str(), "automatic" | "exact_count") {
+            return Err(CommandFailure::new(
+                "GAP_CONTEXT_MODE_UNSUPPORTED",
+                "extension.gap_context_mode is supported only for automatic and exact_count gap additions",
+            ));
+        }
+        if request.scoring.algorithm != "adaptive" && mode == "frozen" {
+            return Err(CommandFailure::new(
+                "GAP_CONTEXT_MODE_REQUIRES_ADAPTIVE",
+                "frozen gap context requires adaptive scoring",
+            ));
+        }
     }
     if request.extension.max_tracks_per_gap.is_some() && request.extension.mode != "exact_count" {
         return Err(CommandFailure::new(

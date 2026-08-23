@@ -16,6 +16,10 @@ impl PreparedAdaptiveContext {
     pub fn distance_to(&self, candidate: &FeatureVector) -> f64 {
         f64::from(adaptive_distance(&self.mean, candidate, &self.matrix))
     }
+
+    pub fn matrix(&self) -> &Array2<f32> {
+        &self.matrix
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +53,18 @@ pub fn adaptive_distance_from_seeds(
     learned_percent: u16,
 ) -> Result<f64, ContextualError> {
     Ok(prepare_adaptive_context(seeds, learned_matrix, learned_percent)?.distance_to(candidate))
+}
+
+pub fn adaptive_distance_with_matrix(
+    seeds: &[FeatureVector],
+    candidate: &FeatureVector,
+    matrix: &Array2<f32>,
+) -> Result<f64, ContextualError> {
+    if seeds.is_empty() {
+        return Err(ContextualError::EmptySeeds);
+    }
+    let mean = mean_feature_vector(seeds).ok_or(ContextualError::EmptySeeds)?;
+    Ok(f64::from(adaptive_distance(&mean, candidate, matrix)))
 }
 
 pub fn prepare_adaptive_context(
