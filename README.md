@@ -6,7 +6,8 @@ It turns a frozen playlist request, Bliss feature database, repeat rules, the
 optional learned similarity matrix, and optional semantic evidence into an
 auditable proposed route. It can reorder fixed membership, analyze and select
 bridge tracks, preserve source anchors, extend a fixed source set to an exact
-target, or build a destination-locked route from a live queue tail.
+target, build a destination-locked one-way route, or build a two-leg excursion
+through a mandatory waypoint and back to a locked queue rejoin.
 
 The native engine is needed because scoring tens of thousands of analyzed
 tracks and searching many contextual routes is computational work that does not
@@ -267,12 +268,27 @@ destination and therefore remains unique route membership. Optional
 `history_tracks` is ordered, immutable listening history preceding the start;
 it may contain repeats or overlap route identities because it is never emitted
 as part of the result. It supplies acoustic and repeat context, while repeat
-windows constrain only newly generated intermediates. Only the final gap is
-extended. `destination_mode=exact` requires exactly `additional_track_count`
+windows constrain only newly generated intermediates. Without a rejoin anchor,
+only the final gap is extended. `destination_mode=exact` requires exactly `additional_track_count`
 intermediates and remains all-or-nothing. Automatic accepts optional
 `min_added_tracks` and required `max_added_tracks` bounds from zero through
 eight; the minimum must not exceed the maximum. A minimum of zero permits the
-direct destination. Exact counts are also bounded from zero through eight.
+direct destination. Exact counts are also bounded from zero through eight.  
+
+An optional `route.rejoin_track_id` turns the same request into a three-anchor
+queue excursion: locked start, mandatory destination waypoint, and locked
+rejoin track must be the final three `source_tracks` in that order. The total
+intermediate-track budget is shared across both gaps. The optimizer carries
+each retained outward path into the return search, so generated membership,
+artist/album/track repeat windows, and the fixed waypoint constrain the complete
+`start -> waypoint -> rejoin` route. It ranks complete routes by their worst
+adjacent transition and then their total distance; Automatic compares the full
+two-leg baseline and result against the same quality target and cautious-model
+consensus used by ordinary destination routing. The rejoin anchor remains in
+the result so a caller can verify it and omit it from a non-destructive queue
+insertion. Independent return searches for retained outward bridge-count
+allocations run in parallel, after which deterministic complete-route ranking
+selects one result per total bridge count.  
 
 Destination routes use a dedicated fixed-matrix layered path search rather than  
 the generic contextual gap-insertion search. Static requests govern that search  
@@ -340,8 +356,9 @@ bounded shortlist derived from the original destination gap; depth-specific
 full-library candidate expansion remains a possible later quality enhancement.  
 
 Every feasible destination result publishes `selection_preview.route_quality`.  
-It covers only the requested path from the captured queue tail through generated  
-intermediates to the destination, not unrelated earlier context edges. Each  
+It covers only the requested path from the captured start through generated  
+intermediates to the destination and, when present, onward to the locked rejoin;  
+it does not include unrelated earlier context edges. Each  
 actual neighboring edge uses `fixed-matrix-adjacent-distance` and a matching  
 `source-relative-local-library-percentile`; the artifact identifies the  
 governing Adaptive-context or Static role and SHA-256, adjacent-distance sum,  

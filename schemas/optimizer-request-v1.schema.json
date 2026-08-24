@@ -124,6 +124,7 @@
         },
         "start_track_id": { "type": "string" },
         "destination_track_id": { "type": "string" },
+        "rejoin_track_id": { "type": "string" },
         "search": {
           "type": "object",
           "additionalProperties": false,
@@ -305,7 +306,8 @@
             "not": {
               "anyOf": [
                 { "required": ["start_track_id"] },
-                { "required": ["destination_track_id"] }
+                { "required": ["destination_track_id"] },
+                { "required": ["rejoin_track_id"] }
               ]
             },
             "properties": {

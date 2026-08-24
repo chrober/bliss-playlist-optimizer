@@ -256,6 +256,10 @@ fn destination_route_requires_locked_endpoints_and_exact_count_when_requested() 
         Value::Array(vec![history_track.clone(), history_track]);
     assert!(validator.is_valid(&with_repeated_history));
 
+    let mut with_rejoin = request.clone();
+    with_rejoin["route"]["rejoin_track_id"] = with_rejoin["source_tracks"][0]["id"].clone();
+    assert!(validator.is_valid(&with_rejoin));
+
     let mut non_destination_with_history = with_repeated_history.clone();
     non_destination_with_history["extension"] = serde_json::json!({"mode": "none"});
     non_destination_with_history["route"]["ordering_policy"] =
@@ -268,6 +272,8 @@ fn destination_route_requires_locked_endpoints_and_exact_count_when_requested() 
         .as_object_mut()
         .unwrap()
         .remove("destination_track_id");
+    non_destination_with_history["route"]["rejoin_track_id"] =
+        non_destination_with_history["source_tracks"][0]["id"].clone();
     assert!(!validator.is_valid(&non_destination_with_history));
 
     request["extension"]["search_effort"] = Value::String("fast".to_owned());

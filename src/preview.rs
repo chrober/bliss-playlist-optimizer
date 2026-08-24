@@ -1237,6 +1237,179 @@ where
     }
     Ok(options)
 }
+
+/// Searches an excursion through one mandatory waypoint and back to a locked
+/// rejoin anchor. The bridge budget is shared across both adjacent gaps.
+/// Each outward option is carried into the return search so uniqueness and
+/// repeat windows constrain the complete audible route.
+pub fn select_destination_waypoint_routes<F>(
+    original_route: &[usize],
+    gaps: &[AutomaticGap],
+    max_added_tracks: usize,
+    selection_config: &ExactSelectionConfig,
+    repeat: DestinationRepeatContext<'_>,
+    scoring: ExactScoringContext<'_>,
+    adjacent_distance: F,
+) -> Result<Vec<DestinationRouteOption>, PreviewError>
+where
+    F: Fn(usize, usize) -> f64 + Sync + Copy,
+{
+    if original_route.len() < 3 || gaps.len() != 2 {
+        return Err(PreviewError::FinalRouteInvalid(
+            "waypoint destination search requires two locked adjacent gaps",
+        ));
+    }
+    let start_position = original_route.len() - 3;
+    let start = original_route[start_position];
+    let waypoint = original_route[start_position + 1];
+    let rejoin = original_route[start_position + 2];
+    if gaps[0].left != start
+        || gaps[0].right != waypoint
+        || gaps[1].left != waypoint
+        || gaps[1].right != rejoin
+    {
+        return Err(PreviewError::FinalRouteInvalid(
+            "waypoint destination gaps do not match start, waypoint, and rejoin anchors",
+        ));
+    }
+    if max_added_tracks > MAX_EXACT_TRACKS_PER_GAP {
+        return Err(PreviewError::InvalidExactConfig(
+            "waypoint bridge budget exceeds the supported total limit",
+        ));
+    }
+
+    let outward_source = &original_route[..original_route.len() - 1];
+    let outward_options = select_destination_bridge_routes(
+        outward_source,
+        &gaps[0],
+        max_added_tracks,
+        selection_config,
+        repeat,
+        scoring,
+        adjacent_distance,
+    )?;
+    let option_groups = outward_options
+        .into_par_iter()
+        .map(
+            |outward| -> Result<Vec<DestinationRouteOption>, PreviewError> {
+                let outward_route = outward
+                    .selection
+                    .final_route
+                    .as_ref()
+                    .expect("destination options always contain a route");
+                let outward_count = outward.added_track_count;
+                let mut return_source = outward_route.clone();
+                return_source.push(rejoin);
+                let remaining = max_added_tracks.saturating_sub(outward_count);
+                let return_options = select_destination_bridge_routes(
+                    &return_source,
+                    &gaps[1],
+                    remaining,
+                    selection_config,
+                    repeat,
+                    scoring,
+                    adjacent_distance,
+                )?;
+
+                let mut combined = Vec::with_capacity(return_options.len());
+                for returning in return_options {
+                    let total = outward_count + returning.added_track_count;
+                    let final_route = returning
+                        .selection
+                        .final_route
+                        .as_ref()
+                        .expect("destination options always contain a route")
+                        .clone();
+                    let waypoint_position = final_route
+                        .iter()
+                        .position(|track| *track == waypoint)
+                        .expect("the mandatory waypoint remains in the route");
+                    let rejoin_position = final_route
+                        .iter()
+                        .position(|track| *track == rejoin)
+                        .expect("the rejoin anchor remains in the route");
+                    let route_start = final_route
+                        .iter()
+                        .position(|track| *track == start)
+                        .expect("the start anchor remains in the route");
+                    let outward_bridges = final_route[route_start + 1..waypoint_position].to_vec();
+                    let return_bridges =
+                        final_route[waypoint_position + 1..rejoin_position].to_vec();
+                    let decisions = final_exact_decisions(
+                        &final_route,
+                        gaps,
+                        &[outward_bridges, return_bridges],
+                        scoring,
+                        selection_config,
+                    )?;
+                    let (transition_sum, worst_transition) = final_route
+                        [route_start..=rejoin_position]
+                        .windows(2)
+                        .map(|edge| adjacent_distance(edge[0], edge[1]))
+                        .fold((0.0_f64, 0.0_f64), |(sum, worst), distance| {
+                            (sum + distance, worst.max(distance))
+                        });
+                    let option = DestinationRouteOption {
+                        added_track_count: total,
+                        selection: ExactSelection {
+                            requested_added_tracks: total,
+                            final_route: Some(final_route),
+                            decisions,
+                            endpoint_decisions: Vec::new(),
+                            stats: ExactSearchStats {
+                                max_tracks_per_gap: max_added_tracks.max(1),
+                                evaluated_states: outward
+                                    .selection
+                                    .stats
+                                    .evaluated_states
+                                    .saturating_add(returning.selection.stats.evaluated_states),
+                                retained_states: outward
+                                    .selection
+                                    .stats
+                                    .retained_states
+                                    .saturating_add(returning.selection.stats.retained_states),
+                                maximum_additions_found: total,
+                                structural_upper_bound: max_added_tracks,
+                            },
+                        },
+                        adjacent_transition_sum: transition_sum,
+                        adjacent_worst_transition: worst_transition,
+                    };
+                    combined.push(option);
+                }
+                Ok(combined)
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut best_by_count = BTreeMap::<usize, DestinationRouteOption>::new();
+    for option in option_groups.into_iter().flatten() {
+        let total = option.added_track_count;
+        let replace = best_by_count.get(&total).is_none_or(|current| {
+            option
+                .adjacent_worst_transition
+                .total_cmp(&current.adjacent_worst_transition)
+                .then_with(|| {
+                    option
+                        .adjacent_transition_sum
+                        .total_cmp(&current.adjacent_transition_sum)
+                })
+                .then_with(|| {
+                    option
+                        .selection
+                        .final_route
+                        .as_ref()
+                        .cmp(&current.selection.final_route.as_ref())
+                })
+                .is_lt()
+        });
+        if replace {
+            best_by_count.insert(total, option);
+        }
+    }
+
+    Ok(best_by_count.into_values().collect())
+}
 pub fn select_exact_count_bridges(
     original_route: &[usize],
     gaps: &[AutomaticGap],
