@@ -211,6 +211,49 @@ struct ValidationSummary {
     source_track_count: usize,
 }
 
+fn aggregate_destination_option_stats(
+    options: &[preview::DestinationRouteOption],
+    max_tracks_per_gap: usize,
+) -> preview::ExactSearchStats {
+    preview::ExactSearchStats {
+        max_tracks_per_gap: max_tracks_per_gap.max(1),
+        evaluated_states: options
+            .iter()
+            .map(|option| option.selection.stats.evaluated_states)
+            .sum::<usize>()
+            .max(1),
+        retained_states: options
+            .iter()
+            .map(|option| option.selection.stats.retained_states)
+            .sum::<usize>()
+            .max(1),
+        maximum_additions_found: options
+            .iter()
+            .map(|option| option.selection.stats.maximum_additions_found)
+            .max()
+            .unwrap_or(0),
+        structural_upper_bound: options
+            .first()
+            .map(|option| option.selection.stats.structural_upper_bound)
+            .unwrap_or(0),
+    }
+}
+
+fn destination_route_outcome_reason(
+    cautious_consensus: bool,
+    selected_added_count: usize,
+    searched_maximum: usize,
+    quality_target_met: bool,
+) -> Option<&'static str> {
+    if cautious_consensus && selected_added_count == 0 && searched_maximum > 0 {
+        Some("no-beneficial-bridge-over-direct")
+    } else if !quality_target_met {
+        Some("quality-target-not-reached")
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ScoringArtifact {
     schema_version: u8,
@@ -4209,6 +4252,7 @@ fn analyze_bridge_validated(
                         Some(maximum),
                     );
                     let options = search_destination(maximum)?;
+                    let aggregate_stats = aggregate_destination_option_stats(&options, maximum);
                     let searched_direct = options
                         .iter()
                         .find(|option| option.added_track_count == 0)
@@ -4266,16 +4310,17 @@ fn analyze_bridge_validated(
                         )
                     })?;
                     let met = quality.worst_percentile <= threshold;
-                    let best_effort_reason = (!met).then_some(
-                        if cautious_consensus && option.added_track_count == 0 && maximum > 0 {
-                            "no-beneficial-bridge-over-direct"
-                        } else {
-                            "quality-target-not-reached"
-                        },
+                    let best_effort_reason = destination_route_outcome_reason(
+                        cautious_consensus,
+                        option.added_track_count,
+                        maximum,
+                        met,
                     );
+                    let mut selection = option.selection;
+                    selection.stats = aggregate_stats;
                     (
                         option.added_track_count,
-                        option.selection,
+                        selection,
                         Some(met),
                         Some(quality.worst_percentile),
                         Some(!met),
@@ -4307,15 +4352,6 @@ fn analyze_bridge_validated(
                         Some(quality),
                     )
                 } else {
-                    let maximum_additions_found = options
-                        .iter()
-                        .map(|option| option.added_track_count)
-                        .max()
-                        .unwrap_or(0);
-                    let structural_upper_bound = options
-                        .first()
-                        .map(|option| option.selection.stats.structural_upper_bound)
-                        .unwrap_or(0);
                     (
                         requested_added_tracks,
                         preview::ExactSelection {
@@ -4323,21 +4359,10 @@ fn analyze_bridge_validated(
                             final_route: None,
                             decisions: Vec::new(),
                             endpoint_decisions: Vec::new(),
-                            stats: preview::ExactSearchStats {
-                                max_tracks_per_gap: requested_added_tracks.max(1),
-                                evaluated_states: options
-                                    .iter()
-                                    .map(|option| option.selection.stats.evaluated_states)
-                                    .sum::<usize>()
-                                    .max(1),
-                                retained_states: options
-                                    .iter()
-                                    .map(|option| option.selection.stats.retained_states)
-                                    .sum::<usize>()
-                                    .max(1),
-                                maximum_additions_found,
-                                structural_upper_bound,
-                            },
+                            stats: aggregate_destination_option_stats(
+                                &options,
+                                requested_added_tracks,
+                            ),
                         },
                         None,
                         None,
@@ -5460,6 +5485,55 @@ mod tests {
             0,
             &direct,
         ));
+    }
+
+    #[test]
+    fn destination_route_reports_searched_direct_retention_even_when_target_is_met() {
+        assert_eq!(
+            destination_route_outcome_reason(true, 0, 4, true),
+            Some("no-beneficial-bridge-over-direct"),
+            "cautious search may retain the direct route even when the quality target is met",
+        );
+        assert_eq!(
+            destination_route_outcome_reason(true, 0, 4, false),
+            Some("no-beneficial-bridge-over-direct"),
+            "direct best-effort fallback keeps the same explicit reason",
+        );
+        assert_eq!(
+            destination_route_outcome_reason(false, 0, 4, false),
+            Some("quality-target-not-reached"),
+        );
+        assert_eq!(destination_route_outcome_reason(true, 1, 4, true), None);
+    }
+
+    #[test]
+    fn destination_route_search_stats_are_aggregated_across_options() {
+        let option = |added_track_count, evaluated_states, retained_states| {
+            preview::DestinationRouteOption {
+                added_track_count,
+                selection: preview::ExactSelection {
+                    requested_added_tracks: added_track_count,
+                    final_route: None,
+                    decisions: Vec::new(),
+                    endpoint_decisions: Vec::new(),
+                    stats: preview::ExactSearchStats {
+                        max_tracks_per_gap: 4,
+                        evaluated_states,
+                        retained_states,
+                        maximum_additions_found: added_track_count,
+                        structural_upper_bound: 7,
+                    },
+                },
+                adjacent_transition_sum: 0.0,
+                adjacent_worst_transition: 0.0,
+            }
+        };
+        let stats = aggregate_destination_option_stats(&[option(0, 1, 1), option(2, 18, 5)], 4);
+        assert_eq!(stats.max_tracks_per_gap, 4);
+        assert_eq!(stats.evaluated_states, 19);
+        assert_eq!(stats.retained_states, 6);
+        assert_eq!(stats.maximum_additions_found, 2);
+        assert_eq!(stats.structural_upper_bound, 7);
     }
 
     #[test]
