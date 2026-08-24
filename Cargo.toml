@@ -1,6 +1,6 @@
 [package]
 name = "bliss-playlist-optimizer"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Deterministic playlist optimization built on bliss similarity"
