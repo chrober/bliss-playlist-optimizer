@@ -414,6 +414,12 @@
         "quality_target_met": { "type": "boolean" },
         "achieved_max_leg_percentile": { "type": "number", "minimum": 0 },
         "best_effort": { "type": "boolean" },
+        "best_effort_reason": {
+          "enum": [
+            "quality-target-not-reached",
+            "no-beneficial-bridge-over-direct"
+          ]
+        },
         "history_track_ids": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 }

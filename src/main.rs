@@ -310,6 +310,7 @@ impl DestinationMatrixRole {
 }
 
 const DESTINATION_MODEL_DISAGREEMENT_THRESHOLD: f64 = 0.25;
+const DESTINATION_BEST_EFFORT_MINIMUM_IMPROVEMENT: f64 = 0.01;
 
 fn destination_model_disagreement(
     governing_percentile: f64,
@@ -325,11 +326,55 @@ fn cautious_disagreement_trigger(caution: &str, disagreement: f64) -> bool {
     caution == "cautious" && disagreement >= DESTINATION_MODEL_DISAGREEMENT_THRESHOLD
 }
 
+fn destination_bridge_meaningfully_improves_direct(
+    direct_worst_percentile: f64,
+    bridge_worst_percentile: f64,
+) -> bool {
+    bridge_worst_percentile <= direct_worst_percentile - DESTINATION_BEST_EFFORT_MINIMUM_IMPROVEMENT
+}
+
 #[derive(Clone, Debug)]
 struct DestinationConsensusQuality {
     governing: AdjacentRouteQuality,
     worst_percentile: f64,
     percentile_sum: f64,
+}
+
+fn destination_best_effort_candidate_is_better(
+    cautious_consensus: bool,
+    candidate_count: usize,
+    candidate: &DestinationConsensusQuality,
+    incumbent_count: usize,
+    incumbent: &DestinationConsensusQuality,
+) -> bool {
+    if cautious_consensus
+        && incumbent_count == 0
+        && candidate_count > 0
+        && !destination_bridge_meaningfully_improves_direct(
+            incumbent.worst_percentile,
+            candidate.worst_percentile,
+        )
+    {
+        return false;
+    }
+    candidate
+        .worst_percentile
+        .total_cmp(&incumbent.worst_percentile)
+        .is_lt()
+        || (candidate.worst_percentile == incumbent.worst_percentile
+            && (candidate
+                .percentile_sum
+                .total_cmp(&incumbent.percentile_sum)
+                .is_lt()
+                || (candidate.percentile_sum == incumbent.percentile_sum
+                    && (candidate
+                        .governing
+                        .worst_transition
+                        .total_cmp(&incumbent.governing.worst_transition)
+                        .is_lt()
+                        || (candidate.governing.worst_transition
+                            == incumbent.governing.worst_transition
+                            && candidate_count < incumbent_count)))))
 }
 
 #[derive(Debug, Serialize)]
@@ -743,6 +788,8 @@ struct ExactSelectionArtifact {
     achieved_max_leg_percentile: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     best_effort: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_effort_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     route_quality: Option<DestinationRouteQualityArtifact>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -4115,6 +4162,7 @@ fn analyze_bridge_validated(
                 quality_target_met,
                 achieved_max_leg_percentile,
                 best_effort,
+                best_effort_reason,
                 route_quality,
             ) = if destination_automatic {
                 let threshold = trigger_percentile
@@ -4132,6 +4180,7 @@ fn analyze_bridge_validated(
                     .as_deref()
                     .expect("the direct destination option is feasible");
                 let direct_quality = evaluate_consensus(direct_route)?;
+                let cautious_consensus = direct_caution == "cautious";
                 let disagreement_triggered = destination_distance_selection
                     .as_ref()
                     .expect("destination routes have direct model evidence")
@@ -4147,6 +4196,7 @@ fn analyze_bridge_validated(
                         Some(true),
                         Some(direct_quality.worst_percentile),
                         Some(false),
+                        None,
                         Some(direct_quality.governing),
                     )
                 } else {
@@ -4159,9 +4209,13 @@ fn analyze_bridge_validated(
                         Some(maximum),
                     );
                     let options = search_destination(maximum)?;
+                    let searched_direct = options
+                        .iter()
+                        .find(|option| option.added_track_count == 0)
+                        .cloned()
+                        .unwrap_or(direct_selection);
                     let mut qualifying = None;
-                    let mut fallback = (minimum == 0 && (!disagreement_triggered || maximum == 0))
-                        .then_some((direct_selection, direct_quality));
+                    let mut fallback = (minimum == 0).then_some((searched_direct, direct_quality));
                     for option in options
                         .into_iter()
                         .filter(|option| option.added_track_count >= minimum.max(1))
@@ -4188,30 +4242,13 @@ fn analyze_bridge_validated(
                                 preview::DestinationRouteOption,
                                 DestinationConsensusQuality,
                             )| {
-                                quality
-                                    .worst_percentile
-                                    .total_cmp(&best_quality.worst_percentile)
-                                    .is_lt()
-                                    || (quality.worst_percentile == best_quality.worst_percentile
-                                        && (quality
-                                            .percentile_sum
-                                            .total_cmp(&best_quality.percentile_sum)
-                                            .is_lt()
-                                            || (quality.percentile_sum
-                                                == best_quality.percentile_sum
-                                                && (quality
-                                                    .governing
-                                                    .worst_transition
-                                                    .total_cmp(
-                                                        &best_quality.governing.worst_transition,
-                                                    )
-                                                    .is_lt()
-                                                    || (quality.governing.worst_transition
-                                                        == best_quality
-                                                            .governing
-                                                            .worst_transition
-                                                        && option.added_track_count
-                                                            < best_option.added_track_count)))))
+                                destination_best_effort_candidate_is_better(
+                                    cautious_consensus,
+                                    option.added_track_count,
+                                    &quality,
+                                    best_option.added_track_count,
+                                    best_quality,
+                                )
                             },
                         );
                         if replace_fallback {
@@ -4229,12 +4266,20 @@ fn analyze_bridge_validated(
                         )
                     })?;
                     let met = quality.worst_percentile <= threshold;
+                    let best_effort_reason = (!met).then_some(
+                        if cautious_consensus && option.added_track_count == 0 && maximum > 0 {
+                            "no-beneficial-bridge-over-direct"
+                        } else {
+                            "quality-target-not-reached"
+                        },
+                    );
                     (
                         option.added_track_count,
                         option.selection,
                         Some(met),
                         Some(quality.worst_percentile),
                         Some(!met),
+                        best_effort_reason,
                         Some(quality.governing),
                     )
                 }
@@ -4255,6 +4300,7 @@ fn analyze_bridge_validated(
                     (
                         requested_added_tracks,
                         option.selection,
+                        None,
                         None,
                         None,
                         None,
@@ -4297,12 +4343,14 @@ fn analyze_bridge_validated(
                         None,
                         None,
                         None,
+                        None,
                     )
                 }
             } else {
                 (
                     requested_added_tracks,
                     select_count(requested_added_tracks, &bridge_config)?,
+                    None,
                     None,
                     None,
                     None,
@@ -4518,6 +4566,7 @@ fn analyze_bridge_validated(
                 quality_target_met,
                 achieved_max_leg_percentile,
                 best_effort,
+                best_effort_reason,
                 route_quality,
                 history_track_ids: if destination_route {
                     request
@@ -5367,6 +5416,53 @@ mod tests {
     }
 
     #[test]
+    fn destination_best_effort_requires_a_meaningful_direct_improvement() {
+        let quality = |worst_percentile: f64, percentile_sum: f64, worst_transition: f64| {
+            DestinationConsensusQuality {
+                governing: AdjacentRouteQuality {
+                    legs: Vec::new(),
+                    transition_sum: worst_transition,
+                    worst_transition,
+                    worst_percentile,
+                },
+                worst_percentile,
+                percentile_sum,
+            }
+        };
+        let direct = quality(0.90, 1.40, 9.0);
+        let marginal_bridge = quality(0.895, 1.20, 8.0);
+        let useful_bridge = quality(0.88, 1.30, 8.5);
+
+        assert!(!destination_bridge_meaningfully_improves_direct(
+            0.90, 0.895
+        ));
+        assert!(destination_bridge_meaningfully_improves_direct(0.90, 0.89));
+        assert!(destination_bridge_meaningfully_improves_direct(0.90, 0.75));
+        assert!(!destination_bridge_meaningfully_improves_direct(0.40, 0.45));
+        assert!(!destination_best_effort_candidate_is_better(
+            true,
+            1,
+            &marginal_bridge,
+            0,
+            &direct,
+        ));
+        assert!(destination_best_effort_candidate_is_better(
+            false,
+            1,
+            &marginal_bridge,
+            0,
+            &direct,
+        ));
+        assert!(destination_best_effort_candidate_is_better(
+            true,
+            2,
+            &useful_bridge,
+            0,
+            &direct,
+        ));
+    }
+
+    #[test]
     fn usage_mentions_the_supported_commands() {
         assert!(usage().contains("version"));
         assert!(usage().contains("validate"));
@@ -5682,6 +5778,10 @@ mod tests {
         assert_eq!(direct_preview.added_track_count, 0);
         assert_eq!(direct_preview.quality_target_met, Some(false));
         assert_eq!(direct_preview.best_effort, Some(true));
+        assert_eq!(
+            direct_preview.best_effort_reason,
+            Some("quality-target-not-reached")
+        );
         let direct_quality = direct_preview.route_quality.as_ref().unwrap();
         assert_eq!(
             direct_preview.achieved_max_leg_percentile,
@@ -5745,6 +5845,7 @@ mod tests {
         assert!(secondary.adjacent_worst_percentile.is_finite());
         assert_eq!(preview.quality_target_met, Some(true));
         assert_eq!(preview.best_effort, Some(false));
+        assert_eq!(preview.best_effort_reason, None);
         assert_eq!(preview.search.search_effort, Some("balanced"));
         assert_eq!(preview.search.beam_width, 64);
         assert_eq!(

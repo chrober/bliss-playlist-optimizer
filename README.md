@@ -298,11 +298,14 @@ model meets the target. Cautious additionally measures distinct available Static
 and learned-only views. A direct-edge disagreement of at least 25 percentile  
 points between the governing matrix and any secondary view is a reason to search.  
 Every candidate path is then measured under all distinct available views, and  
-its worst model controls target acceptance and best-effort ranking. When  
-disagreement triggered the search and the bridge budget is non-zero, a direct  
-fallback is not silently selected if any repeat-safe bridge route exists. Exact-  
-count routing already expresses the required bridge count and therefore rejects  
-this automatic-only option.  
+its worst model controls target acceptance and best-effort ranking. In every  
+Cautious search where zero intermediates are permitted, the direct route remains  
+the best-effort baseline: a bridge route that misses the target replaces it only  
+when the cautious worst-model percentile improves by at least one percentage  
+point. Otherwise the  
+artifact retains the direct route and reports  
+`best_effort_reason=no-beneficial-bridge-over-direct`. A positive minimum and  
+exact-count routing remain explicit requests for intermediates.  
 
 The search builds complete paths for the  
 permitted intermediate counts and ranks them by worst adjacent Bliss distance,  
@@ -311,7 +314,8 @@ lower bound based on the remaining endpoint distance keeps the beam focused
 without repeatedly rescoring the full library. Automatic returns the shortest  
 permitted path whose measured adjacent percentiles meet `trigger_percentile`;  
 if none qualifies, it returns the lowest-bottleneck repeat-safe best effort  
-within the configured minimum and maximum. Exact uses  
+within the configured minimum and maximum, subject to the direct-baseline rule  
+above. Exact uses  
 the same path objective for precisely `additional_track_count` intermediates.  
 
 `extension.search_effort` controls bounded search breadth independently from  
