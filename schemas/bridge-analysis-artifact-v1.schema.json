@@ -51,6 +51,27 @@
     "local_candidate_track_count": { "type": "integer", "minimum": 0 },
     "non_local_candidate_excluded_count": { "type": "integer", "minimum": 0 },
     "eligible_candidate_count": { "type": "integer", "minimum": 0 },
+    "genre_filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "restrict_genres", "exclude_christmas", "match_all_genres",
+        "use_track_genre", "configured_group_count",
+        "reference_track_count", "acceptable_genre_count",
+        "genre_excluded_count", "christmas_excluded_count"
+      ],
+      "properties": {
+        "restrict_genres": { "type": "boolean" },
+        "exclude_christmas": { "type": "boolean" },
+        "match_all_genres": { "type": "boolean" },
+        "use_track_genre": { "type": "boolean" },
+        "configured_group_count": { "type": "integer", "minimum": 0 },
+        "reference_track_count": { "type": "integer", "minimum": 2 },
+        "acceptable_genre_count": { "type": "integer", "minimum": 0 },
+        "genre_excluded_count": { "type": "integer", "minimum": 0 },
+        "christmas_excluded_count": { "type": "integer", "minimum": 0 }
+      }
+    },
     "frozen_reference_count": { "type": "integer", "minimum": 1 },
     "trigger_percentile": {
       "anyOf": [

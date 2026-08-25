@@ -24,6 +24,18 @@ scoring, selection, routing, and diagnostic artifacts. The user-facing playlist
 modes and options are described in the plugin's
 [strategy guide](https://github.com/chrober/lms-better-call-bliss/blob/main/ALGORITHMS.md).
 
+Track-adding requests may also carry a `candidate_policy.genre` snapshot from
+BlissMixer. The optimizer applies that policy once at its shared eligible-library
+boundary, before any extension, gap, destination-route, or round-trip search can
+select generated tracks. Genre groups, glob patterns, match-all behavior,
+per-track genre matching, and the seasonal Christmas exclusion follow the shared
+`bliss-mixer-core` implementation. Source tracks and immutable recent listening
+history supply the acceptable genre groups, as seed and previous tracks do in
+BlissMixer. Existing source/history tracks, mandatory destinations, and locked
+queue-rejoin tracks remain valid anchors even when their genres would exclude
+them as newly generated candidates. The result records separate ordinary-genre
+and Christmas rejection counts.
+
 The current read-only contract slice exposes:
 
 ```text

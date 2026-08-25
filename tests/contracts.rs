@@ -228,6 +228,37 @@ fn automatic_request_requires_a_budget_and_trigger() {
 }
 
 #[test]
+fn candidate_genre_policy_is_typed_and_closed() {
+    let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut request = read_json(&repository_path(
+        "fixtures/synthetic/automatic-preview-request.json",
+    ));
+    request["candidate_policy"] = serde_json::json!({
+        "genre": {
+            "restrict_genres": true,
+            "exclude_christmas": true,
+            "genre_groups": [["Rock", "Hard Rock"], ["Jazz*"]],
+            "match_all_genres": false,
+            "use_track_genre": true
+        }
+    });
+    assert!(validator.is_valid(&request));
+
+    let mut string_boolean = request.clone();
+    string_boolean["candidate_policy"]["genre"]["exclude_christmas"] =
+        Value::String("1".to_owned());
+    assert!(!validator.is_valid(&string_boolean));
+
+    let mut empty_group = request.clone();
+    empty_group["candidate_policy"]["genre"]["genre_groups"] = serde_json::json!([[]]);
+    assert!(!validator.is_valid(&empty_group));
+
+    request["candidate_policy"]["genre"]["unknown_setting"] = Value::Bool(true);
+    assert!(!validator.is_valid(&request));
+}
+
+#[test]
 fn destination_route_requires_locked_endpoints_and_exact_count_when_requested() {
     let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
     let validator = jsonschema::validator_for(&schema).unwrap();

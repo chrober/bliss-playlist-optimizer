@@ -111,6 +111,40 @@
         }
       }
     },
+    "candidate_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "genre": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "restrict_genres",
+            "exclude_christmas",
+            "genre_groups",
+            "match_all_genres",
+            "use_track_genre"
+          ],
+          "properties": {
+            "restrict_genres": { "type": "boolean" },
+            "exclude_christmas": {
+              "type": "boolean",
+              "description": "Effective captured Christmas exclusion. Callers disable it for requests started in December."
+            },
+            "genre_groups": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              }
+            },
+            "match_all_genres": { "type": "boolean" },
+            "use_track_genre": { "type": "boolean" }
+          }
+        }
+      }
+    },
     "route": {
       "type": "object",
       "additionalProperties": false,

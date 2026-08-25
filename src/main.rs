@@ -35,9 +35,9 @@ const LOCAL_CANDIDATE_INVENTORY_SCHEMA: &str =
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 const EXACT_COUNT_BEAM_WIDTH: usize = 64;
 const SEMANTIC_SHORTLIST_RESERVE: usize = 32;
-const LIBRARY_CACHE_VERSION: u8 = 2;
+const LIBRARY_CACHE_VERSION: u8 = 3;
 const MAX_LIBRARY_CACHE_BYTES: u64 = 512 * 1024 * 1024;
-const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v2\n";
+const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v3\n";
 #[derive(Clone, Copy)]
 struct DestinationSearchEffort {
     name: &'static str,
@@ -79,10 +79,32 @@ struct Request {
     scoring: Scoring,
     #[serde(default)]
     selection: SelectionSettings,
+    #[serde(default)]
+    candidate_policy: CandidatePolicySettings,
     route: RouteSettings,
     repeat_windows: RepeatWindows,
     extension: ExtensionSettings,
     semantic_evidence: Artifact,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct CandidatePolicySettings {
+    #[serde(default)]
+    genre: GenrePolicySettings,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct GenrePolicySettings {
+    #[serde(default)]
+    restrict_genres: bool,
+    #[serde(default)]
+    exclude_christmas: bool,
+    #[serde(default)]
+    genre_groups: Vec<Vec<String>>,
+    #[serde(default)]
+    match_all_genres: bool,
+    #[serde(default)]
+    use_track_genre: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -526,6 +548,8 @@ struct BridgeAnalysisArtifact {
     #[serde(skip_serializing_if = "Option::is_none")]
     non_local_candidate_excluded_count: Option<usize>,
     eligible_candidate_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    genre_filter: Option<GenreFilterArtifact>,
     frozen_reference_count: usize,
     trigger_percentile: Option<f64>,
     max_leg_percentile: f64,
@@ -538,6 +562,90 @@ struct BridgeAnalysisArtifact {
     scoring_provenance: ScoringProvenanceArtifact,
     #[serde(skip_serializing_if = "Option::is_none")]
     performance: Option<PerformanceArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct GenreFilterArtifact {
+    restrict_genres: bool,
+    exclude_christmas: bool,
+    match_all_genres: bool,
+    use_track_genre: bool,
+    configured_group_count: usize,
+    reference_track_count: usize,
+    acceptable_genre_count: usize,
+    genre_excluded_count: usize,
+    christmas_excluded_count: usize,
+}
+
+struct CandidateGenreFilter {
+    settings: GenrePolicySettings,
+    prepared: bliss_mixer_core::genre::PreparedGenreFilter,
+    acceptable_genres: HashSet<String>,
+    reference_track_count: usize,
+}
+
+impl CandidateGenreFilter {
+    fn prepare(
+        settings: &GenrePolicySettings,
+        library: &Library,
+        source_library_indices: &[usize],
+    ) -> Result<Self, CommandFailure> {
+        let prepared = bliss_mixer_core::genre::PreparedGenreFilter::new(
+            bliss_mixer_core::genre::GenreFilterSettings {
+                restrict_genres: settings.restrict_genres,
+                exclude_christmas: settings.exclude_christmas,
+                genre_groups: settings.genre_groups.clone(),
+                match_all_genres: settings.match_all_genres,
+                use_track_genre: settings.use_track_genre,
+            },
+            library
+                .metadata
+                .iter()
+                .flat_map(|metadata| metadata.genres.iter()),
+        )
+        .map_err(|error| CommandFailure::new("GENRE_POLICY_INVALID", error.to_string()))?;
+        let acceptable_genres = prepared.acceptable_genres(
+            source_library_indices
+                .iter()
+                .map(|index| &library.metadata(*index).genres),
+        );
+        Ok(Self {
+            settings: settings.clone(),
+            prepared,
+            acceptable_genres,
+            reference_track_count: source_library_indices.len(),
+        })
+    }
+
+    fn active(&self) -> bool {
+        self.settings.restrict_genres || self.settings.exclude_christmas
+    }
+
+    fn rejection_reason(
+        &self,
+        candidate_genres: &HashSet<String>,
+    ) -> Option<bliss_mixer_core::genre::GenreRejection> {
+        self.prepared
+            .rejection_reason(candidate_genres, &self.acceptable_genres)
+    }
+
+    fn artifact(
+        &self,
+        genre_excluded_count: usize,
+        christmas_excluded_count: usize,
+    ) -> Option<GenreFilterArtifact> {
+        self.active().then_some(GenreFilterArtifact {
+            restrict_genres: self.settings.restrict_genres,
+            exclude_christmas: self.settings.exclude_christmas,
+            match_all_genres: self.settings.match_all_genres,
+            use_track_genre: self.settings.use_track_genre,
+            configured_group_count: self.settings.genre_groups.len(),
+            reference_track_count: self.reference_track_count,
+            acceptable_genre_count: self.acceptable_genres.len(),
+            genre_excluded_count,
+            christmas_excluded_count,
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -928,6 +1036,7 @@ struct LibraryMetadata {
     row_id: u64,
     file: String,
     title_key: String,
+    genres: HashSet<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -2193,6 +2302,7 @@ fn load_usable_library(database: &BlissDatabase) -> Result<Library, CommandFailu
             row_id,
             file: metadata.file,
             title_key,
+            genres: bliss_mixer_core::genre::genres_from_field(metadata.genre.as_deref()),
         });
         route_tracks.push(route::RouteTrack {
             features,
@@ -3335,8 +3445,20 @@ fn analyze_bridge_validated(
         None,
     );
     let started = Instant::now();
+    let genre_reference_indices = history_library_indices
+        .iter()
+        .chain(source_library_indices.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    let candidate_genre_filter = CandidateGenreFilter::prepare(
+        &request.candidate_policy.genre,
+        &library,
+        &genre_reference_indices,
+    )?;
     let mut eligible_candidates = Vec::with_capacity(library.len());
     let mut adjacent_reference_candidates = Vec::with_capacity(library.len());
+    let mut genre_excluded_count = 0usize;
+    let mut christmas_excluded_count = 0usize;
     for (index, metadata) in library.metadata.iter().enumerate() {
         if local_candidate_rows
             .as_ref()
@@ -3346,12 +3468,23 @@ fn analyze_bridge_validated(
         }
         adjacent_reference_candidates.push(index);
         let route_track = library.track(index);
-        if !source_files.contains(&metadata.file)
-            && !source_identities
+        if source_files.contains(&metadata.file)
+            || source_identities
                 .get(&route_track.artist_key)
                 .is_some_and(|titles| titles.contains(metadata.title_key.as_str()))
         {
-            eligible_candidates.push(index);
+            continue;
+        }
+        match candidate_genre_filter.rejection_reason(&metadata.genres) {
+            Some(bliss_mixer_core::genre::GenreRejection::Genre) => {
+                genre_excluded_count += 1;
+            }
+            Some(bliss_mixer_core::genre::GenreRejection::Christmas) => {
+                christmas_excluded_count += 1;
+            }
+            None => {
+                eligible_candidates.push(index);
+            }
         }
     }
     let semantic_candidate_lookup = semantic::CandidateLookup::from_library_candidates(
@@ -4876,6 +5009,8 @@ fn analyze_bridge_validated(
             .local_candidate_track_count
             .map(|count| library.len().saturating_sub(count)),
         eligible_candidate_count: eligible_candidates.len(),
+        genre_filter: candidate_genre_filter
+            .artifact(genre_excluded_count, christmas_excluded_count),
         frozen_reference_count: reference.len(),
         trigger_percentile,
         max_leg_percentile: if request.extension.mode == "destination_route" {
@@ -5472,7 +5607,7 @@ fn main() {
         [command] if command == "version" => println!("{PROGRAM} {VERSION}"),
         [command, format] if command == "version" && format == "--json" => {
             println!(
-                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true}}"
+                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true}}"
             );
         }
         _ => {
@@ -5485,6 +5620,72 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn genres(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn shared_candidate_genre_filter_excludes_christmas_and_unrelated_groups() {
+        let library = Library {
+            metadata: vec![
+                LibraryMetadata {
+                    row_id: 1,
+                    file: "source-a.flac".to_owned(),
+                    title_key: "source a".to_owned(),
+                    genres: genres(&["alternative"]),
+                },
+                LibraryMetadata {
+                    row_id: 2,
+                    file: "source-b.flac".to_owned(),
+                    title_key: "source b".to_owned(),
+                    genres: genres(&["hard rock"]),
+                },
+                LibraryMetadata {
+                    row_id: 3,
+                    file: "christmas.flac".to_owned(),
+                    title_key: "christmas".to_owned(),
+                    genres: genres(&["christmas"]),
+                },
+                LibraryMetadata {
+                    row_id: 4,
+                    file: "jazz.flac".to_owned(),
+                    title_key: "jazz".to_owned(),
+                    genres: genres(&["jazz"]),
+                },
+            ],
+            tracks: Vec::new(),
+        };
+        let filter = CandidateGenreFilter::prepare(
+            &GenrePolicySettings {
+                restrict_genres: true,
+                exclude_christmas: true,
+                genre_groups: vec![
+                    vec!["Alternative".to_owned(), "Hard Rock".to_owned()],
+                    vec!["Christmas".to_owned()],
+                    vec!["Jazz".to_owned()],
+                ],
+                match_all_genres: false,
+                use_track_genre: false,
+            },
+            &library,
+            &[0, 1],
+        )
+        .unwrap();
+        assert_eq!(
+            filter.rejection_reason(&library.metadata(2).genres),
+            Some(bliss_mixer_core::genre::GenreRejection::Christmas)
+        );
+        assert_eq!(
+            filter.rejection_reason(&library.metadata(3).genres),
+            Some(bliss_mixer_core::genre::GenreRejection::Genre)
+        );
+        let artifact = filter.artifact(1, 1).unwrap();
+        assert_eq!(artifact.reference_track_count, 2);
+        assert_eq!(artifact.acceptable_genre_count, 2);
+        assert_eq!(artifact.genre_excluded_count, 1);
+        assert_eq!(artifact.christmas_excluded_count, 1);
+    }
 
     #[test]
     fn cautious_destination_trigger_detects_strong_model_disagreement() {
