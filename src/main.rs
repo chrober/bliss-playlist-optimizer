@@ -1913,7 +1913,7 @@ fn prepare_runtime_request(
                 format!("duplicate Bliss file identity '{database_file}'"),
             ));
         }
-        let Some(library_index) = file_to_index.get(database_file).copied() else {
+        let Some(_) = file_to_index.get(database_file).copied() else {
             return Err(CommandFailure::new(
                 "TRACK_NOT_ANALYZED",
                 format!(
@@ -1922,18 +1922,6 @@ fn prepare_runtime_request(
                 ),
             ));
         };
-        if local_candidate_rows
-            .as_ref()
-            .is_some_and(|rows| !rows.contains(&library.metadata(library_index).row_id))
-        {
-            return Err(CommandFailure::new(
-                "SOURCE_NOT_IN_LOCAL_CANDIDATE_INVENTORY",
-                format!(
-                    "source track '{}' is not present in the frozen LMS-local inventory",
-                    track.id
-                ),
-            ));
-        }
     }
     for track in &request.history_tracks {
         let database_file = track.database_file.as_deref().ok_or_else(|| {
@@ -1942,7 +1930,7 @@ fn prepare_runtime_request(
                 format!("history track '{}' has no database_file identity", track.id),
             )
         })?;
-        let Some(library_index) = file_to_index.get(database_file).copied() else {
+        let Some(_) = file_to_index.get(database_file).copied() else {
             return Err(CommandFailure::new(
                 "TRACK_NOT_ANALYZED",
                 format!(
@@ -1951,18 +1939,6 @@ fn prepare_runtime_request(
                 ),
             ));
         };
-        if local_candidate_rows
-            .as_ref()
-            .is_some_and(|rows| !rows.contains(&library.metadata(library_index).row_id))
-        {
-            return Err(CommandFailure::new(
-                "SOURCE_NOT_IN_LOCAL_CANDIDATE_INVENTORY",
-                format!(
-                    "history track '{}' is not present in the frozen LMS-local inventory",
-                    track.id
-                ),
-            ));
-        }
     }
     timings.record("source_resolution", started.elapsed());
 
@@ -2083,7 +2059,7 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         let row_id = database
             .usable_row_id_for_file(database_file)
             .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?;
-        let Some(row_id) = row_id else {
+        let Some(_) = row_id else {
             return Err(CommandFailure::new(
                 "TRACK_NOT_ANALYZED",
                 format!(
@@ -2092,18 +2068,6 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
                 ),
             ));
         };
-        if local_candidate_rows
-            .as_ref()
-            .is_some_and(|rows| !rows.contains(&row_id))
-        {
-            return Err(CommandFailure::new(
-                "SOURCE_NOT_IN_LOCAL_CANDIDATE_INVENTORY",
-                format!(
-                    "source track '{}' is not present in the frozen LMS-local inventory",
-                    track.id
-                ),
-            ));
-        }
     }
     for track in &request.history_tracks {
         let database_file = track.database_file.as_deref().ok_or_else(|| {
@@ -2115,7 +2079,7 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         let row_id = database
             .usable_row_id_for_file(database_file)
             .map_err(|error| CommandFailure::new("DATABASE_QUERY_FAILED", error.to_string()))?;
-        let Some(row_id) = row_id else {
+        let Some(_) = row_id else {
             return Err(CommandFailure::new(
                 "TRACK_NOT_ANALYZED",
                 format!(
@@ -2124,18 +2088,6 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
                 ),
             ));
         };
-        if local_candidate_rows
-            .as_ref()
-            .is_some_and(|rows| !rows.contains(&row_id))
-        {
-            return Err(CommandFailure::new(
-                "SOURCE_NOT_IN_LOCAL_CANDIDATE_INVENTORY",
-                format!(
-                    "history track '{}' is not present in the frozen LMS-local inventory",
-                    track.id
-                ),
-            ));
-        }
     }
 
     Ok(ValidationSummary {
@@ -5607,7 +5559,7 @@ fn main() {
         [command] if command == "version" => println!("{PROGRAM} {VERSION}"),
         [command, format] if command == "version" && format == "--json" => {
             println!(
-                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true}}"
+                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true}}"
             );
         }
         _ => {
@@ -6642,7 +6594,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_search_excludes_every_row_outside_the_local_inventory() {
+    fn candidate_inventory_scopes_additions_without_rejecting_source_anchors() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
         let original = std::env::current_dir().unwrap();
         std::env::set_current_dir(repository).unwrap();
@@ -6660,17 +6612,9 @@ mod tests {
         let database_path = request["artifacts"]["database"]["path"].as_str().unwrap();
         let database = BlissDatabase::open_read_only(database_path).unwrap();
         let library = load_usable_library(&database).unwrap();
-        let allowed = request["source_tracks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|track| {
-                database
-                    .usable_row_id_for_file(track["database_file"].as_str().unwrap())
-                    .unwrap()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
+        // A candidate library is allowed to exclude every immutable source
+        // anchor. The allowlist governs generated additions, not route input.
+        let allowed = Vec::<u64>::new();
         let allowed_count = allowed.len();
         let inventory_path = temporary_root.join("inventory.json");
         let inventory = serde_json::json!({

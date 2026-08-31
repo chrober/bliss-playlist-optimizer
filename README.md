@@ -36,6 +36,16 @@ queue-rejoin tracks remain valid anchors even when their genres would exclude
 them as newly generated candidates. The result records separate ordinary-genre
 and Christmas rejection counts.
 
+The frozen local candidate inventory is an allowlist for **generated tracks**,
+not for immutable route input. A caller may therefore scope additions to a
+Lyrion virtual library while retaining source tracks, listening history,
+mandatory destinations, waypoints, and queue-rejoin anchors that are outside
+that view. Those anchors must still resolve to usable Bliss rows, but they never
+become eligible additions merely because they participate in scoring. Candidate
+membership remains enforced at the one shared eligible-library boundary used by
+every track-adding mode. Callers can feature-detect this contract through the
+`candidate_library_scope` flag returned by `version --json`.
+
 The current read-only contract slice exposes:
 
 ```text
