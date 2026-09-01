@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+pub mod anchored_path;
 pub mod bridge;
 pub mod contextual;
 pub mod preview;

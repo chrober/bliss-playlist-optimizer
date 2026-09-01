@@ -334,11 +334,12 @@ pub fn evaluate_gap(
     })
 }
 
-pub(crate) fn repeat_safe_at(
+pub(crate) fn repeat_windows_safe_at(
     route: &[usize],
     tracks: &[RouteTrack],
-    config: &BridgeConfig,
     inserted_position: usize,
+    artist_window: usize,
+    album_window: usize,
 ) -> bool {
     let inserted = &tracks[route[inserted_position]];
     for (position, track_index) in route.iter().enumerate() {
@@ -347,15 +348,15 @@ pub(crate) fn repeat_safe_at(
         }
         let distance = position.abs_diff(inserted_position);
         let other = &tracks[*track_index];
-        if config.artist_window > 0
-            && distance <= config.artist_window
+        if artist_window > 0
+            && distance <= artist_window
             && !inserted.artist_key.is_empty()
             && inserted.artist_key == other.artist_key
         {
             return false;
         }
-        if config.album_window > 0
-            && distance <= config.album_window
+        if album_window > 0
+            && distance <= album_window
             && !inserted.album_key.is_empty()
             && inserted.album_key == other.album_key
         {
@@ -363,6 +364,21 @@ pub(crate) fn repeat_safe_at(
         }
     }
     true
+}
+
+pub(crate) fn repeat_safe_at(
+    route: &[usize],
+    tracks: &[RouteTrack],
+    config: &BridgeConfig,
+    inserted_position: usize,
+) -> bool {
+    repeat_windows_safe_at(
+        route,
+        tracks,
+        inserted_position,
+        config.artist_window,
+        config.album_window,
+    )
 }
 
 pub fn evaluate_candidate(

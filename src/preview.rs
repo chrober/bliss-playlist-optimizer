@@ -7,6 +7,10 @@ use ndarray::Array2;
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::anchored_path::{
+    search_anchored_paths, AnchoredPathCandidate, AnchoredPathError, AnchoredPathRequest,
+    AnchoredPathSearchConfig,
+};
 use crate::bridge::{
     gap_context_matrix, rank_candidates_in_context, rank_endpoint_candidates,
     BridgeCandidateEvaluation, BridgeConfig, BridgeError, CandidateScoringContext,
@@ -923,55 +927,14 @@ fn select_exact_count_multi_gap_bridges(
     })
 }
 
-#[derive(Clone, Debug)]
-struct DestinationPathState {
-    bridges: Vec<usize>,
-    transition_sum: f64,
-    worst_transition: f64,
-    lower_sum: f64,
-    lower_worst: f64,
-    semantic_support: f64,
-}
-
-fn destination_path_order(
-    left: &DestinationPathState,
-    right: &DestinationPathState,
-) -> std::cmp::Ordering {
-    left.lower_worst
-        .total_cmp(&right.lower_worst)
-        .then_with(|| left.lower_sum.total_cmp(&right.lower_sum))
-        .then_with(|| right.semantic_support.total_cmp(&left.semantic_support))
-        .then_with(|| left.bridges.cmp(&right.bridges))
-}
-
-fn destination_complete_order(
-    left: &DestinationPathState,
-    right: &DestinationPathState,
-) -> std::cmp::Ordering {
-    left.worst_transition
-        .total_cmp(&right.worst_transition)
-        .then_with(|| left.transition_sum.total_cmp(&right.transition_sum))
-        .then_with(|| right.semantic_support.total_cmp(&left.semantic_support))
-        .then_with(|| left.bridges.cmp(&right.bridges))
-}
-
-fn destination_route_repeat_safe(
-    route: &[usize],
-    first_generated: usize,
-    generated_count: usize,
-    tracks: &[RouteTrack],
-    config: &BridgeConfig,
-    track_window: usize,
-) -> bool {
-    (first_generated..first_generated.saturating_add(generated_count)).all(|position| {
-        crate::bridge::repeat_safe_at(route, tracks, config, position)
-            && (track_window == 0
-                || route.iter().enumerate().all(|(other, track)| {
-                    other == position
-                        || other.abs_diff(position) > track_window
-                        || *track != route[position]
-                }))
-    })
+fn anchored_path_error(error: AnchoredPathError) -> PreviewError {
+    match error {
+        AnchoredPathError::InvalidConfig(message) => PreviewError::InvalidExactConfig(message),
+        AnchoredPathError::InvalidRoute(message) => PreviewError::FinalRouteInvalid(message),
+        AnchoredPathError::InvalidTrackIndex(_) => {
+            PreviewError::FinalRouteInvalid("anchored path contains an unknown track index")
+        }
+    }
 }
 
 /// Searches the final source transition as a bounded, fixed-matrix path.
@@ -1008,211 +971,51 @@ where
         ));
     }
 
-    let tracks = scoring.tracks;
-    let config = scoring.config;
-    let destination = gap.right;
     let prefix = &original_route[..original_route.len() - 1];
-    let mut repeat_prefix = repeat.history_route.to_vec();
-    repeat_prefix.extend(prefix.iter().copied());
-    let first_generated = repeat_prefix.len();
-    let mut candidates = gap
+    let candidates = gap
         .semantics
         .candidates
         .iter()
-        .map(|candidate| candidate.candidate)
-        .filter(|candidate| !original_route.contains(candidate))
+        .map(|candidate| AnchoredPathCandidate {
+            track: candidate.candidate,
+            semantic_support: candidate.guidance_score(
+                selection_config.track_guidance_percent,
+                selection_config.artist_guidance_percent,
+            ),
+        })
         .collect::<Vec<_>>();
-    candidates.sort_unstable();
-    candidates.dedup();
-    let semantics = gap
-        .semantics
-        .candidates
-        .iter()
-        .map(|candidate| (candidate.candidate, candidate))
-        .collect::<HashMap<_, _>>();
-    let structural_upper_bound = max_added_tracks.min(candidates.len());
-    let direct = adjacent_distance(gap.left, destination);
-    let direct_decisions = final_exact_decisions(
-        original_route,
-        std::slice::from_ref(gap),
-        &[Vec::new()],
-        scoring,
-        selection_config,
-    )?;
-    let mut options = vec![DestinationRouteOption {
-        added_track_count: 0,
-        selection: ExactSelection {
-            requested_added_tracks: 0,
-            final_route: Some(original_route.to_vec()),
-            decisions: direct_decisions,
-            endpoint_decisions: Vec::new(),
-            stats: ExactSearchStats {
-                max_tracks_per_gap: max_added_tracks.max(1),
-                evaluated_states: 1,
-                retained_states: 1,
-                maximum_additions_found: 0,
-                structural_upper_bound,
+    let anchored_options = search_anchored_paths(
+        AnchoredPathRequest {
+            route_prefix: prefix,
+            immutable_history: repeat.history_route,
+            unavailable_tracks: original_route,
+            left_anchor: gap.left,
+            right_anchor: gap.right,
+            candidates: &candidates,
+            tracks: scoring.tracks,
+            config: AnchoredPathSearchConfig {
+                max_intermediates: max_added_tracks,
+                candidate_limit: selection_config.candidate_limit,
+                beam_width: selection_config.beam_width,
+                alternatives_per_count: 1,
+                variation_percent: selection_config.variation_percent,
+                generation_seed: selection_config.generation_seed,
+                artist_window: scoring.config.artist_window,
+                album_window: scoring.config.album_window,
+                track_window: repeat.track_window,
             },
         },
-        adjacent_transition_sum: direct,
-        adjacent_worst_transition: direct,
-    }];
+        adjacent_distance,
+    )
+    .map_err(anchored_path_error)?;
 
-    for requested in 1..=max_added_tracks {
-        let mut evaluated_states = 1usize;
-        let mut retained_states = 1usize;
-        let mut frontier = vec![DestinationPathState {
-            bridges: Vec::with_capacity(requested),
-            transition_sum: 0.0,
-            worst_transition: 0.0,
-            lower_sum: direct,
-            lower_worst: direct / (requested + 1) as f64,
-            semantic_support: 0.0,
-        }];
-
-        for layer in 0..requested {
-            let mut next = frontier
-                .par_iter()
-                .flat_map_iter(|state| {
-                    let left = state.bridges.last().copied().unwrap_or(gap.left);
-                    let remaining_edges = requested - layer;
-                    let mut variants = candidates
-                        .iter()
-                        .copied()
-                        .filter(|candidate| !state.bridges.contains(candidate))
-                        .filter_map(|candidate| {
-                            let destination_distance = requested - layer;
-                            let candidate_track = &tracks[candidate];
-                            let destination_track = &tracks[destination];
-                            let conflicts_with_destination = (config.artist_window > 0
-                                && destination_distance <= config.artist_window
-                                && !candidate_track.artist_key.is_empty()
-                                && candidate_track.artist_key == destination_track.artist_key)
-                                || (config.album_window > 0
-                                    && destination_distance <= config.album_window
-                                    && !candidate_track.album_key.is_empty()
-                                    && candidate_track.album_key == destination_track.album_key);
-                            if conflicts_with_destination {
-                                return None;
-                            }
-                            let mut partial = repeat_prefix.clone();
-                            partial.extend(state.bridges.iter().copied());
-                            partial.push(candidate);
-                            if !destination_route_repeat_safe(
-                                &partial,
-                                partial.len() - 1,
-                                1,
-                                tracks,
-                                config,
-                                repeat.track_window,
-                            ) {
-                                return None;
-                            }
-                            let edge = adjacent_distance(left, candidate);
-                            let distance_left = adjacent_distance(candidate, destination);
-                            let transition_sum = state.transition_sum + edge;
-                            let worst_transition = state.worst_transition.max(edge);
-                            let mut bridges = state.bridges.clone();
-                            bridges.push(candidate);
-                            Some(DestinationPathState {
-                                bridges,
-                                transition_sum,
-                                worst_transition,
-                                lower_sum: transition_sum + distance_left,
-                                lower_worst: worst_transition
-                                    .max(distance_left / remaining_edges as f64),
-                                semantic_support: state.semantic_support
-                                    + semantics
-                                        .get(&candidate)
-                                        .map(|candidate| {
-                                            candidate.guidance_score(
-                                                selection_config.track_guidance_percent,
-                                                selection_config.artist_guidance_percent,
-                                            )
-                                        })
-                                        .unwrap_or(0.0),
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    variants.sort_by(destination_path_order);
-                    variants.truncate(selection_config.candidate_limit);
-                    variants
-                })
-                .collect::<Vec<_>>();
-            evaluated_states = evaluated_states.saturating_add(next.len());
-            next.sort_by(destination_path_order);
-            next.dedup_by(|left, right| left.bridges == right.bridges);
-            next.truncate(selection_config.beam_width);
-            retained_states = retained_states.saturating_add(next.len());
-            frontier = next;
-            if frontier.is_empty() {
-                break;
-            }
-        }
-
-        let mut complete = frontier
-            .into_iter()
-            .filter_map(|mut state| {
-                let mut route = repeat_prefix.clone();
-                route.extend(state.bridges.iter().copied());
-                route.push(destination);
-                if !destination_route_repeat_safe(
-                    &route,
-                    first_generated,
-                    requested,
-                    tracks,
-                    config,
-                    repeat.track_window,
-                ) {
-                    return None;
-                }
-                let final_edge = adjacent_distance(*state.bridges.last()?, destination);
-                state.transition_sum += final_edge;
-                state.worst_transition = state.worst_transition.max(final_edge);
-                state.lower_sum = state.transition_sum;
-                state.lower_worst = state.worst_transition;
-                Some(state)
-            })
-            .collect::<Vec<_>>();
-        complete.sort_by(destination_complete_order);
-        let Some(best) = complete.first() else {
-            continue;
-        };
-        let worst_limit = best.worst_transition + (best.worst_transition * 0.02).max(1.0e-9);
-        let sum_limit = best.transition_sum + (best.transition_sum * 0.05).max(1.0e-9);
-        let quality_band = complete
-            .iter()
-            .take_while(|candidate| candidate.worst_transition <= worst_limit)
-            .filter(|candidate| candidate.transition_sum <= sum_limit)
-            .cloned()
-            .collect::<Vec<_>>();
-        let pool = varied_pool_length(
-            quality_band.len(),
-            VariationConfig {
-                percent: selection_config.variation_percent,
-                seed: selection_config.generation_seed,
-                minimum_pool: 1,
-            },
-        );
-        let selected = quality_band
-            .into_iter()
-            .take(pool.max(1))
-            .min_by_key(|candidate| {
-                variation_key(
-                    selection_config.generation_seed,
-                    &candidate.bridges,
-                    requested,
-                    destination,
-                )
-            })
-            .expect("the destination quality band contains its best route");
-        let mut route = prefix.to_vec();
-        route.extend(selected.bridges.iter().copied());
-        route.push(destination);
+    let mut options = Vec::with_capacity(anchored_options.len());
+    for anchored in anchored_options {
+        let requested = anchored.intermediates.len();
         let decisions = final_exact_decisions(
-            &route,
+            &anchored.route,
             std::slice::from_ref(gap),
-            std::slice::from_ref(&selected.bridges),
+            std::slice::from_ref(&anchored.intermediates),
             scoring,
             selection_config,
         )?;
@@ -1220,19 +1023,19 @@ where
             added_track_count: requested,
             selection: ExactSelection {
                 requested_added_tracks: requested,
-                final_route: Some(route),
+                final_route: Some(anchored.route),
                 decisions,
                 endpoint_decisions: Vec::new(),
                 stats: ExactSearchStats {
                     max_tracks_per_gap: max_added_tracks.max(1),
-                    evaluated_states,
-                    retained_states,
+                    evaluated_states: anchored.stats.evaluated_states,
+                    retained_states: anchored.stats.retained_states,
                     maximum_additions_found: requested,
-                    structural_upper_bound,
+                    structural_upper_bound: anchored.stats.structural_upper_bound,
                 },
             },
-            adjacent_transition_sum: selected.transition_sum,
-            adjacent_worst_transition: selected.worst_transition,
+            adjacent_transition_sum: anchored.transition_sum,
+            adjacent_worst_transition: anchored.worst_transition,
         });
     }
     Ok(options)
@@ -2034,37 +1837,6 @@ mod tests {
                 candidates: vec![semantics(candidate)],
             },
         }
-    }
-
-    #[test]
-    fn destination_repeat_checks_ignore_existing_history_duplicates() {
-        let tracks = vec![track(0.0, "a"), track(1.0, "b"), track(2.0, "c")];
-        let config = BridgeConfig {
-            seed_limit: 2,
-            learned_percent: 20,
-            artist_window: 0,
-            album_window: 0,
-            max_leg_percentile: 0.70,
-            max_detour_percentile: 1.30,
-            gap_context_mode: crate::bridge::GapContextMode::Rolling,
-        };
-
-        assert!(destination_route_repeat_safe(
-            &[0, 1, 0, 2],
-            3,
-            1,
-            &tracks,
-            &config,
-            4
-        ));
-        assert!(!destination_route_repeat_safe(
-            &[0, 1, 0, 0],
-            3,
-            1,
-            &tracks,
-            &config,
-            4
-        ));
     }
 
     #[test]

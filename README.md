@@ -315,6 +315,14 @@ selects one result per total bridge count.
 Destination routes use a dedicated fixed-matrix layered path search rather than  
 the generic contextual gap-insertion search. Static requests govern that search  
 with the diagonal matrix built from the captured BlissMixer feature weights.  
+The bounded inner search is implemented as a shared, outer-planner-neutral  
+anchored-path engine: callers provide left/right anchors, immutable history,  
+unavailable route membership, candidate evidence, repeat windows, and an  
+adjacent-distance function. It returns complete scored alternatives without  
+mutating a playlist or queue. Destination and waypoint workflows currently  
+retain one alternative per intermediate count for compatibility; future  
+multi-gap playlist planners can request several alternatives and choose a  
+globally repeat-safe combination.  
 Adaptive requests build one per-run context from the bounded suffix of analyzed  
 `history_tracks` followed by the locked start track. The destination is never an  
 Adaptive seed. The optimizer passes those features, the optional learned matrix,  
