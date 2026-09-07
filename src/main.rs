@@ -181,6 +181,8 @@ struct RouteSettings {
     objective: String,
     start_track_id: Option<String>,
     destination_track_id: Option<String>,
+    #[serde(default)]
+    destination_track_ids: Vec<String>,
     rejoin_track_id: Option<String>,
     search: SearchSettings,
 }
@@ -458,6 +460,68 @@ struct AdjacentRouteQuality {
     transition_sum: f64,
     worst_transition: f64,
     worst_percentile: f64,
+}
+
+fn destination_block_ids(route: &RouteSettings) -> Vec<&str> {
+    if route.destination_track_ids.is_empty() {
+        route.destination_track_id.as_deref().into_iter().collect()
+    } else {
+        route
+            .destination_track_ids
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+fn destination_boundary_edges(
+    route: &[usize],
+    start: usize,
+    destination_first: usize,
+    destination_last: usize,
+    rejoin: Option<usize>,
+) -> Result<Vec<(usize, usize)>, CommandFailure> {
+    let position = |track| {
+        route
+            .iter()
+            .position(|candidate| *candidate == track)
+            .ok_or_else(|| {
+                CommandFailure::new(
+                    "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
+                    "a locked destination-route anchor is absent from the selected route",
+                )
+            })
+    };
+    let start_position = position(start)?;
+    let destination_first_position = position(destination_first)?;
+    let destination_last_position = position(destination_last)?;
+    if start_position >= destination_first_position
+        || destination_first_position > destination_last_position
+    {
+        return Err(CommandFailure::new(
+            "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
+            "the immutable destination block is out of order in the selected route",
+        ));
+    }
+    let mut edges = route[start_position..=destination_first_position]
+        .windows(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect::<Vec<_>>();
+    if let Some(rejoin) = rejoin {
+        let rejoin_position = position(rejoin)?;
+        if destination_last_position >= rejoin_position {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
+                "the queue rejoin anchor does not follow the immutable destination block",
+            ));
+        }
+        edges.extend(
+            route[destination_last_position..=rejoin_position]
+                .windows(2)
+                .map(|pair| (pair[0], pair[1])),
+        );
+    }
+    Ok(edges)
 }
 struct FixedMatrixDistanceIndex<'a> {
     tracks: &'a [route::RouteTrack],
@@ -3484,9 +3548,25 @@ fn analyze_bridge_validated(
     };
     let destination_route = request.extension.mode == "destination_route";
     let destination_rejoins_queue = destination_route && request.route.rejoin_track_id.is_some();
-    let destination_start_position = selected_library_route
+    let destination_block_len = if destination_route {
+        destination_block_ids(&request.route).len()
+    } else {
+        0
+    };
+    let destination_route_start_position = selected_library_route
         .len()
-        .saturating_sub(if destination_rejoins_queue { 3 } else { 2 });
+        .saturating_sub(1 + destination_block_len + usize::from(destination_rejoins_queue));
+    let destination_first_position = destination_route_start_position + 1;
+    let destination_last_position =
+        destination_first_position.saturating_add(destination_block_len.saturating_sub(1));
+    let destination_start_anchor =
+        destination_route.then(|| selected_library_route[destination_route_start_position]);
+    let destination_first_anchor =
+        destination_route.then(|| selected_library_route[destination_first_position]);
+    let destination_last_anchor =
+        destination_route.then(|| selected_library_route[destination_last_position]);
+    let destination_rejoin_anchor =
+        destination_rejoins_queue.then(|| selected_library_route[destination_last_position + 1]);
     let static_destination_matrix = if destination_route {
         Some(static_weight_matrix(&request)?)
     } else {
@@ -3504,8 +3584,8 @@ fn analyze_bridge_validated(
     let mut adaptive_variance_failure = None;
     let mut adaptive_fallback_reason = None;
     let adaptive_context_matrix = if destination_route && request.scoring.algorithm == "adaptive" {
-        let left = selected_library_route[destination_start_position];
-        let left_track_id = selected_track_ids[destination_start_position].clone();
+        let left = selected_library_route[destination_route_start_position];
+        let left_track_id = selected_track_ids[destination_route_start_position].clone();
         let mut context = history_library_indices
             .iter()
             .copied()
@@ -3563,15 +3643,23 @@ fn analyze_bridge_validated(
         .as_ref()
         .map(|(matrix, _)| FixedMatrixDistanceIndex::new(bridge_tracks, matrix));
     let destination_distance_selection = if destination_route {
-        let direct_route = &selected_library_route[destination_start_position..];
+        let direct_edges = destination_boundary_edges(
+            &selected_library_route,
+            destination_start_anchor.expect("destination route has a start anchor"),
+            destination_first_anchor.expect("destination route has a first destination anchor"),
+            destination_last_anchor.expect("destination route has a last destination anchor"),
+            destination_rejoin_anchor,
+        )?;
         let static_index = static_distance_index
             .as_ref()
             .expect("destination routes always construct the Static distance index");
-        let static_quality =
-            static_index.evaluate_route(direct_route, &adjacent_reference_candidates)?;
+        let static_quality = static_index
+            .evaluate_edges(direct_edges.iter().copied(), &adjacent_reference_candidates)?;
         let learned_quality = learned_distance_index
             .as_ref()
-            .map(|index| index.evaluate_route(direct_route, &adjacent_reference_candidates))
+            .map(|index| {
+                index.evaluate_edges(direct_edges.iter().copied(), &adjacent_reference_candidates)
+            })
             .transpose()?;
         let static_hash = static_destination_matrix
             .as_ref()
@@ -3580,7 +3668,9 @@ fn analyze_bridge_validated(
             .clone();
         let adaptive_quality = adaptive_distance_index
             .as_ref()
-            .map(|index| index.evaluate_route(direct_route, &adjacent_reference_candidates))
+            .map(|index| {
+                index.evaluate_edges(direct_edges.iter().copied(), &adjacent_reference_candidates)
+            })
             .transpose()?;
         let (selected_role, selected_hash, selected_quality, policy) =
             if let (Some((_, hash)), Some(quality)) =
@@ -3709,18 +3799,18 @@ fn analyze_bridge_validated(
         &bridge_config,
     )
     .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
-    // A two-track source produces a single self-referential distance. Such a
-    // distribution assigns that transition percentile zero regardless of its
-    // absolute distance, making every automatic trigger ineffective. Fall back
-    // to the current local library as the frozen comparison population whenever
-    // the source cannot provide at least two distinct observations.
-    if reference.len() < 2 {
+    // Destination routes judge only the generated boundaries around an
+    // immutable target. Album-internal transitions must therefore never shape
+    // their acceptance reference. Other two-track sources also need the local
+    // library because one self-referential distance cannot form a percentile
+    // distribution.
+    if destination_route || reference.len() < 2 {
         let mut library_reference_candidates = eligible_candidates.clone();
         library_reference_candidates.extend(selected_library_route.iter().copied());
         library_reference_candidates.sort_unstable();
         library_reference_candidates.dedup();
         reference = if let Some(distance_index) = distance_index.as_ref() {
-            let left = selected_library_route[destination_start_position];
+            let left = selected_library_route[destination_route_start_position];
             bridge::FrozenReference::from_distances(
                 library_reference_candidates
                     .par_iter()
@@ -3757,16 +3847,18 @@ fn analyze_bridge_validated(
     let mut gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut preview_gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut semantic_assisted = false;
-    let first_gap = if request.extension.mode == "fixed_source_extension" {
-        selected_library_route.len()
-    } else if request.extension.mode == "destination_route" {
-        selected_library_route
-            .len()
-            .saturating_sub(if destination_rejoins_queue { 2 } else { 1 })
+    let gap_positions = if request.extension.mode == "fixed_source_extension" {
+        Vec::new()
+    } else if destination_route {
+        let mut positions = vec![destination_first_position];
+        if destination_rejoins_queue {
+            positions.push(destination_last_position + 1);
+        }
+        positions
     } else {
-        1
+        (1..selected_library_route.len()).collect::<Vec<_>>()
     };
-    let gap_total = selected_library_route.len().saturating_sub(first_gap);
+    let gap_total = gap_positions.len();
     progress.update(
         "gap_candidate_scoring",
         if gap_total == 0 {
@@ -3777,7 +3869,7 @@ fn analyze_bridge_validated(
         Some(0),
         Some(gap_total),
     );
-    for position in first_gap..selected_library_route.len() {
+    for (gap_index, position) in gap_positions.into_iter().enumerate() {
         let gap = bridge::evaluate_gap(
             &selected_library_route,
             position,
@@ -3787,7 +3879,7 @@ fn analyze_bridge_validated(
             &reference,
         )
         .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
-        let destination_leg = position.saturating_sub(first_gap);
+        let destination_leg = gap_index;
         let (direct_distance, direct_percentile) = destination_distance_selection
             .as_ref()
             .map(|(_, _, quality, _)| {
@@ -3993,12 +4085,12 @@ fn analyze_bridge_validated(
             "gap_candidate_scoring",
             format!(
                 "Scored transition {}/{}: {} shortlisted, {} accepted",
-                position - first_gap + 1,
+                gap_index + 1,
                 gap_total,
                 shortlisted_candidate_count,
                 accepted_candidate_count,
             ),
-            Some(position - first_gap + 1),
+            Some(gap_index + 1),
             Some(gap_total),
         );
     }
@@ -4194,19 +4286,19 @@ fn analyze_bridge_validated(
                 .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))
             };
             let evaluate_destination = |route: &[usize]| {
-                let path_start = route
-                    .iter()
-                    .position(|track| *track == preview_gaps[0].left)
-                    .ok_or_else(|| {
-                        CommandFailure::new(
-                            "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
-                            "the destination path start is absent from the selected route",
-                        )
-                    })?;
+                let edges = destination_boundary_edges(
+                    route,
+                    destination_start_anchor.expect("destination route has a start anchor"),
+                    destination_first_anchor
+                        .expect("destination route has a first destination anchor"),
+                    destination_last_anchor
+                        .expect("destination route has a last destination anchor"),
+                    destination_rejoin_anchor,
+                )?;
                 distance_index
                     .as_ref()
                     .expect("destination routes build a fixed distance index")
-                    .evaluate_route(&route[path_start..], &adjacent_reference_candidates)
+                    .evaluate_edges(edges, &adjacent_reference_candidates)
             };
             let direct_caution = request
                 .extension
@@ -4226,11 +4318,23 @@ fn analyze_bridge_validated(
                         .expect("destination routes always construct the Static matrix")
                         .1;
                     if static_hash != selected_hash {
+                        let edges = destination_boundary_edges(
+                            route,
+                            destination_start_anchor.expect("destination route has a start anchor"),
+                            destination_first_anchor
+                                .expect("destination route has a first destination anchor"),
+                            destination_last_anchor
+                                .expect("destination route has a last destination anchor"),
+                            destination_rejoin_anchor,
+                        )?;
                         percentiles.push(
                             static_distance_index
                                 .as_ref()
                                 .expect("destination routes always construct the Static index")
-                                .evaluate_route(route, &adjacent_reference_candidates)?
+                                .evaluate_edges(
+                                    edges.iter().copied(),
+                                    &adjacent_reference_candidates,
+                                )?
                                 .worst_percentile,
                         );
                     }
@@ -4238,9 +4342,19 @@ fn analyze_bridge_validated(
                         && scoring_matrix_sha256 != *static_hash
                     {
                         if let Some(index) = learned_distance_index.as_ref() {
+                            let edges = destination_boundary_edges(
+                                route,
+                                destination_start_anchor
+                                    .expect("destination route has a start anchor"),
+                                destination_first_anchor
+                                    .expect("destination route has a first destination anchor"),
+                                destination_last_anchor
+                                    .expect("destination route has a last destination anchor"),
+                                destination_rejoin_anchor,
+                            )?;
                             percentiles.push(
                                 index
-                                    .evaluate_route(route, &adjacent_reference_candidates)?
+                                    .evaluate_edges(edges, &adjacent_reference_candidates)?
                                     .worst_percentile,
                             );
                         }
@@ -4273,6 +4387,7 @@ fn analyze_bridge_validated(
                     .expect("destination routes build a fixed distance index");
                 let repeat = preview::DestinationRepeatContext {
                     history_route: &history_library_indices,
+                    unavailable_tracks: &selected_library_route,
                     track_window: request.repeat_windows.track,
                 };
                 let scoring = preview::ExactScoringContext {
@@ -4281,27 +4396,19 @@ fn analyze_bridge_validated(
                     config: &relaxed_config,
                     reference: &reference,
                 };
-                if destination_rejoins_queue {
-                    preview::select_destination_waypoint_routes(
-                        &selected_library_route,
-                        &preview_gaps,
-                        maximum,
-                        &destination_config(maximum),
-                        repeat,
-                        scoring,
-                        |left, right| distance_index.distance(left, right),
-                    )
-                } else {
-                    preview::select_destination_bridge_routes(
-                        &selected_library_route,
-                        &preview_gaps[0],
-                        maximum,
-                        &destination_config(maximum),
-                        repeat,
-                        scoring,
-                        |left, right| distance_index.distance(left, right),
-                    )
-                }
+                preview::select_destination_block_routes(
+                    &selected_library_route,
+                    &preview_gaps,
+                    preview::DestinationBlockPlan {
+                        track_count: destination_block_len,
+                        rejoins_queue: destination_rejoins_queue,
+                        max_added_tracks: maximum,
+                    },
+                    &destination_config(maximum),
+                    repeat,
+                    scoring,
+                    |left, right| distance_index.distance(left, right),
+                )
                 .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))
             };
             let (
@@ -4352,7 +4459,7 @@ fn analyze_bridge_validated(
                         "bridge_selection",
                         if destination_rejoins_queue {
                             format!(
-                                "Searching waypoint-and-rejoin paths with {minimum} through {maximum} total intermediate tracks"
+                                "Searching destination-block and rejoin paths with {minimum} through {maximum} total intermediate tracks"
                             )
                         } else {
                             format!(
@@ -4379,7 +4486,7 @@ fn analyze_bridge_validated(
                             "bridge_selection",
                             if destination_rejoins_queue {
                                 format!(
-                                    "Comparing complete waypoint-and-rejoin route with {}/{} total intermediate tracks",
+                                    "Comparing complete destination-block and rejoin route with {}/{} total intermediate tracks",
                                     option.added_track_count, maximum
                                 )
                             } else {
@@ -4520,16 +4627,15 @@ fn analyze_bridge_validated(
                         "the selected destination route is absent from its quality artifact",
                     )
                         })?;
-                        let path_start = final_route
-                            .iter()
-                            .position(|track| *track == preview_gaps[0].left)
-                            .ok_or_else(|| {
-                                CommandFailure::new(
-                                    "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
-                                    "the destination path start is absent from the selected route",
-                                )
-                            })?;
-                        let destination_path = &final_route[path_start..];
+                        let destination_edges = destination_boundary_edges(
+                            final_route,
+                            destination_start_anchor.expect("destination route has a start anchor"),
+                            destination_first_anchor
+                                .expect("destination route has a first destination anchor"),
+                            destination_last_anchor
+                                .expect("destination route has a last destination anchor"),
+                            destination_rejoin_anchor,
+                        )?;
                         let mut secondary_models = Vec::new();
                         let mut push_secondary =
                             |role: DestinationMatrixRole,
@@ -4568,7 +4674,10 @@ fn analyze_bridge_validated(
                                 .expect(
                                     "destination routes always construct the Static distance index",
                                 )
-                                .evaluate_route(destination_path, &adjacent_reference_candidates)?;
+                                .evaluate_edges(
+                                    destination_edges.iter().copied(),
+                                    &adjacent_reference_candidates,
+                                )?;
                             push_secondary(
                                 DestinationMatrixRole::Static,
                                 static_hash.clone(),
@@ -4579,8 +4688,8 @@ fn analyze_bridge_validated(
                             && scoring_matrix_sha256 != static_hash
                         {
                             if let Some(index) = learned_distance_index.as_ref() {
-                                let learned_quality = index.evaluate_route(
-                                    destination_path,
+                                let learned_quality = index.evaluate_edges(
+                                    destination_edges.iter().copied(),
                                     &adjacent_reference_candidates,
                                 )?;
                                 push_secondary(
@@ -4685,9 +4794,9 @@ fn analyze_bridge_validated(
                 mode: "exact_count",
                 processing_order: if destination_route {
                     if destination_rejoins_queue {
-                        "fixed-adjacent-layered-waypoint-and-rejoin-beam-search"
+                        "fixed-adjacent-layered-destination-block-and-rejoin-beam-search"
                     } else {
-                        "fixed-adjacent-layered-destination-beam-search"
+                        "fixed-adjacent-layered-destination-block-beam-search"
                     }
                 } else if endpoint_slots.opening.is_some() || endpoint_slots.closing.is_some() {
                     "bounded-endpoints-and-original-gaps-beam-search"
@@ -5096,6 +5205,13 @@ fn analyze_bridge_request_with_options(
                     "destination_route requires route.destination_track_id",
                 )
             })?;
+        let destination_block = destination_block_ids(&request.route);
+        if destination_block.first().copied() != Some(destination) {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_BLOCK_INVALID",
+                "route.destination_track_ids must begin with route.destination_track_id",
+            ));
+        }
         let rejoin = request.route.rejoin_track_id.as_deref();
         let start_position = request
             .source_tracks
@@ -5107,16 +5223,30 @@ fn analyze_bridge_request_with_options(
                     "route.start_track_id is not present in source_tracks",
                 )
             })?;
-        let destination_position = request
-            .source_tracks
+        let mut destination_positions = Vec::with_capacity(destination_block.len());
+        for destination_id in &destination_block {
+            let destination_position = request
+                .source_tracks
+                .iter()
+                .position(|track| track.id == *destination_id)
+                .ok_or_else(|| {
+                    CommandFailure::new(
+                        "DESTINATION_ROUTE_TARGET_INVALID",
+                        format!(
+                            "destination block track '{destination_id}' is not present in source_tracks"
+                        ),
+                    )
+                })?;
+            destination_positions.push(destination_position);
+        }
+        let destination_position = destination_positions[0];
+        let destination_end_position = *destination_positions
+            .last()
+            .expect("destination routes have at least one destination track");
+        let destination_contiguous = destination_positions
             .iter()
-            .position(|track| track.id == destination)
-            .ok_or_else(|| {
-                CommandFailure::new(
-                    "DESTINATION_ROUTE_TARGET_INVALID",
-                    "route.destination_track_id is not present in source_tracks",
-                )
-            })?;
+            .enumerate()
+            .all(|(offset, position)| *position == destination_position + offset);
         let anchors_valid = if let Some(rejoin) = rejoin {
             let rejoin_position = request
                 .source_tracks
@@ -5128,20 +5258,22 @@ fn analyze_bridge_request_with_options(
                         "route.rejoin_track_id is not present in source_tracks",
                     )
                 })?;
-            start_position + 1 == destination_position
-                && destination_position + 1 == rejoin_position
+            destination_contiguous
+                && start_position + 1 == destination_position
+                && destination_end_position + 1 == rejoin_position
                 && rejoin_position + 1 == request.source_tracks.len()
         } else {
-            start_position + 1 == destination_position
-                && destination_position + 1 == request.source_tracks.len()
+            destination_contiguous
+                && start_position + 1 == destination_position
+                && destination_end_position + 1 == request.source_tracks.len()
         };
         if !anchors_valid {
             return Err(CommandFailure::new(
                 "DESTINATION_ROUTE_ANCHORS_INVALID",
                 if rejoin.is_some() {
-                    "a rejoining destination_route requires start, destination waypoint, and rejoin to be the final three source_tracks"
+                    "a rejoining destination_route requires start, the ordered destination block, and rejoin to be the final source_tracks"
                 } else {
-                    "destination_route requires the start and destination to be the final two source_tracks"
+                    "destination_route requires the start and ordered destination block to be the final source_tracks"
                 },
             ));
         }
@@ -5186,6 +5318,7 @@ fn analyze_bridge_request_with_options(
         if request.route.ordering_policy == "queue_destination"
             || request.route.start_track_id.is_some()
             || request.route.destination_track_id.is_some()
+            || !request.route.destination_track_ids.is_empty()
             || request.route.rejoin_track_id.is_some()
         {
             return Err(CommandFailure::new(
@@ -5465,28 +5598,32 @@ impl<'a> FixedMatrixDistanceIndex<'a> {
         Ok((below as f64 / population.saturating_sub(1).max(1) as f64).min(1.0))
     }
 
-    fn evaluate_route(
+    fn evaluate_edges(
         &self,
-        route: &[usize],
+        edges: impl IntoIterator<Item = (usize, usize)>,
         reference_candidates: &[usize],
     ) -> Result<AdjacentRouteQuality, CommandFailure> {
-        if route.len() < 2 || reference_candidates.len() < 2 {
+        if reference_candidates.len() < 2 {
             return Err(CommandFailure::new(
                 "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
-                "adjacent route quality requires at least two route and reference tracks",
+                "adjacent route quality requires at least two reference tracks",
             ));
         }
-        let legs = route
-            .windows(2)
-            .map(|pair| {
-                let left = pair[0];
-                let right = pair[1];
+        let legs = edges
+            .into_iter()
+            .map(|(left, right)| {
                 let distance = self.distance(left, right);
                 let percentile =
                     self.source_relative_percentile(left, distance, reference_candidates)?;
                 Ok((left, right, distance, percentile))
             })
             .collect::<Result<Vec<_>, CommandFailure>>()?;
+        if legs.is_empty() {
+            return Err(CommandFailure::new(
+                "DESTINATION_ROUTE_QUALITY_UNAVAILABLE",
+                "destination route quality requires at least one routed boundary",
+            ));
+        }
         Ok(AdjacentRouteQuality {
             transition_sum: legs.iter().map(|leg| leg.2).sum(),
             worst_transition: legs.iter().map(|leg| leg.2).fold(0.0_f64, f64::max),
@@ -5559,7 +5696,7 @@ fn main() {
         [command] if command == "version" => println!("{PROGRAM} {VERSION}"),
         [command, format] if command == "version" && format == "--json" => {
             println!(
-                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true}}"
+                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true}}"
             );
         }
         _ => {
@@ -5944,19 +6081,21 @@ mod tests {
     }
 
     #[test]
-    fn destination_route_can_visit_a_waypoint_and_rejoin_the_queue() {
+    fn destination_route_can_visit_an_immutable_block_and_rejoin_the_queue() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
         let request_path = repository.join("fixtures/synthetic/automatic-bridge-request.json");
         let mut request: Value = serde_json::from_slice(&fs::read(request_path).unwrap()).unwrap();
         let all_sources = request["source_tracks"].as_array().unwrap().clone();
-        let anchors = all_sources[all_sources.len() - 3..].to_vec();
-        request["job_id"] = Value::String("destination-waypoint-rejoin-test".to_owned());
-        request["history_tracks"] = Value::Array(all_sources[..all_sources.len() - 3].to_vec());
+        let anchors = all_sources[all_sources.len() - 4..].to_vec();
+        request["job_id"] = Value::String("destination-block-rejoin-test".to_owned());
+        request["history_tracks"] = Value::Array(all_sources[..all_sources.len() - 4].to_vec());
         request["source_tracks"] = Value::Array(anchors.clone());
         request["route"]["ordering_policy"] = Value::String("queue_destination".to_owned());
         request["route"]["start_track_id"] = anchors[0]["id"].clone();
         request["route"]["destination_track_id"] = anchors[1]["id"].clone();
-        request["route"]["rejoin_track_id"] = anchors[2]["id"].clone();
+        request["route"]["destination_track_ids"] =
+            Value::Array(vec![anchors[1]["id"].clone(), anchors[2]["id"].clone()]);
+        request["route"]["rejoin_track_id"] = anchors[3]["id"].clone();
         request["route"]["search"]["restart_count"] = Value::from(0);
         request["repeat_windows"] = serde_json::json!({
             "artist": 0,
@@ -5981,7 +6120,7 @@ mod tests {
         });
 
         let temporary = std::env::temp_dir().join(format!(
-            "bliss-playlist-optimizer-waypoint-{}.json",
+            "bliss-playlist-optimizer-destination-block-{}.json",
             std::process::id()
         ));
         fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
@@ -5989,14 +6128,14 @@ mod tests {
         let _ = fs::remove_file(temporary);
 
         let SelectionPreviewArtifact::Exact(preview) = result.selection_preview else {
-            panic!("waypoint route must return an exact-selection preview");
+            panic!("destination-block route must return an exact-selection preview");
         };
         assert!(preview.feasible);
         assert_eq!(preview.added_track_count, 2);
         assert_eq!(preview.decisions.len(), 2);
         assert_eq!(
             preview.processing_order,
-            "fixed-adjacent-layered-waypoint-and-rejoin-beam-search"
+            "fixed-adjacent-layered-destination-block-and-rejoin-beam-search"
         );
         let sequence = preview.final_sequence.unwrap();
         let original_ids = sequence
@@ -6013,7 +6152,22 @@ mod tests {
         );
         assert_eq!(
             sequence.last().unwrap().track_id,
-            anchors[2]["id"].as_str().unwrap()
+            anchors[3]["id"].as_str().unwrap()
+        );
+        let album_tracks = sequence
+            .iter()
+            .filter(|entry| {
+                entry.track_id == anchors[1]["id"].as_str().unwrap()
+                    || entry.track_id == anchors[2]["id"].as_str().unwrap()
+            })
+            .map(|entry| entry.track_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            album_tracks,
+            vec![
+                anchors[1]["id"].as_str().unwrap(),
+                anchors[2]["id"].as_str().unwrap(),
+            ]
         );
         assert_eq!(preview.route_quality.unwrap().adjacent_legs.len(), 4);
     }

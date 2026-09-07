@@ -285,25 +285,29 @@ the semantic pool frozen for the original anchor endpoints.
 
 Destination-route requests use `extension.mode=destination_route` together with
 `route.ordering_policy=queue_destination`, `route.start_track_id`, and
-`route.destination_track_id`. `source_tracks` contains the locked start and
-destination and therefore remains unique route membership. Optional
+`route.destination_track_id`. The optional `route.destination_track_ids` turns
+that single destination into an immutable ordered block; its first entry must
+equal `destination_track_id`. `source_tracks` contains the locked start followed
+by the complete destination block and therefore remains unique route membership. Optional
 `history_tracks` is ordered, immutable listening history preceding the start;
 it may contain repeats or overlap route identities because it is never emitted
 as part of the result. It supplies acoustic and repeat context, while repeat
 windows constrain only newly generated intermediates. Without a rejoin anchor,
-only the final gap is extended. `destination_mode=exact` requires exactly `additional_track_count`
+only the boundary before the block is extended. The block's internal
+transitions are user-selected content and are neither rerouted nor included in
+bridge acceptance. `destination_mode=exact` requires exactly `additional_track_count`
 intermediates and remains all-or-nothing. Automatic accepts optional
 `min_added_tracks` and required `max_added_tracks` bounds from zero through
 eight; the minimum must not exceed the maximum. A minimum of zero permits the
 direct destination. Exact counts are also bounded from zero through eight.  
 
-An optional `route.rejoin_track_id` turns the same request into a three-anchor
-queue excursion: locked start, mandatory destination waypoint, and locked
-rejoin track must be the final three `source_tracks` in that order. The total
-intermediate-track budget is shared across both gaps. The optimizer carries
+An optional `route.rejoin_track_id` turns the same request into a queue
+excursion: locked start, immutable destination block, and locked rejoin track
+must form the final `source_tracks` in that order. The total intermediate-track
+budget is shared across the block's entry and exit boundaries. The optimizer carries
 each retained outward path into the return search, so generated membership,
-artist/album/track repeat windows, and the fixed waypoint constrain the complete
-`start -> waypoint -> rejoin` route. It ranks complete routes by their worst
+artist/album/track repeat windows, and fixed destination membership constrain the complete
+`start -> destination block -> rejoin` route. It ranks complete routes by their worst
 adjacent transition and then their total distance; Automatic compares the full
 two-leg baseline and result against the same quality target and cautious-model
 consensus used by ordinary destination routing. The rejoin anchor remains in
@@ -319,7 +323,7 @@ The bounded inner search is implemented as a shared, outer-planner-neutral
 anchored-path engine: callers provide left/right anchors, immutable history,  
 unavailable route membership, candidate evidence, repeat windows, and an  
 adjacent-distance function. It returns complete scored alternatives without  
-mutating a playlist or queue. Destination and waypoint workflows currently  
+mutating a playlist or queue. Destination-block workflows currently  
 retain one alternative per intermediate count for compatibility; future  
 multi-gap playlist planners can request several alternatives and choose a  
 globally repeat-safe combination.  

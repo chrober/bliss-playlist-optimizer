@@ -271,6 +271,8 @@ fn destination_route_requires_locked_endpoints_and_exact_count_when_requested() 
     request["route"]["ordering_policy"] = Value::String("queue_destination".to_owned());
     request["route"]["start_track_id"] = start;
     request["route"]["destination_track_id"] = destination;
+    request["route"]["destination_track_ids"] =
+        serde_json::json!([request["route"]["destination_track_id"].clone()]);
     request["extension"] = serde_json::json!({
         "mode": "destination_route",
         "destination_mode": "automatic",
@@ -280,6 +282,12 @@ fn destination_route_requires_locked_endpoints_and_exact_count_when_requested() 
         "trigger_percentile": 0.7
     });
     assert!(validator.is_valid(&request));
+
+    let mut duplicate_block = request.clone();
+    let destination = duplicate_block["route"]["destination_track_id"].clone();
+    duplicate_block["route"]["destination_track_ids"] =
+        Value::Array(vec![destination.clone(), destination]);
+    assert!(!validator.is_valid(&duplicate_block));
 
     let mut with_repeated_history = request.clone();
     let history_track = with_repeated_history["source_tracks"][0].clone();

@@ -146,7 +146,15 @@ struct GapRankingContext<'a> {
 #[derive(Clone, Copy)]
 pub struct DestinationRepeatContext<'a> {
     pub history_route: &'a [usize],
+    pub unavailable_tracks: &'a [usize],
     pub track_window: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DestinationBlockPlan {
+    pub track_count: usize,
+    pub rejoins_queue: bool,
+    pub max_added_tracks: usize,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -988,7 +996,7 @@ where
         AnchoredPathRequest {
             route_prefix: prefix,
             immutable_history: repeat.history_route,
-            unavailable_tracks: original_route,
+            unavailable_tracks: repeat.unavailable_tracks,
             left_anchor: gap.left,
             right_anchor: gap.right,
             candidates: &candidates,
@@ -1041,14 +1049,14 @@ where
     Ok(options)
 }
 
-/// Searches an excursion through one mandatory waypoint and back to a locked
-/// rejoin anchor. The bridge budget is shared across both adjacent gaps.
-/// Each outward option is carried into the return search so uniqueness and
-/// repeat windows constrain the complete audible route.
-pub fn select_destination_waypoint_routes<F>(
+/// Searches a route into one immutable, ordered destination block and,
+/// optionally, back to a locked queue-rejoin anchor. Only the boundary before
+/// the block and the optional boundary after it may receive generated tracks.
+/// The bridge budget is shared across those boundaries.
+pub fn select_destination_block_routes<F>(
     original_route: &[usize],
     gaps: &[AutomaticGap],
-    max_added_tracks: usize,
+    plan: DestinationBlockPlan,
     selection_config: &ExactSelectionConfig,
     repeat: DestinationRepeatContext<'_>,
     scoring: ExactScoringContext<'_>,
@@ -1057,31 +1065,43 @@ pub fn select_destination_waypoint_routes<F>(
 where
     F: Fn(usize, usize) -> f64 + Sync + Copy,
 {
-    if original_route.len() < 3 || gaps.len() != 2 {
-        return Err(PreviewError::FinalRouteInvalid(
-            "waypoint destination search requires two locked adjacent gaps",
-        ));
-    }
-    let start_position = original_route.len() - 3;
-    let start = original_route[start_position];
-    let waypoint = original_route[start_position + 1];
-    let rejoin = original_route[start_position + 2];
-    if gaps[0].left != start
-        || gaps[0].right != waypoint
-        || gaps[1].left != waypoint
-        || gaps[1].right != rejoin
+    let DestinationBlockPlan {
+        track_count: destination_block_len,
+        rejoins_queue,
+        max_added_tracks,
+    } = plan;
+    let expected_gap_count = if rejoins_queue { 2 } else { 1 };
+    let minimum_route_len = 1 + destination_block_len + usize::from(rejoins_queue);
+    if destination_block_len == 0
+        || original_route.len() < minimum_route_len
+        || gaps.len() != expected_gap_count
     {
         return Err(PreviewError::FinalRouteInvalid(
-            "waypoint destination gaps do not match start, waypoint, and rejoin anchors",
+            "destination-block search received inconsistent anchors or boundary gaps",
+        ));
+    }
+    let start_position = original_route.len() - minimum_route_len;
+    let start = original_route[start_position];
+    let destination_first_position = start_position + 1;
+    let destination_last_position = destination_first_position + destination_block_len - 1;
+    let destination_first = original_route[destination_first_position];
+    let destination_last = original_route[destination_last_position];
+    let rejoin = rejoins_queue.then(|| original_route[destination_last_position + 1]);
+    if gaps[0].left != start
+        || gaps[0].right != destination_first
+        || (rejoins_queue && (gaps[1].left != destination_last || Some(gaps[1].right) != rejoin))
+    {
+        return Err(PreviewError::FinalRouteInvalid(
+            "destination boundary gaps do not match the locked source, block, and rejoin anchors",
         ));
     }
     if max_added_tracks > MAX_EXACT_TRACKS_PER_GAP {
         return Err(PreviewError::InvalidExactConfig(
-            "waypoint bridge budget exceeds the supported total limit",
+            "destination-block bridge budget exceeds the supported total limit",
         ));
     }
 
-    let outward_source = &original_route[..original_route.len() - 1];
+    let outward_source = &original_route[..=destination_first_position];
     let outward_options = select_destination_bridge_routes(
         outward_source,
         &gaps[0],
@@ -1101,15 +1121,71 @@ where
                     .as_ref()
                     .expect("destination options always contain a route");
                 let outward_count = outward.added_track_count;
+                if !rejoins_queue {
+                    let mut final_route = outward_route.clone();
+                    if destination_first_position < destination_last_position {
+                        final_route.extend_from_slice(
+                            &original_route
+                                [destination_first_position + 1..=destination_last_position],
+                        );
+                    }
+                    let destination_first_position = final_route
+                        .iter()
+                        .position(|track| *track == destination_first)
+                        .expect("the destination block entrance remains in the route");
+                    let route_start = final_route
+                        .iter()
+                        .position(|track| *track == start)
+                        .expect("the start anchor remains in the route");
+                    let outward_bridges =
+                        final_route[route_start + 1..destination_first_position].to_vec();
+                    let decisions = final_exact_decisions(
+                        &final_route,
+                        gaps,
+                        &[outward_bridges],
+                        scoring,
+                        selection_config,
+                    )?;
+                    return Ok(vec![DestinationRouteOption {
+                        added_track_count: outward_count,
+                        selection: ExactSelection {
+                            requested_added_tracks: outward_count,
+                            final_route: Some(final_route),
+                            decisions,
+                            endpoint_decisions: Vec::new(),
+                            stats: outward.selection.stats.clone(),
+                        },
+                        adjacent_transition_sum: outward.adjacent_transition_sum,
+                        adjacent_worst_transition: outward.adjacent_worst_transition,
+                    }]);
+                }
+
                 let mut return_source = outward_route.clone();
+                if destination_first_position < destination_last_position {
+                    return_source.extend_from_slice(
+                        &original_route[destination_first_position + 1..=destination_last_position],
+                    );
+                }
+                let rejoin = rejoin.expect("rejoining destination block has a queue anchor");
                 return_source.push(rejoin);
                 let remaining = max_added_tracks.saturating_sub(outward_count);
+                let mut return_unavailable = repeat.unavailable_tracks.to_vec();
+                let outward_unavailable = outward_route
+                    .iter()
+                    .copied()
+                    .filter(|track| !return_unavailable.contains(track))
+                    .collect::<Vec<_>>();
+                return_unavailable.extend(outward_unavailable);
                 let return_options = select_destination_bridge_routes(
                     &return_source,
                     &gaps[1],
                     remaining,
                     selection_config,
-                    repeat,
+                    DestinationRepeatContext {
+                        history_route: repeat.history_route,
+                        unavailable_tracks: &return_unavailable,
+                        track_window: repeat.track_window,
+                    },
                     scoring,
                     adjacent_distance,
                 )?;
@@ -1123,10 +1199,14 @@ where
                         .as_ref()
                         .expect("destination options always contain a route")
                         .clone();
-                    let waypoint_position = final_route
+                    let destination_first_position = final_route
                         .iter()
-                        .position(|track| *track == waypoint)
-                        .expect("the mandatory waypoint remains in the route");
+                        .position(|track| *track == destination_first)
+                        .expect("the destination block entrance remains in the route");
+                    let destination_last_position = final_route
+                        .iter()
+                        .position(|track| *track == destination_last)
+                        .expect("the destination block exit remains in the route");
                     let rejoin_position = final_route
                         .iter()
                         .position(|track| *track == rejoin)
@@ -1135,9 +1215,10 @@ where
                         .iter()
                         .position(|track| *track == start)
                         .expect("the start anchor remains in the route");
-                    let outward_bridges = final_route[route_start + 1..waypoint_position].to_vec();
+                    let outward_bridges =
+                        final_route[route_start + 1..destination_first_position].to_vec();
                     let return_bridges =
-                        final_route[waypoint_position + 1..rejoin_position].to_vec();
+                        final_route[destination_last_position + 1..rejoin_position].to_vec();
                     let decisions = final_exact_decisions(
                         &final_route,
                         gaps,
@@ -1145,9 +1226,10 @@ where
                         scoring,
                         selection_config,
                     )?;
-                    let (transition_sum, worst_transition) = final_route
-                        [route_start..=rejoin_position]
+                    let boundary_edges = final_route[route_start..=destination_first_position]
                         .windows(2)
+                        .chain(final_route[destination_last_position..=rejoin_position].windows(2));
+                    let (transition_sum, worst_transition) = boundary_edges
                         .map(|edge| adjacent_distance(edge[0], edge[1]))
                         .fold((0.0_f64, 0.0_f64), |(sum, worst), distance| {
                             (sum + distance, worst.max(distance))
@@ -2236,6 +2318,139 @@ mod tests {
         .unwrap();
         assert_eq!(two_bridges.final_route, Some(vec![0, 1, 2, 3]));
         assert_eq!(two_bridges.stats.maximum_additions_found, 2);
+    }
+
+    #[test]
+    fn destination_block_preserves_album_order_and_routes_only_its_boundaries() {
+        let tracks = vec![
+            track(0.0, "start"),
+            track(0.8, "outward-bridge"),
+            track(1.6, "album-artist"),
+            track(2.4, "album-artist"),
+            track(3.2, "return-bridge"),
+            track(4.0, "rejoin"),
+        ];
+        let route = [0, 2, 3, 5];
+        let matrix = Array2::eye(23);
+        let config = BridgeConfig {
+            seed_limit: 2,
+            learned_percent: 20,
+            artist_window: 1,
+            album_window: 1,
+            max_leg_percentile: 1.0,
+            max_detour_percentile: 2.0,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
+        };
+        let reference =
+            build_frozen_reference(&route, &[0, 1, 2, 3, 4, 5], &tracks, &matrix, &config).unwrap();
+        let gaps = [gap(1, 0, 2, 1), gap(3, 3, 5, 4)];
+        let selection = ExactSelectionConfig {
+            requested_added_tracks: 2,
+            candidate_limit: 2,
+            beam_width: 16,
+            max_tracks_per_gap: 2,
+            track_guidance_percent: 0,
+            artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_907,
+        };
+        let options = select_destination_block_routes(
+            &route,
+            &gaps,
+            DestinationBlockPlan {
+                track_count: 2,
+                rejoins_queue: true,
+                max_added_tracks: 2,
+            },
+            &selection,
+            DestinationRepeatContext {
+                history_route: &[],
+                unavailable_tracks: &route,
+                track_window: 100,
+            },
+            ExactScoringContext {
+                tracks: &tracks,
+                learned_matrix: &matrix,
+                config: &config,
+                reference: &reference,
+            },
+            |left, right| (left as f64 - right as f64).abs(),
+        )
+        .unwrap();
+        let exact = options
+            .iter()
+            .find(|option| option.added_track_count == 2)
+            .expect("two-boundary route is available");
+        assert_eq!(exact.selection.final_route, Some(vec![0, 1, 2, 3, 4, 5]));
+        assert_eq!(exact.selection.decisions.len(), 2);
+        assert_eq!(exact.adjacent_transition_sum, 4.0);
+        assert_eq!(exact.adjacent_worst_transition, 1.0);
+    }
+
+    #[test]
+    fn one_way_destination_block_appends_the_complete_album_after_its_bridge() {
+        let tracks = vec![
+            track(0.0, "start"),
+            track(0.8, "bridge"),
+            track(1.6, "album-artist"),
+            track(2.4, "album-artist"),
+            track(3.2, "album-artist"),
+        ];
+        let route = [0, 2, 3, 4];
+        let matrix = Array2::eye(23);
+        let config = BridgeConfig {
+            seed_limit: 2,
+            learned_percent: 20,
+            artist_window: 1,
+            album_window: 1,
+            max_leg_percentile: 1.0,
+            max_detour_percentile: 2.0,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
+        };
+        let reference =
+            build_frozen_reference(&route, &[0, 1, 2, 3, 4], &tracks, &matrix, &config).unwrap();
+        let gaps = [gap(1, 0, 2, 1)];
+        let selection = ExactSelectionConfig {
+            requested_added_tracks: 1,
+            candidate_limit: 1,
+            beam_width: 8,
+            max_tracks_per_gap: 1,
+            track_guidance_percent: 0,
+            artist_guidance_percent: 0,
+            variation_percent: 0,
+            generation_seed: 20_260_907,
+        };
+        let options = select_destination_block_routes(
+            &route,
+            &gaps,
+            DestinationBlockPlan {
+                track_count: 3,
+                rejoins_queue: false,
+                max_added_tracks: 1,
+            },
+            &selection,
+            DestinationRepeatContext {
+                history_route: &[],
+                unavailable_tracks: &route,
+                track_window: 100,
+            },
+            ExactScoringContext {
+                tracks: &tracks,
+                learned_matrix: &matrix,
+                config: &config,
+                reference: &reference,
+            },
+            |left, right| (left as f64 - right as f64).abs(),
+        )
+        .unwrap();
+        let exact = options
+            .iter()
+            .find(|option| option.added_track_count == 1)
+            .expect("one-boundary bridge route is available");
+        assert_eq!(exact.selection.final_route, Some(vec![0, 1, 2, 3, 4]));
+        assert_eq!(exact.selection.decisions.len(), 1);
+        assert_eq!(exact.adjacent_transition_sum, 2.0);
+        assert_eq!(exact.adjacent_worst_transition, 1.0);
     }
 
     #[test]
