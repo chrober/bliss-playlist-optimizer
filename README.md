@@ -6,8 +6,9 @@ It turns a frozen playlist request, Bliss feature database, repeat rules, the
 optional learned similarity matrix, and optional semantic evidence into an
 auditable proposed route. It can reorder fixed membership, analyze and select
 bridge tracks, preserve source anchors, extend a fixed source set to an exact
-target, build a destination-locked one-way route, or build a two-leg excursion
-through a mandatory waypoint and back to a locked queue rejoin.
+target, build a destination-locked one-way route, or build a two-boundary
+excursion through a selected track or immutable ordered destination block and
+back to a locked queue rejoin.
 
 The native engine is needed because scoring tens of thousands of analyzed
 tracks and searching many contextual routes is computational work that does not
@@ -31,15 +32,15 @@ select generated tracks. Genre groups, glob patterns, match-all behavior,
 per-track genre matching, and the seasonal Christmas exclusion follow the shared
 `bliss-mixer-core` implementation. Source tracks and immutable recent listening
 history supply the acceptable genre groups, as seed and previous tracks do in
-BlissMixer. Existing source/history tracks, mandatory destinations, and locked
-queue-rejoin tracks remain valid anchors even when their genres would exclude
+BlissMixer. Existing source/history tracks, selected destination tracks or
+blocks, and locked queue-rejoin tracks remain valid anchors even when their genres would exclude
 them as newly generated candidates. The result records separate ordinary-genre
 and Christmas rejection counts.
 
 The frozen local candidate inventory is an allowlist for **generated tracks**,
 not for immutable route input. A caller may therefore scope additions to a
 Lyrion virtual library while retaining source tracks, listening history,
-mandatory destinations, waypoints, and queue-rejoin anchors that are outside
+selected destination tracks or blocks, and queue-rejoin anchors that are outside
 that view. Those anchors must still resolve to usable Bliss rows, but they never
 become eligible additions merely because they participate in scoring. Candidate
 membership remains enforced at the one shared eligible-library boundary used by
