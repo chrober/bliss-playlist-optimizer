@@ -8,6 +8,9 @@ human-readable messages may improve without a schema-version change.
 | `INVALID_REQUEST` | The request does not satisfy the supported v1 contract. |
 | `UNSUPPORTED_SCHEMA` | An input contract or database schema is unsupported. |
 | `ARTIFACT_HASH_MISMATCH` | A frozen artifact differs from its declared digest. |
+| `PLAY_COUNTS_REQUIRED` | A non-zero play-count influence was requested without a frozen play-count snapshot. |
+| `PLAY_COUNTS_SCHEMA_MISMATCH` | The play-count artifact does not declare the supported `lms-play-counts-v1` contract. |
+| `PLAY_COUNTS_DATABASE_MISMATCH` | The play-count snapshot was captured for a different guarded Bliss database identity. |
 | `TRACK_NOT_ANALYZED` | A requested track cannot be resolved to an analyzed database row. |
 | `MATRIX_REQUIRED` | The requested optimizer mode currently requires `artifacts.learned_matrix`; Adaptive routing and bridge scoring still need the matrix for one-track context fallback. |
 | `INFEASIBLE_REPEAT_WINDOWS` | No route satisfies the captured repeat constraints. |

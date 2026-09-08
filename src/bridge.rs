@@ -657,6 +657,7 @@ mod tests {
             features: std::array::from_fn(|index| value + index as f32 / 100.0),
             artist_key: artist.to_owned(),
             album_key: album.to_owned(),
+            play_count_percentile: 0.0,
         }
     }
 
@@ -922,6 +923,7 @@ mod tests {
                 }),
                 artist_key: format!("artist-{track_index}"),
                 album_key: format!("album-{track_index}"),
+                play_count_percentile: 0.0,
             })
             .collect::<Vec<_>>();
         let matrix = Array2::eye(23);

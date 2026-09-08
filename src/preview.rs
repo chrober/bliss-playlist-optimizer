@@ -37,6 +37,7 @@ pub struct AutomaticSelectionConfig {
     pub trigger_percentile: f64,
     pub track_guidance_percent: u8,
     pub artist_guidance_percent: u8,
+    pub playcount_influence: i8,
     pub variation_percent: u8,
     pub generation_seed: u64,
 }
@@ -49,6 +50,7 @@ pub struct ExactSelectionConfig {
     pub max_tracks_per_gap: usize,
     pub track_guidance_percent: u8,
     pub artist_guidance_percent: u8,
+    pub playcount_influence: i8,
     pub variation_percent: u8,
     pub generation_seed: u64,
 }
@@ -57,6 +59,7 @@ pub struct ExactSelectionConfig {
 struct GuidanceConfig {
     track_percent: u8,
     artist_percent: u8,
+    playcount_influence: i8,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -88,6 +91,7 @@ impl AutomaticSelectionConfig {
         GuidanceConfig {
             track_percent: self.track_guidance_percent,
             artist_percent: self.artist_guidance_percent,
+            playcount_influence: self.playcount_influence,
         }
     }
 
@@ -105,6 +109,7 @@ impl ExactSelectionConfig {
         GuidanceConfig {
             track_percent: self.track_guidance_percent,
             artist_percent: self.artist_guidance_percent,
+            playcount_influence: self.playcount_influence,
         }
     }
 
@@ -315,6 +320,22 @@ fn varied_pool_length(accepted: usize, variation: VariationConfig) -> usize {
     floor + (ceiling.saturating_sub(floor) * usize::from(variation.percent) / 100)
 }
 
+fn adjusted_candidate_percentile(
+    semantics: &CandidateSemantics,
+    acoustic_percentile: f64,
+    guidance: GuidanceConfig,
+    track: &RouteTrack,
+) -> f64 {
+    let semantic = semantics.adjusted_percentile(
+        acoustic_percentile,
+        guidance.track_percent,
+        guidance.artist_percent,
+    );
+    let playcount_shift =
+        0.10 * (f64::from(guidance.playcount_influence) / 100.0) * track.play_count_percentile;
+    (semantic - playcount_shift).clamp(0.0, 1.0)
+}
+
 fn rank_for_evolving_route(
     route: &[usize],
     position: usize,
@@ -360,34 +381,32 @@ fn rank_for_evolving_route(
             .accepts(right, config)
             .cmp(&acceptance.accepts(left, config))
             .then_with(|| {
-                semantics_by_candidate[&left.candidate]
-                    .adjusted_percentile(
-                        left.max_percentile,
-                        guidance.track_percent,
-                        guidance.artist_percent,
-                    )
-                    .total_cmp(
-                        &semantics_by_candidate[&right.candidate].adjusted_percentile(
-                            right.max_percentile,
-                            guidance.track_percent,
-                            guidance.artist_percent,
-                        ),
-                    )
+                adjusted_candidate_percentile(
+                    semantics_by_candidate[&left.candidate],
+                    left.max_percentile,
+                    guidance,
+                    &tracks[left.candidate],
+                )
+                .total_cmp(&adjusted_candidate_percentile(
+                    semantics_by_candidate[&right.candidate],
+                    right.max_percentile,
+                    guidance,
+                    &tracks[right.candidate],
+                ))
             })
             .then_with(|| {
-                semantics_by_candidate[&left.candidate]
-                    .adjusted_percentile(
-                        left.detour_percentile,
-                        guidance.track_percent,
-                        guidance.artist_percent,
-                    )
-                    .total_cmp(
-                        &semantics_by_candidate[&right.candidate].adjusted_percentile(
-                            right.detour_percentile,
-                            guidance.track_percent,
-                            guidance.artist_percent,
-                        ),
-                    )
+                adjusted_candidate_percentile(
+                    semantics_by_candidate[&left.candidate],
+                    left.detour_percentile,
+                    guidance,
+                    &tracks[left.candidate],
+                )
+                .total_cmp(&adjusted_candidate_percentile(
+                    semantics_by_candidate[&right.candidate],
+                    right.detour_percentile,
+                    guidance,
+                    &tracks[right.candidate],
+                ))
             })
             .then_with(|| left.max_percentile.total_cmp(&right.max_percentile))
             .then_with(|| left.detour_percentile.total_cmp(&right.detour_percentile))
@@ -1389,19 +1408,18 @@ fn rank_endpoint_for_route(
             .accepted
             .cmp(&left.accepted)
             .then_with(|| {
-                semantics_by_candidate[&left.candidate]
-                    .adjusted_percentile(
-                        left.percentile,
-                        guidance.track_percent,
-                        guidance.artist_percent,
-                    )
-                    .total_cmp(
-                        &semantics_by_candidate[&right.candidate].adjusted_percentile(
-                            right.percentile,
-                            guidance.track_percent,
-                            guidance.artist_percent,
-                        ),
-                    )
+                adjusted_candidate_percentile(
+                    semantics_by_candidate[&left.candidate],
+                    left.percentile,
+                    guidance,
+                    &tracks[left.candidate],
+                )
+                .total_cmp(&adjusted_candidate_percentile(
+                    semantics_by_candidate[&right.candidate],
+                    right.percentile,
+                    guidance,
+                    &tracks[right.candidate],
+                ))
             })
             .then_with(|| left.percentile.total_cmp(&right.percentile))
             .then_with(|| left.candidate.cmp(&right.candidate))
@@ -1896,7 +1914,29 @@ mod tests {
             features: std::array::from_fn(|index| value + index as f32 / 100.0),
             artist_key: artist.to_owned(),
             album_key: format!("album-{artist}"),
+            play_count_percentile: 0.0,
         }
+    }
+
+    #[test]
+    fn signed_playcount_guidance_moves_candidate_percentiles_in_both_directions() {
+        let semantics = semantics(0);
+        let mut frequent = track(0.0, "frequent");
+        frequent.play_count_percentile = 1.0;
+        let positive = GuidanceConfig {
+            playcount_influence: 100,
+            ..GuidanceConfig::default()
+        };
+        let negative = GuidanceConfig {
+            playcount_influence: -100,
+            ..GuidanceConfig::default()
+        };
+        assert!(adjusted_candidate_percentile(&semantics, 0.5, positive, &frequent) < 0.5);
+        assert!(adjusted_candidate_percentile(&semantics, 0.5, negative, &frequent) > 0.5);
+        assert_eq!(
+            adjusted_candidate_percentile(&semantics, 0.5, GuidanceConfig::default(), &frequent,),
+            0.5,
+        );
     }
 
     fn semantics(candidate: usize) -> CandidateSemantics {
@@ -1977,6 +2017,7 @@ mod tests {
             trigger_percentile: 0.70,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_721,
         };
@@ -2049,6 +2090,7 @@ mod tests {
             trigger_percentile: 0.70,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_721,
         };
@@ -2095,6 +2137,7 @@ mod tests {
             max_tracks_per_gap: 1,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_721,
         };
@@ -2186,6 +2229,7 @@ mod tests {
             max_tracks_per_gap: 2,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_721,
         };
@@ -2293,6 +2337,7 @@ mod tests {
             max_tracks_per_gap: 2,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_811,
         };
@@ -2351,6 +2396,7 @@ mod tests {
             max_tracks_per_gap: 2,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_907,
         };
@@ -2417,6 +2463,7 @@ mod tests {
             max_tracks_per_gap: 1,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_907,
         };
@@ -2481,6 +2528,7 @@ mod tests {
             max_tracks_per_gap: 1,
             track_guidance_percent: 0,
             artist_guidance_percent: 0,
+            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_721,
         };

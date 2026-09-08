@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/chrober/bliss-playlist-optimizer/schemas/lms-play-counts-v1.schema.json",
+  "title": "LMS play counts v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "schema_identity", "generated_at", "database_cache_identity", "tracks"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "schema_identity": { "const": "lms-play-counts-v1" },
+    "generated_at": { "type": "integer", "minimum": 0 },
+    "database_cache_identity": { "type": "string", "minLength": 1 },
+    "tracks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["database_file", "play_count"],
+        "properties": {
+          "database_file": { "type": "string", "minLength": 1 },
+          "play_count": { "type": ["integer", "null"], "minimum": 0 }
+        }
+      }
+    }
+  }
+}

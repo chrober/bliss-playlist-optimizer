@@ -26,7 +26,8 @@
       "properties": {
         "database": { "$ref": "#/$defs/artifact" },
         "learned_matrix": { "$ref": "#/$defs/artifact" },
-        "local_candidate_inventory": { "$ref": "#/$defs/artifact" }
+        "local_candidate_inventory": { "$ref": "#/$defs/artifact" },
+        "play_counts": { "$ref": "#/$defs/artifact" }
       }
     },
     "source_tracks": {
@@ -108,6 +109,12 @@
           "maximum": 100,
           "deprecated": true,
           "description": "Legacy alias for lastfm_artist_guidance_percent."
+        },
+        "playcount_influence": {
+          "type": "integer",
+          "minimum": -100,
+          "maximum": 100,
+          "description": "Strategy-neutral preference for less-played (negative) or frequently played (positive) generated tracks; zero disables it."
         }
       }
     },

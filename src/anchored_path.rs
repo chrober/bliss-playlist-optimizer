@@ -453,6 +453,7 @@ mod tests {
             features: std::array::from_fn(|index| value + index as f32 / 100.0),
             artist_key: artist.to_owned(),
             album_key: album.to_owned(),
+            play_count_percentile: 0.0,
         }
     }
 

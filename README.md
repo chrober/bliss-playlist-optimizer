@@ -167,7 +167,8 @@ infer the actual scoring setup from request fields alone.
 
 Requests may include the strategy-neutral `selection` block with
 `variation_percent`, `generation_seed`, `lastfm_track_guidance_percent`, and
-`lastfm_artist_guidance_percent`.
+`lastfm_artist_guidance_percent`, plus signed `playcount_influence` from -100
+to 100.
 Variation zero preserves strict deterministic route, bridge, and fixed-source
 extension choices. Higher values seed route search, reorder a bounded pool of
 acoustically qualified bridge candidates, and let fixed-source extension perform
@@ -177,13 +178,22 @@ is downstream of scoring rather than nested under Adaptive, so Static and
 Forest can reuse it when those strategies are connected. The two Last.fm values
 independently scale recording and artist evidence after local-inventory,
 acoustic, uniqueness, and repeat-capacity qualification. Zero ignores that
-evidence type. Bridge ranking caps the combined adjustment at ten percentile
-points. Deterministic fixed-source extension caps semantic movement at 20% of its bounded
-Bliss relevance pool; varied fixed-source extension uses a bounded evidence multiplier. These
+evidence type. Bridge ranking caps Last.fm's combined adjustment and the
+play-count adjustment at ten percentile points each. Deterministic fixed-source
+extension caps each guidance contribution at 20% of its bounded Bliss relevance
+pool; varied fixed-source extension uses bounded evidence multipliers. These
 are guidance strengths, not quotas, and even 100 cannot rescue an acoustically
 rejected candidate. The deprecated `lastfm_artist_probability` spelling remains
 an input alias for artist guidance. Omitting the block retains deterministic
 zero-guidance defaults.
+
+A non-zero play-count influence requires a checksum-protected
+`artifacts.play_counts` snapshot declaring `lms-play-counts-v1` and bound to
+the same database cache identity. Negative values prefer less-played generated
+tracks and positive values prefer frequently played generated tracks. Unknown
+counts remain distinguishable in the snapshot and rank with zero plays. This
+guidance changes only generated-track selection; it does not reorder existing
+membership or weaken acoustic, local-library, uniqueness, or repeat gates.
 
 Adaptive transition scores are cached privately within each restart. Independent
 restarts run through indexed Rayon iteration and are reduced with stable
