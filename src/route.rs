@@ -22,6 +22,12 @@ const EPSILON: f64 = 1e-12;
 
 type ScoreCache = HashMap<(Vec<usize>, usize), f64>;
 
+#[derive(Clone, Copy, Debug)]
+struct LocalSearchKey {
+    repeat_violations: usize,
+    score: f64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RouteTrack {
     pub features: FeatureVector,
@@ -341,6 +347,25 @@ fn candidate_precedes(left: &CandidateRoute, right: &CandidateRoute, arc_aware: 
         || (left_score == right_score && left.route < right.route)
 }
 
+fn local_search_key(
+    route: &[usize],
+    metrics: &RouteMetrics,
+    tracks: &[RouteTrack],
+    config: &SearchConfig,
+    arc_aware: bool,
+) -> LocalSearchKey {
+    LocalSearchKey {
+        repeat_violations: repeat_violations(route, tracks, config).len(),
+        score: search_score(metrics, arc_aware),
+    }
+}
+
+fn local_key_precedes(left: LocalSearchKey, right: LocalSearchKey) -> bool {
+    left.repeat_violations < right.repeat_violations
+        || (left.repeat_violations == right.repeat_violations
+            && left.score + EPSILON < right.score)
+}
+
 fn greedy_route(
     tracks: &[RouteTrack],
     learned_matrix: &Array2<f32>,
@@ -414,9 +439,15 @@ where
             arc_context,
             score_cache,
         )?;
-        let current_score = search_score(&current, arc_context.is_some());
+        let current_key = local_search_key(
+            &route,
+            &current,
+            tracks,
+            config,
+            arc_context.is_some(),
+        );
         let mut best_route = route.clone();
-        let mut best_score = current_score;
+        let mut best_key = current_key;
 
         for start in 0..route.len().saturating_sub(1) {
             for end in start + 1..route.len() {
@@ -425,7 +456,7 @@ where
                 consider_neighbor(
                     candidate,
                     &mut best_route,
-                    &mut best_score,
+                    &mut best_key,
                     tracks,
                     learned_matrix,
                     config,
@@ -444,7 +475,7 @@ where
                     consider_neighbor(
                         candidate,
                         &mut best_route,
-                        &mut best_score,
+                        &mut best_key,
                         tracks,
                         learned_matrix,
                         config,
@@ -455,7 +486,7 @@ where
             }
         }
 
-        if best_score + EPSILON < current_score {
+        if local_key_precedes(best_key, current_key) {
             route = best_route;
         } else {
             return Ok(route);
@@ -467,16 +498,13 @@ where
 fn consider_neighbor(
     candidate: Vec<usize>,
     best_route: &mut Vec<usize>,
-    best_score: &mut f64,
+    best_key: &mut LocalSearchKey,
     tracks: &[RouteTrack],
     learned_matrix: &Array2<f32>,
     config: &SearchConfig,
     arc_context: Option<(&[f64], &[f64])>,
     score_cache: &mut ScoreCache,
 ) -> Result<(), RouteError> {
-    if !repeat_violations(&candidate, tracks, config).is_empty() {
-        return Ok(());
-    }
     let metrics = route_metrics(
         &candidate,
         tracks,
@@ -485,11 +513,19 @@ fn consider_neighbor(
         arc_context,
         score_cache,
     )?;
-    let score = search_score(&metrics, arc_context.is_some());
-    if score + EPSILON < *best_score
-        || ((score - *best_score).abs() <= EPSILON && candidate.as_slice() < best_route.as_slice())
+    let key = local_search_key(
+        &candidate,
+        &metrics,
+        tracks,
+        config,
+        arc_context.is_some(),
+    );
+    if local_key_precedes(key, *best_key)
+        || (key.repeat_violations == best_key.repeat_violations
+            && (key.score - best_key.score).abs() <= EPSILON
+            && candidate.as_slice() < best_route.as_slice())
     {
-        *best_score = score;
+        *best_key = key;
         *best_route = candidate;
     }
     Ok(())
@@ -734,5 +770,34 @@ mod tests {
             optimize_adaptive_route(&tracks, &Array2::eye(23), &config()),
             Err(RouteError::Infeasible)
         );
+    }
+
+    #[test]
+    fn local_search_repairs_repeats_before_improving_acoustic_score() {
+        let tracks = vec![
+            track(0.0, "a"),
+            track(0.1, "a"),
+            track(5.0, "b"),
+            track(5.1, "b"),
+        ];
+        let config = SearchConfig {
+            artist_window: 1,
+            album_window: 0,
+            ..config()
+        };
+        let repaired = improve_route(
+            vec![0, 1, 2, 3],
+            &tracks,
+            &Array2::eye(23),
+            &config,
+            None,
+            &mut ScoreCache::new(),
+            || {},
+        )
+        .unwrap();
+        assert!(repeat_violations(&repaired, &tracks, &config).is_empty());
+        let mut members = repaired;
+        members.sort_unstable();
+        assert_eq!(members, vec![0, 1, 2, 3]);
     }
 }
