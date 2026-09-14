@@ -362,8 +362,7 @@ fn local_search_key(
 
 fn local_key_precedes(left: LocalSearchKey, right: LocalSearchKey) -> bool {
     left.repeat_violations < right.repeat_violations
-        || (left.repeat_violations == right.repeat_violations
-            && left.score + EPSILON < right.score)
+        || (left.repeat_violations == right.repeat_violations && left.score + EPSILON < right.score)
 }
 
 fn greedy_route(
@@ -439,13 +438,7 @@ where
             arc_context,
             score_cache,
         )?;
-        let current_key = local_search_key(
-            &route,
-            &current,
-            tracks,
-            config,
-            arc_context.is_some(),
-        );
+        let current_key = local_search_key(&route, &current, tracks, config, arc_context.is_some());
         let mut best_route = route.clone();
         let mut best_key = current_key;
 
@@ -513,13 +506,7 @@ fn consider_neighbor(
         arc_context,
         score_cache,
     )?;
-    let key = local_search_key(
-        &candidate,
-        &metrics,
-        tracks,
-        config,
-        arc_context.is_some(),
-    );
+    let key = local_search_key(&candidate, &metrics, tracks, config, arc_context.is_some());
     if local_key_precedes(key, *best_key)
         || (key.repeat_violations == best_key.repeat_violations
             && (key.score - best_key.score).abs() <= EPSILON

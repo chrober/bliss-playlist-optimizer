@@ -173,10 +173,14 @@ struct AdaptiveSettings {
 struct SelectionSettings {
     variation_percent: u8,
     generation_seed: u64,
-    #[serde(default)]
-    lastfm_track_guidance_percent: u8,
-    #[serde(default, alias = "lastfm_artist_probability")]
-    lastfm_artist_guidance_percent: u8,
+    #[serde(default, alias = "lastfm_track_guidance_percent")]
+    recording_guidance_percent: u8,
+    #[serde(
+        default,
+        alias = "lastfm_artist_guidance_percent",
+        alias = "lastfm_artist_probability"
+    )]
+    artist_guidance_percent: u8,
     #[serde(default)]
     playcount_influence: i8,
 }
@@ -186,8 +190,8 @@ impl Default for SelectionSettings {
         Self {
             variation_percent: 0,
             generation_seed: 20_260_721,
-            lastfm_track_guidance_percent: 0,
-            lastfm_artist_guidance_percent: 0,
+            recording_guidance_percent: 0,
+            artist_guidance_percent: 0,
             playcount_influence: 0,
         }
     }
@@ -912,17 +916,28 @@ struct FixedSourceExtensionAcceptanceProofsArtifact {
 struct FixedSourceExtensionAdditionArtifact {
     candidate_id: String,
     relevance_distance: f64,
+    semantic_pool: semantic::SemanticPool,
+    semantic_tier: semantic::SemanticTier,
+    semantic_evidence: Vec<semantic::MatchedEvidence>,
+}
+
+#[derive(Debug, PartialEq)]
+struct FixedSourceExtensionAddition {
+    candidate: usize,
+    relevance_distance: f64,
+    semantics: semantic::CandidateSemantics,
 }
 
 struct FixedSourceExtensionResult {
     final_route: Vec<usize>,
-    additions: Vec<(usize, f64)>,
+    additions: Vec<FixedSourceExtensionAddition>,
     selected_strategy: &'static str,
     route_metrics: route::RouteMetrics,
 }
 
 struct FixedSourceExtensionContext<'a> {
-    semantic_candidates: &'a [semantic::CandidateIdentity],
+    semantic_candidate_lookup: &'a semantic::CandidateLookup,
+    semantic_candidate_count: usize,
     source_semantic_identities: &'a [semantic::TrackIdentity],
     semantic_bundle: &'a semantic::EvidenceBundle,
     tracks: &'a [route::RouteTrack],
@@ -935,18 +950,19 @@ struct FixedSourceExtensionContext<'a> {
 
 fn place_fixed_source_extension_additions_preserving_source_order(
     source_route: &[usize],
-    additions: &[(usize, f64)],
+    additions: &[FixedSourceExtensionAddition],
     tracks: &[route::RouteTrack],
     learned_matrix: &Array2<f32>,
     route_config: &route::SearchConfig,
 ) -> Result<(Vec<usize>, route::RouteMetrics), CommandFailure> {
     let mut route = source_route.to_vec();
 
-    for (candidate, _) in additions {
+    for addition in additions {
+        let candidate = addition.candidate;
         let mut best: Option<(usize, route::RouteMetrics, Vec<usize>)> = None;
         for position in 0..=route.len() {
             let mut proposed = route.clone();
-            proposed.insert(position, *candidate);
+            proposed.insert(position, candidate);
             let violations = route::repeat_violations(&proposed, tracks, route_config).len();
             let metrics = route::evaluate_adaptive_sequence(
                 &proposed,
@@ -2596,7 +2612,8 @@ fn select_fixed_source_extension(
     context: FixedSourceExtensionContext<'_>,
 ) -> Result<FixedSourceExtensionResult, CommandFailure> {
     let FixedSourceExtensionContext {
-        semantic_candidates,
+        semantic_candidate_lookup,
+        semantic_candidate_count,
         source_semantic_identities,
         semantic_bundle,
         tracks,
@@ -2714,54 +2731,51 @@ fn select_fixed_source_extension(
     progress.update(
         "extension_semantic_guidance",
         format!(
-            "Matching optional Last.fm guidance against {} addition candidates and {} evidence edges",
-            semantic_candidates.len(),
+            "Applying caller-resolved candidate guidance to {} addition candidates and {} evidence edges",
+            semantic_candidate_count,
             semantic_bundle.edges.len()
         ),
-        Some(0),
-        Some(semantic_candidates.len()),
+        None,
+        None,
     );
-    let mut semantic_candidate_matches = Vec::new();
-    let mut semantic_checked = 0usize;
-    for chunk in semantic_candidates.chunks(EXTENSION_PROGRESS_CHUNK) {
-        let mut chunk_matches =
-            semantic::select_seed_candidates(semantic_bundle, source_semantic_identities, chunk);
-        semantic_checked += chunk.len();
-        semantic_candidate_matches.append(&mut chunk_matches);
-        let track_supported = semantic_candidate_matches
-            .iter()
-            .filter(|candidate| {
-                candidate.evidence.iter().any(|evidence| {
-                    evidence.provider.eq_ignore_ascii_case("last.fm")
-                        && evidence.kind == semantic::EntityKind::Recording
-                })
-            })
-            .count();
-        let artist_supported = semantic_candidate_matches
-            .iter()
-            .filter(|candidate| {
-                candidate.evidence.iter().any(|evidence| {
-                    evidence.provider.eq_ignore_ascii_case("last.fm")
-                        && evidence.kind == semantic::EntityKind::Artist
-                })
-            })
-            .count();
-        progress.update(
-            "extension_semantic_guidance",
-            format!(
-                "Matched Last.fm guidance: {track_supported} candidate tracks supported by track similarity, {artist_supported} candidate tracks supported by artist similarity"
-            ),
-            Some(semantic_checked),
-            Some(semantic_candidates.len()),
-        );
-    }
+    let semantic_candidate_matches = semantic::select_seed_candidate_matches(
+        semantic_bundle,
+        source_semantic_identities,
+        semantic_candidate_lookup,
+    );
+    let recording_supported = semantic_candidate_matches
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .evidence
+                .iter()
+                .any(|evidence| evidence.kind == semantic::EntityKind::Recording)
+        })
+        .count();
+    let artist_supported = semantic_candidate_matches
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .evidence
+                .iter()
+                .any(|evidence| evidence.kind == semantic::EntityKind::Artist)
+        })
+        .count();
+    progress.update(
+        "extension_semantic_guidance",
+        format!(
+            "Matched caller guidance: {recording_supported} candidate tracks supported by recording similarity, {artist_supported} candidate tracks supported by artist similarity"
+        ),
+        Some(semantic_candidate_count),
+        Some(semantic_candidate_count),
+    );
     let semantic_candidates_by_id = semantic_candidate_matches
         .into_iter()
         .map(|candidate| (candidate.candidate, candidate))
         .collect::<HashMap<_, _>>();
 
-    let guidance_enabled = selection.lastfm_track_guidance_percent > 0
-        || selection.lastfm_artist_guidance_percent > 0
+    let guidance_enabled = selection.recording_guidance_percent > 0
+        || selection.artist_guidance_percent > 0
         || selection.playcount_influence != 0;
     let pool_limit = if selection.variation_percent == 0 && !guidance_enabled {
         maximum_requested
@@ -2801,8 +2815,8 @@ fn select_fixed_source_extension(
                     .get(&entry.0)
                     .map(|candidate| {
                         candidate.seed_guidance_score(
-                            selection.lastfm_track_guidance_percent,
-                            selection.lastfm_artist_guidance_percent,
+                            selection.recording_guidance_percent,
+                            selection.artist_guidance_percent,
                         )
                     })
                     .unwrap_or(0.0);
@@ -2843,8 +2857,8 @@ fn select_fixed_source_extension(
                     .get(&entry.0)
                     .map(|candidate| {
                         candidate.seed_guidance_score(
-                            selection.lastfm_track_guidance_percent,
-                            selection.lastfm_artist_guidance_percent,
+                            selection.recording_guidance_percent,
+                            selection.artist_guidance_percent,
                         )
                     })
                     .unwrap_or(0.0);
@@ -2957,7 +2971,18 @@ fn select_fixed_source_extension(
                 continue;
             }
             membership.push(candidate);
-            additions.push((candidate, distance));
+            additions.push(FixedSourceExtensionAddition {
+                candidate,
+                relevance_distance: distance,
+                semantics: semantic_candidates_by_id
+                    .get(&candidate)
+                    .cloned()
+                    .unwrap_or_else(|| semantic::CandidateSemantics {
+                        candidate,
+                        tier: semantic::SemanticTier::BlissOnly,
+                        evidence: Vec::new(),
+                    }),
+            });
             *artist_counts.entry(artist).or_default() += 1;
             *album_counts.entry(album).or_default() += 1;
             progress.update(
@@ -3765,10 +3790,9 @@ fn analyze_bridge_validated(
             )
         }),
     );
-    let materialize_semantic_candidates = request.extension.mode == "fixed_source_extension"
-        || (request.extension.mode == "exact_count"
-            && (request.extension.allow_opening_track.unwrap_or(false)
-                || request.extension.allow_closing_track.unwrap_or(false)));
+    let materialize_semantic_candidates = request.extension.mode == "exact_count"
+        && (request.extension.allow_opening_track.unwrap_or(false)
+            || request.extension.allow_closing_track.unwrap_or(false));
     let semantic_candidates = if materialize_semantic_candidates {
         eligible_candidates
             .iter()
@@ -4257,14 +4281,14 @@ fn analyze_bridge_validated(
                     semantics_by_candidate[&left.candidate]
                         .adjusted_percentile(
                             left.max_percentile,
-                            request.selection.lastfm_track_guidance_percent,
-                            request.selection.lastfm_artist_guidance_percent,
+                            request.selection.recording_guidance_percent,
+                            request.selection.artist_guidance_percent,
                         )
                         .total_cmp(
                             &semantics_by_candidate[&right.candidate].adjusted_percentile(
                                 right.max_percentile,
-                                request.selection.lastfm_track_guidance_percent,
-                                request.selection.lastfm_artist_guidance_percent,
+                                request.selection.recording_guidance_percent,
+                                request.selection.artist_guidance_percent,
                             ),
                         )
                 })
@@ -4272,14 +4296,14 @@ fn analyze_bridge_validated(
                     semantics_by_candidate[&left.candidate]
                         .adjusted_percentile(
                             left.detour_percentile,
-                            request.selection.lastfm_track_guidance_percent,
-                            request.selection.lastfm_artist_guidance_percent,
+                            request.selection.recording_guidance_percent,
+                            request.selection.artist_guidance_percent,
                         )
                         .total_cmp(
                             &semantics_by_candidate[&right.candidate].adjusted_percentile(
                                 right.detour_percentile,
-                                request.selection.lastfm_track_guidance_percent,
-                                request.selection.lastfm_artist_guidance_percent,
+                                request.selection.recording_guidance_percent,
+                                request.selection.artist_guidance_percent,
                             ),
                         )
                 })
@@ -4400,8 +4424,8 @@ fn analyze_bridge_validated(
                 &preview::AutomaticSelectionConfig {
                     max_added_tracks,
                     trigger_percentile,
-                    track_guidance_percent: request.selection.lastfm_track_guidance_percent,
-                    artist_guidance_percent: request.selection.lastfm_artist_guidance_percent,
+                    recording_guidance_percent: request.selection.recording_guidance_percent,
+                    artist_guidance_percent: request.selection.artist_guidance_percent,
                     playcount_influence: request.selection.playcount_influence,
                     variation_percent: request.selection.variation_percent,
                     generation_seed: request.selection.generation_seed,
@@ -4520,8 +4544,8 @@ fn analyze_bridge_validated(
                         candidate_limit: retained_candidate_limit,
                         beam_width: EXACT_COUNT_BEAM_WIDTH,
                         max_tracks_per_gap,
-                        track_guidance_percent: request.selection.lastfm_track_guidance_percent,
-                        artist_guidance_percent: request.selection.lastfm_artist_guidance_percent,
+                        recording_guidance_percent: request.selection.recording_guidance_percent,
+                        artist_guidance_percent: request.selection.artist_guidance_percent,
                         playcount_influence: request.selection.playcount_influence,
                         variation_percent: request.selection.variation_percent,
                         generation_seed: request.selection.generation_seed,
@@ -4627,8 +4651,8 @@ fn analyze_bridge_validated(
                 candidate_limit: retained_candidate_limit,
                 beam_width: destination_beam_width,
                 max_tracks_per_gap: count.max(1),
-                track_guidance_percent: request.selection.lastfm_track_guidance_percent,
-                artist_guidance_percent: request.selection.lastfm_artist_guidance_percent,
+                recording_guidance_percent: request.selection.recording_guidance_percent,
+                artist_guidance_percent: request.selection.artist_guidance_percent,
                 playcount_influence: request.selection.playcount_influence,
                 variation_percent: request.selection.variation_percent,
                 generation_seed: request.selection.generation_seed,
@@ -5125,7 +5149,8 @@ fn analyze_bridge_validated(
                 &eligible_candidates,
                 request.route.ordering_policy == "preserve_order",
                 FixedSourceExtensionContext {
-                    semantic_candidates: &semantic_candidates,
+                    semantic_candidate_lookup: &semantic_candidate_lookup,
+                    semantic_candidate_count: eligible_candidates.len(),
                     source_semantic_identities: &source_semantic_identities,
                     semantic_bundle: &semantic_bundle,
                     tracks: bridge_tracks,
@@ -5163,7 +5188,11 @@ fn analyze_bridge_validated(
             let all_additions_from_local_inventory = extension_result
                 .additions
                 .iter()
-                .all(|(candidate, _)| eligible_candidate_set.contains(candidate));
+                .all(|addition| eligible_candidate_set.contains(&addition.candidate));
+            semantic_assisted |= extension_result
+                .additions
+                .iter()
+                .any(|addition| !addition.semantics.evidence.is_empty());
             let repeat_violations = route::repeat_violations(
                 &extension_result.final_route,
                 bridge_tracks,
@@ -5178,19 +5207,19 @@ fn analyze_bridge_validated(
             let relevance_minimum = extension_result
                 .additions
                 .iter()
-                .map(|(_, distance)| *distance)
+                .map(|addition| addition.relevance_distance)
                 .min_by(f64::total_cmp)
                 .unwrap_or(0.0);
             let relevance_maximum = extension_result
                 .additions
                 .iter()
-                .map(|(_, distance)| *distance)
+                .map(|addition| addition.relevance_distance)
                 .max_by(f64::total_cmp)
                 .unwrap_or(0.0);
             let relevance_mean = extension_result
                 .additions
                 .iter()
-                .map(|(_, distance)| *distance)
+                .map(|addition| addition.relevance_distance)
                 .sum::<f64>()
                 / extension_result.additions.len().max(1) as f64;
             SelectionPreviewArtifact::FixedSourceExtension(FixedSourceExtensionSelectionArtifact {
@@ -5229,12 +5258,23 @@ fn analyze_bridge_validated(
                 selected_additions: extension_result
                     .additions
                     .into_iter()
-                    .map(
-                        |(candidate, relevance_distance)| FixedSourceExtensionAdditionArtifact {
-                            candidate_id: bridge_candidate_id(library.metadata(candidate).row_id),
-                            relevance_distance,
+                    .map(|addition| FixedSourceExtensionAdditionArtifact {
+                        candidate_id: bridge_candidate_id(
+                            library.metadata(addition.candidate).row_id,
+                        ),
+                        relevance_distance: addition.relevance_distance,
+                        semantic_pool: if addition.semantics.evidence.is_empty() {
+                            semantic::SemanticPool::BlissOnly
+                        } else if addition.semantics.evidence.iter().any(|evidence| {
+                            evidence.scope == semantic::EvidenceScope::EndpointLocal
+                        }) {
+                            semantic::SemanticPool::EndpointLocal
+                        } else {
+                            semantic::SemanticPool::CollectionFallback
                         },
-                    )
+                        semantic_tier: addition.semantics.tier,
+                        semantic_evidence: addition.semantics.evidence,
+                    })
                     .collect(),
             })
         }
@@ -5952,7 +5992,7 @@ fn main() {
         [command] if command == "version" => println!("{PROGRAM} {VERSION}"),
         [command, format] if command == "version" && format == "--json" => {
             println!(
-                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"play_count_guidance\":true}}"
+                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"play_count_guidance\":true,\"resolved_candidate_guidance\":true}}"
             );
         }
         _ => {
@@ -6289,8 +6329,8 @@ mod tests {
         request["selection"] = serde_json::json!({
             "variation_percent": 75,
             "generation_seed": 1234,
-            "lastfm_track_guidance_percent": 0,
-            "lastfm_artist_guidance_percent": 0
+            "recording_guidance_percent": 0,
+            "artist_guidance_percent": 0
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6373,8 +6413,8 @@ mod tests {
         request["selection"] = serde_json::json!({
             "variation_percent": 0,
             "generation_seed": 1234,
-            "lastfm_track_guidance_percent": 0,
-            "lastfm_artist_guidance_percent": 0
+            "recording_guidance_percent": 0,
+            "artist_guidance_percent": 0
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6462,8 +6502,8 @@ mod tests {
             request["selection"] = serde_json::json!({
                 "variation_percent": 25,
                 "generation_seed": 1234,
-                "lastfm_track_guidance_percent": 0,
-                "lastfm_artist_guidance_percent": 0
+                "recording_guidance_percent": 0,
+                "artist_guidance_percent": 0
             });
 
             let temporary = std::env::temp_dir().join(format!(
@@ -6528,8 +6568,8 @@ mod tests {
         request["selection"] = serde_json::json!({
             "variation_percent": 0,
             "generation_seed": 1234,
-            "lastfm_track_guidance_percent": 0,
-            "lastfm_artist_guidance_percent": 0
+            "recording_guidance_percent": 0,
+            "artist_guidance_percent": 0
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6664,8 +6704,8 @@ mod tests {
         request["selection"] = serde_json::json!({
             "variation_percent": 0,
             "generation_seed": 1234,
-            "lastfm_track_guidance_percent": 0,
-            "lastfm_artist_guidance_percent": 0
+            "recording_guidance_percent": 0,
+            "artist_guidance_percent": 0
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6776,6 +6816,7 @@ mod tests {
                 },
             })
             .collect::<Vec<_>>();
+        let semantic_candidate_lookup = semantic::CandidateLookup::new(&semantic_candidates);
         let semantic_bundle = semantic::EvidenceBundle {
             schema_version: 1,
             frozen_at: "1970-01-01T00:00:00Z".to_owned(),
@@ -6791,7 +6832,8 @@ mod tests {
             &candidates,
             false,
             FixedSourceExtensionContext {
-                semantic_candidates: &semantic_candidates,
+                semantic_candidate_lookup: &semantic_candidate_lookup,
+                semantic_candidate_count: semantic_candidates.len(),
                 source_semantic_identities: &source_semantic_identities,
                 semantic_bundle: &semantic_bundle,
                 tracks: &tracks,
@@ -6835,7 +6877,8 @@ mod tests {
             &candidates,
             true,
             FixedSourceExtensionContext {
-                semantic_candidates: &semantic_candidates,
+                semantic_candidate_lookup: &semantic_candidate_lookup,
+                semantic_candidate_count: semantic_candidates.len(),
                 source_semantic_identities: &source_semantic_identities,
                 semantic_bundle: &semantic_bundle,
                 tracks: &tracks,
@@ -6863,6 +6906,95 @@ mod tests {
         );
         assert!(route::repeat_violations(&preserved.final_route, &tracks, &config).is_empty());
 
+        let guided_bundle = semantic::EvidenceBundle {
+            schema_version: 1,
+            frozen_at: "1970-01-01T00:00:00Z".to_owned(),
+            providers: vec![semantic::ProviderState {
+                provider: "fixture-provider".to_owned(),
+                dataset_or_algorithm: Some("recording-similarity".to_owned()),
+                state: semantic::ProviderStatus::Fresh,
+                request_count: Some(1),
+                failure_count: Some(0),
+                error_codes: Vec::new(),
+            }],
+            edges: vec![semantic::EvidenceEdge {
+                provider: "fixture-provider".to_owned(),
+                dataset_or_algorithm: Some("recording-similarity".to_owned()),
+                source: semantic::Entity {
+                    kind: semantic::EntityKind::Recording,
+                    id: "seed-0".to_owned(),
+                    mbid: None,
+                    name: None,
+                    title: None,
+                },
+                candidate: semantic::Entity {
+                    kind: semantic::EntityKind::Recording,
+                    id: "provider-result".to_owned(),
+                    mbid: None,
+                    name: None,
+                    title: None,
+                },
+                resolved_candidate_id: Some("bliss-row-3".to_owned()),
+                scope: semantic::EvidenceScope::EndpointLocal,
+                raw_rank: Some(1),
+                raw_score: Some(1.0),
+                identity_confidence: 1.0,
+                observed_at: None,
+                cache_state: Some(semantic::CacheState::Fresh),
+            }],
+        };
+        let guided_lookup = semantic::CandidateLookup::from_library_candidates(
+            &guided_bundle,
+            candidates.iter().map(|candidate| {
+                (
+                    *candidate,
+                    *candidate as u64,
+                    semantic_candidates[*candidate - 2]
+                        .track
+                        .title_name
+                        .as_str(),
+                    semantic_candidates[*candidate - 2]
+                        .track
+                        .artist_name
+                        .as_str(),
+                )
+            }),
+        );
+        let mut progress = ProgressReporter::disabled();
+        let guided = select_fixed_source_extension(
+            3,
+            None,
+            &[0, 1],
+            &[0, 1],
+            &candidates,
+            false,
+            FixedSourceExtensionContext {
+                semantic_candidate_lookup: &guided_lookup,
+                semantic_candidate_count: semantic_candidates.len(),
+                source_semantic_identities: &source_semantic_identities,
+                semantic_bundle: &guided_bundle,
+                tracks: &tracks,
+                learned_matrix: &Array2::eye(23),
+                route_config: &config,
+                selection: SelectionSettings {
+                    variation_percent: 0,
+                    generation_seed: 1234,
+                    recording_guidance_percent: 100,
+                    artist_guidance_percent: 0,
+                    playcount_influence: 0,
+                },
+                shortlist_limit: 256,
+                progress: &mut progress,
+            },
+        )
+        .unwrap();
+        assert_eq!(guided.additions[0].candidate, 3);
+        assert_eq!(
+            guided.additions[0].semantics.tier,
+            semantic::SemanticTier::RecordingOne
+        );
+        assert_eq!(guided.additions[0].semantics.evidence.len(), 1);
+
         let varied = |seed| {
             let mut progress = ProgressReporter::disabled();
             select_fixed_source_extension(
@@ -6873,7 +7005,8 @@ mod tests {
                 &candidates,
                 false,
                 FixedSourceExtensionContext {
-                    semantic_candidates: &semantic_candidates,
+                    semantic_candidate_lookup: &semantic_candidate_lookup,
+                    semantic_candidate_count: semantic_candidates.len(),
                     source_semantic_identities: &source_semantic_identities,
                     semantic_bundle: &semantic_bundle,
                     tracks: &tracks,
@@ -6882,8 +7015,8 @@ mod tests {
                     selection: SelectionSettings {
                         variation_percent: 100,
                         generation_seed: seed,
-                        lastfm_track_guidance_percent: 0,
-                        lastfm_artist_guidance_percent: 0,
+                        recording_guidance_percent: 0,
+                        artist_guidance_percent: 0,
                         playcount_influence: 0,
                     },
                     shortlist_limit: 256,
@@ -6897,11 +7030,11 @@ mod tests {
         assert_ne!(
             varied(101)
                 .iter()
-                .map(|entry| entry.0)
+                .map(|entry| entry.candidate)
                 .collect::<HashSet<_>>(),
             varied(202)
                 .iter()
-                .map(|entry| entry.0)
+                .map(|entry| entry.candidate)
                 .collect::<HashSet<_>>()
         );
     }

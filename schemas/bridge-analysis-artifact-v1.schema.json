@@ -376,10 +376,26 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["candidate_id", "relevance_distance"],
+            "required": [
+              "candidate_id", "relevance_distance", "semantic_pool", "semantic_tier",
+              "semantic_evidence"
+            ],
             "properties": {
               "candidate_id": { "type": "string", "pattern": "^bliss-row-[1-9][0-9]*$" },
-              "relevance_distance": { "type": "number", "minimum": 0 }
+              "relevance_distance": { "type": "number", "minimum": 0 },
+              "semantic_pool": {
+                "enum": ["endpoint_local", "collection_fallback", "bliss_only"]
+              },
+              "semantic_tier": {
+                "enum": [
+                  "recording_both", "recording_one", "artist_local",
+                  "artist_collection", "bliss_only"
+                ]
+              },
+              "semantic_evidence": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/matched_evidence" }
+              }
             }
           }
         }

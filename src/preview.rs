@@ -35,7 +35,7 @@ pub struct AutomaticGap {
 pub struct AutomaticSelectionConfig {
     pub max_added_tracks: usize,
     pub trigger_percentile: f64,
-    pub track_guidance_percent: u8,
+    pub recording_guidance_percent: u8,
     pub artist_guidance_percent: u8,
     pub playcount_influence: i8,
     pub variation_percent: u8,
@@ -48,7 +48,7 @@ pub struct ExactSelectionConfig {
     pub candidate_limit: usize,
     pub beam_width: usize,
     pub max_tracks_per_gap: usize,
-    pub track_guidance_percent: u8,
+    pub recording_guidance_percent: u8,
     pub artist_guidance_percent: u8,
     pub playcount_influence: i8,
     pub variation_percent: u8,
@@ -89,7 +89,7 @@ impl EvolvingAcceptance {
 impl AutomaticSelectionConfig {
     fn guidance(self) -> GuidanceConfig {
         GuidanceConfig {
-            track_percent: self.track_guidance_percent,
+            track_percent: self.recording_guidance_percent,
             artist_percent: self.artist_guidance_percent,
             playcount_influence: self.playcount_influence,
         }
@@ -107,7 +107,7 @@ impl AutomaticSelectionConfig {
 impl ExactSelectionConfig {
     fn guidance(self) -> GuidanceConfig {
         GuidanceConfig {
-            track_percent: self.track_guidance_percent,
+            track_percent: self.recording_guidance_percent,
             artist_percent: self.artist_guidance_percent,
             playcount_influence: self.playcount_influence,
         }
@@ -1006,7 +1006,7 @@ where
         .map(|candidate| AnchoredPathCandidate {
             track: candidate.candidate,
             semantic_support: candidate.guidance_score(
-                selection_config.track_guidance_percent,
+                selection_config.recording_guidance_percent,
                 selection_config.artist_guidance_percent,
             ),
         })
@@ -2015,7 +2015,7 @@ mod tests {
         let selection_config = AutomaticSelectionConfig {
             max_added_tracks: 1,
             trigger_percentile: 0.70,
-            track_guidance_percent: 0,
+            recording_guidance_percent: 0,
             artist_guidance_percent: 0,
             playcount_influence: 0,
             variation_percent: 0,
@@ -2088,7 +2088,7 @@ mod tests {
         let selection_config = AutomaticSelectionConfig {
             max_added_tracks: 1,
             trigger_percentile: 0.70,
-            track_guidance_percent: 0,
+            recording_guidance_percent: 0,
             artist_guidance_percent: 0,
             playcount_influence: 0,
             variation_percent: 0,
@@ -2135,7 +2135,7 @@ mod tests {
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 1,
-            track_guidance_percent: 0,
+            recording_guidance_percent: 0,
             artist_guidance_percent: 0,
             playcount_influence: 0,
             variation_percent: 0,
@@ -2227,7 +2227,7 @@ mod tests {
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 2,
-            track_guidance_percent: 0,
+            recording_guidance_percent: 0,
             artist_guidance_percent: 0,
             playcount_influence: 0,
             variation_percent: 0,
@@ -2335,7 +2335,7 @@ mod tests {
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 2,
-            track_guidance_percent: 0,
+            recording_guidance_percent: 0,
             artist_guidance_percent: 0,
             playcount_influence: 0,
             variation_percent: 0,
@@ -2394,7 +2394,7 @@ mod tests {
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 2,
-            track_guidance_percent: 0,
+            recording_guidance_percent: 0,
             artist_guidance_percent: 0,
             playcount_influence: 0,
             variation_percent: 0,
@@ -2461,7 +2461,7 @@ mod tests {
             candidate_limit: 1,
             beam_width: 8,
             max_tracks_per_gap: 1,
-            track_guidance_percent: 0,
+            recording_guidance_percent: 0,
             artist_guidance_percent: 0,
             playcount_influence: 0,
             variation_percent: 0,
@@ -2526,7 +2526,7 @@ mod tests {
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 1,
-            track_guidance_percent: 0,
+            recording_guidance_percent: 0,
             artist_guidance_percent: 0,
             playcount_influence: 0,
             variation_percent: 0,

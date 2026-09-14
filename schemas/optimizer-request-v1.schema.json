@@ -91,24 +91,38 @@
           "minimum": 0,
           "description": "Reproducible per-job seed used by every scoring strategy and selection workflow."
         },
+        "recording_guidance_percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Bounded influence of caller-resolved recording-level guidance after acoustic qualification; zero ignores recording guidance."
+        },
+        "artist_guidance_percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Bounded influence of caller-resolved artist-level guidance after acoustic qualification; zero ignores artist guidance."
+        },
         "lastfm_track_guidance_percent": {
           "type": "integer",
           "minimum": 0,
           "maximum": 100,
-          "description": "Bounded influence of Last.fm recording-level evidence after acoustic qualification; zero ignores recording evidence."
+          "deprecated": true,
+          "description": "Legacy alias for recording_guidance_percent."
         },
         "lastfm_artist_guidance_percent": {
           "type": "integer",
           "minimum": 0,
           "maximum": 100,
-          "description": "Bounded influence of Last.fm artist-level evidence after acoustic qualification; zero ignores artist evidence."
+          "deprecated": true,
+          "description": "Legacy alias for artist_guidance_percent."
         },
         "lastfm_artist_probability": {
           "type": "integer",
           "minimum": 0,
           "maximum": 100,
           "deprecated": true,
-          "description": "Legacy alias for lastfm_artist_guidance_percent."
+          "description": "Legacy alias for artist_guidance_percent."
         },
         "playcount_influence": {
           "type": "integer",

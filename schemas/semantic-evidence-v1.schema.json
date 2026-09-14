@@ -67,6 +67,11 @@
         "dataset_or_algorithm": { "type": "string" },
         "source": { "$ref": "#/$defs/entity" },
         "candidate": { "$ref": "#/$defs/entity" },
+        "resolved_candidate_id": {
+          "type": "string",
+          "pattern": "^bliss-row-[1-9][0-9]*$",
+          "description": "Optional caller-resolved local candidate identity. When present, the optimizer uses it directly and does not perform provider identity matching."
+        },
         "scope": { "enum": ["endpoint_local", "collection_fallback"] },
         "raw_rank": { "type": "integer", "minimum": 1 },
         "raw_score": { "type": "number" },

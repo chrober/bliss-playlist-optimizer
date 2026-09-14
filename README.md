@@ -3,7 +3,7 @@
 **bliss-playlist-optimizer** is the network-free Rust engine behind the Lyrion
 plugin [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss).
 It turns a frozen playlist request, Bliss feature database, repeat rules, the
-optional learned similarity matrix, and optional semantic evidence into an
+optional learned similarity matrix, and optional caller-resolved candidate guidance into an
 auditable proposed route. It can reorder fixed membership, analyze and select
 bridge tracks, preserve source anchors, extend a fixed source set to an exact
 target, build a destination-locked one-way route, or build a two-boundary
@@ -19,7 +19,7 @@ and requires neither Python nor network access on the server.
 
 This program deliberately does not call Last.fm, modify `bliss.db`, write
 audio metadata, or create Lyrion playlists. Better Call Bliss owns provider
-access, LMS identities, user interaction, Preview, and playlist persistence;
+access, provider-to-LMS identity resolution, user interaction, Preview, and playlist persistence;
 this repository owns the versioned native request/result contracts, validation,
 scoring, selection, routing, and diagnostic artifacts. The user-facing playlist
 modes and options are described in the plugin's
@@ -117,8 +117,13 @@ change is a safe miss.
 Cache format v2 stores compact metadata separately from the route features and
 artist/album repeat keys. Destination jobs borrow those decoded route tracks
 instead of cloning the complete library for every optimizer process. Optional
-semantic lookup is evidence-scoped: it scans candidates once but retains index
-entries only for recording/artist keys actually named by the evidence bundle.
+candidate-guidance lookup is evidence-scoped. Current Better Call Bliss requests
+carry explicit `bliss-row-N` candidate identities resolved against the frozen
+LMS/Bliss inventory before launch, so the native engine does not interpret
+Last.fm names or MusicBrainz identifiers. The legacy unresolved-evidence form
+remains accepted by the v1 contract. In either form the optimizer scans candidates
+once but retains index entries only for identities actually named by the evidence
+bundle.
 Its retained memory is therefore proportional to evidence matches rather than
 the full library. A 200,000-candidate regression test protects this property.
 The remaining cold and warm setup passes are intentionally linear in library
@@ -166,8 +171,8 @@ availability, base matrix hash, and fallback contract so callers do not have to
 infer the actual scoring setup from request fields alone.  
 
 Requests may include the strategy-neutral `selection` block with
-`variation_percent`, `generation_seed`, `lastfm_track_guidance_percent`, and
-`lastfm_artist_guidance_percent`, plus signed `playcount_influence` from -100
+`variation_percent`, `generation_seed`, `recording_guidance_percent`, and
+`artist_guidance_percent`, plus signed `playcount_influence` from -100
 to 100.
 Variation zero preserves strict deterministic route, bridge, and fixed-source
 extension choices. Higher values seed route search, reorder a bounded pool of
@@ -175,16 +180,19 @@ acoustically qualified bridge candidates, and let fixed-source extension perform
 reproducible weighted sampling inside a bounded top acoustic pool.
 The same seed and inputs reproduce membership across worker counts. Selection
 is downstream of scoring rather than nested under Adaptive, so Static and
-Forest can reuse it when those strategies are connected. The two Last.fm values
-independently scale recording and artist evidence after local-inventory,
+Forest can reuse it when those strategies are connected. The two provider-neutral
+values independently scale recording and artist guidance after local-inventory,
 acoustic, uniqueness, and repeat-capacity qualification. Zero ignores that
-evidence type. Bridge ranking caps Last.fm's combined adjustment and the
+guidance type. Better Call Bliss currently derives these hints from its own
+LastMix/Last.fm adapter, but the optimizer neither calls nor branches on that
+provider. Bridge ranking caps the combined guidance adjustment and the
 play-count adjustment at ten percentile points each. Deterministic fixed-source
 extension caps each guidance contribution at 20% of its bounded Bliss relevance
 pool; varied fixed-source extension uses bounded evidence multipliers. These
 are guidance strengths, not quotas, and even 100 cannot rescue an acoustically
-rejected candidate. The deprecated `lastfm_artist_probability` spelling remains
-an input alias for artist guidance. Omitting the block retains deterministic
+rejected candidate. The deprecated `lastfm_track_guidance_percent`,
+`lastfm_artist_guidance_percent`, and `lastfm_artist_probability` spellings remain
+input aliases. Omitting the block retains deterministic
 zero-guidance defaults.
 
 A non-zero play-count influence requires a checksum-protected

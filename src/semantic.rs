@@ -97,6 +97,7 @@ pub struct EvidenceEdge {
     pub dataset_or_algorithm: Option<String>,
     pub source: Entity,
     pub candidate: Entity,
+    pub resolved_candidate_id: Option<String>,
     pub scope: EvidenceScope,
     pub raw_rank: Option<u64>,
     pub raw_score: Option<f64>,
@@ -249,8 +250,7 @@ impl CandidateSemantics {
             .evidence
             .iter()
             .filter(|evidence| {
-                evidence.provider.eq_ignore_ascii_case("last.fm")
-                    && evidence.kind == EntityKind::Recording
+                evidence.kind == EntityKind::Recording
                     && evidence.source_endpoint == SourceEndpoint::Left
             })
             .map(Self::evidence_strength)
@@ -259,8 +259,7 @@ impl CandidateSemantics {
             .evidence
             .iter()
             .filter(|evidence| {
-                evidence.provider.eq_ignore_ascii_case("last.fm")
-                    && evidence.kind == EntityKind::Recording
+                evidence.kind == EntityKind::Recording
                     && evidence.source_endpoint == SourceEndpoint::Right
             })
             .map(Self::evidence_strength)
@@ -275,10 +274,7 @@ impl CandidateSemantics {
     pub fn artist_support(&self) -> f64 {
         self.evidence
             .iter()
-            .filter(|evidence| {
-                evidence.provider.eq_ignore_ascii_case("last.fm")
-                    && evidence.kind == EntityKind::Artist
-            })
+            .filter(|evidence| evidence.kind == EntityKind::Artist)
             .map(|evidence| {
                 let scope_factor = if evidence.scope == EvidenceScope::CollectionFallback {
                     0.5
@@ -301,10 +297,7 @@ impl CandidateSemantics {
         let recording_support = self
             .evidence
             .iter()
-            .filter(|evidence| {
-                evidence.provider.eq_ignore_ascii_case("last.fm")
-                    && evidence.kind == EntityKind::Recording
-            })
+            .filter(|evidence| evidence.kind == EntityKind::Recording)
             .map(Self::evidence_strength)
             .max_by(f64::total_cmp)
             .unwrap_or(0.0);
@@ -379,6 +372,14 @@ impl CandidateLookup {
         let mut required_artist_keys = HashMap::<String, Vec<String>>::new();
 
         for edge in &bundle.edges {
+            if let Some(row_id) = edge
+                .resolved_candidate_id
+                .as_deref()
+                .and_then(|value| value.strip_prefix("bliss-row-"))
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                required_recording_rows.insert(row_id);
+            }
             match edge.candidate.kind {
                 EntityKind::Recording => {
                     for key in recording_keys_for_entity(&edge.candidate) {
@@ -484,7 +485,11 @@ impl CandidateLookup {
         lookup
     }
 
-    fn candidates_for_entity(&self, entity: &Entity) -> Vec<usize> {
+    fn candidates_for_edge(&self, edge: &EvidenceEdge) -> Vec<usize> {
+        if let Some(resolved) = edge.resolved_candidate_id.as_deref() {
+            return self.recording.get(resolved).cloned().unwrap_or_default();
+        }
+        let entity = &edge.candidate;
         let keys = match entity.kind {
             EntityKind::Recording => recording_keys_for_entity(entity),
             EntityKind::Artist => artist_keys_for_entity(entity),
@@ -658,6 +663,13 @@ fn source_matches(edge: &EvidenceEdge, track: &TrackIdentity) -> bool {
 }
 
 fn candidate_matches(edge: &EvidenceEdge, track: &TrackIdentity) -> bool {
+    if edge
+        .resolved_candidate_id
+        .as_deref()
+        .is_some_and(|candidate_id| candidate_id == track.recording_id)
+    {
+        return true;
+    }
     if edge.source.kind != edge.candidate.kind {
         return false;
     }
@@ -941,6 +953,43 @@ pub fn select_seed_candidates(
         .collect()
 }
 
+pub fn select_seed_candidate_matches(
+    bundle: &EvidenceBundle,
+    collection_sources: &[TrackIdentity],
+    lookup: &CandidateLookup,
+) -> Vec<CandidateSemantics> {
+    let mut matches = HashMap::<usize, CandidateAccumulator>::new();
+    for edge in &bundle.edges {
+        if edge.source.kind != edge.candidate.kind
+            || !collection_sources
+                .iter()
+                .any(|source| source_matches(edge, source))
+        {
+            continue;
+        }
+        for candidate in lookup.candidates_for_edge(edge) {
+            let accumulator = matches.entry(candidate).or_default();
+            accumulator.recording_left |= edge.source.kind == EntityKind::Recording;
+            accumulator.artist_local |= edge.source.kind == EntityKind::Artist
+                && edge.scope == EvidenceScope::EndpointLocal;
+            accumulator.evidence.push(matched_evidence(
+                edge,
+                if edge.scope == EvidenceScope::CollectionFallback {
+                    SourceEndpoint::Collection
+                } else {
+                    SourceEndpoint::Left
+                },
+            ));
+        }
+    }
+    let mut candidates = matches
+        .into_iter()
+        .map(|(candidate, accumulator)| semantics_from_accumulator(candidate, accumulator))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| candidate.candidate);
+    candidates
+}
+
 pub fn select_gap_candidates(
     bundle: &EvidenceBundle,
     left: &TrackIdentity,
@@ -1053,7 +1102,7 @@ pub fn select_gap_candidate_matches(
         if !left_match && !right_match {
             continue;
         }
-        for candidate in lookup.candidates_for_entity(&edge.candidate) {
+        for candidate in lookup.candidates_for_edge(edge) {
             let accumulator = local.entry(candidate).or_default();
             if left_match {
                 accumulator.recording_left |= edge.source.kind == EntityKind::Recording;
@@ -1094,7 +1143,7 @@ pub fn select_gap_candidate_matches(
         {
             continue;
         }
-        for candidate in lookup.candidates_for_entity(&edge.candidate) {
+        for candidate in lookup.candidates_for_edge(edge) {
             collection
                 .entry(candidate)
                 .or_default()
@@ -1157,6 +1206,7 @@ mod tests {
             dataset_or_algorithm: Some("fixture-v1".to_owned()),
             source: entity(source_kind, source_id),
             candidate: entity(candidate_kind, candidate_id),
+            resolved_candidate_id: None,
             scope,
             raw_rank: Some(rank),
             raw_score: None,
@@ -1455,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn lastfm_recording_metadata_matches_and_guidance_is_bounded() {
+    fn provider_neutral_recording_guidance_is_bounded() {
         let left = track("source", "Source Artist");
         let right = track("right", "Right Artist");
         let mut local_track = track("bliss-row-10", "Similar Artist");
@@ -1476,8 +1526,8 @@ mod tests {
             EvidenceScope::EndpointLocal,
             1,
         );
-        recording_edge.provider = "last.fm".to_owned();
-        recording_edge.dataset_or_algorithm = Some("track.getSimilar".to_owned());
+        recording_edge.provider = "fixture-provider".to_owned();
+        recording_edge.dataset_or_algorithm = Some("recording-similarity".to_owned());
         recording_edge.candidate.name = Some("Similar Artist".to_owned());
         recording_edge.candidate.title = Some("Similar Song".to_owned());
         recording_edge.raw_score = Some(0.9);
@@ -1507,6 +1557,43 @@ mod tests {
         let fully_guided = guided.adjusted_percentile(0.5, 100, 100);
         assert!(fully_guided < 0.5);
         assert!(fully_guided >= 0.4);
+    }
+
+    #[test]
+    fn caller_resolved_candidate_id_bypasses_provider_name_matching() {
+        let left = track("source", "Source Artist");
+        let right = track("right", "Right Artist");
+        let mut resolved = edge(
+            EntityKind::Recording,
+            "source",
+            EntityKind::Recording,
+            "provider-result-with-no-local-name-match",
+            EvidenceScope::EndpointLocal,
+            1,
+        );
+        resolved.provider = "fixture-provider".to_owned();
+        resolved.resolved_candidate_id = Some("bliss-row-42".to_owned());
+        let bundle = EvidenceBundle {
+            schema_version: 1,
+            frozen_at: "2026-09-14T00:00:00Z".to_owned(),
+            providers: Vec::new(),
+            edges: vec![resolved],
+        };
+        let lookup = CandidateLookup::from_library_candidates(
+            &bundle,
+            [(7usize, 42u64, "local title", "local artist")],
+        );
+        let selected = select_gap_candidate_matches(
+            &bundle,
+            &left,
+            &right,
+            &[left.clone(), right.clone()],
+            &lookup,
+        );
+        assert_eq!(selected.pool, SemanticPool::EndpointLocal);
+        assert_eq!(selected.candidates.len(), 1);
+        assert_eq!(selected.candidates[0].candidate, 7);
+        assert!(selected.candidates[0].track_support() > 0.0);
     }
 
     #[test]
