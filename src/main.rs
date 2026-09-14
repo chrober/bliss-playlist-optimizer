@@ -2588,6 +2588,7 @@ fn endpoint_candidate_artifact(
 
 fn select_fixed_source_extension(
     target_track_count: usize,
+    max_target_track_count: Option<usize>,
     source_library_indices: &[usize],
     selected_library_route: &[usize],
     eligible_candidates: &[usize],
@@ -2614,16 +2615,29 @@ fn select_fixed_source_extension(
             ),
         ));
     }
-    let requested = target_track_count - source_library_indices.len();
-    if requested > eligible_candidates.len() {
+    let maximum_target_track_count = max_target_track_count
+        .unwrap_or(target_track_count)
+        .min(source_library_indices.len() + eligible_candidates.len());
+    if maximum_target_track_count < target_track_count {
+        return Err(CommandFailure::new(
+            "FIXED_SOURCE_EXTENSION_TARGET_INVALID",
+            format!(
+                "fixed-source extension maximum target {maximum_target_track_count} is below the minimum target {target_track_count}"
+            ),
+        ));
+    }
+    let minimum_requested = target_track_count - source_library_indices.len();
+    let maximum_requested = maximum_target_track_count - source_library_indices.len();
+    if minimum_requested > eligible_candidates.len() {
         return Err(CommandFailure::new(
             "FIXED_SOURCE_EXTENSION_INFEASIBLE",
             format!(
-                "fixed-source extension needs {requested} additions but only {} local analyzed candidates are eligible",
+                "fixed-source extension needs at least {minimum_requested} additions but only {} local analyzed candidates are eligible",
                 eligible_candidates.len()
             ),
         ));
     }
+    let dynamic_target = maximum_target_track_count > target_track_count;
 
     // The complete, immutable source set defines relevance. Newly selected
     // tracks never enter this context, which prevents iterative taste drift.
@@ -2750,9 +2764,9 @@ fn select_fixed_source_extension(
         || selection.lastfm_artist_guidance_percent > 0
         || selection.playcount_influence != 0;
     let pool_limit = if selection.variation_percent == 0 && !guidance_enabled {
-        requested
+        maximum_requested
     } else {
-        requested.saturating_mul(10).max(requested)
+        maximum_requested.saturating_mul(10).max(maximum_requested)
     }
     .min(shortlist_limit)
     .min(ranked.len());
@@ -2776,7 +2790,7 @@ fn select_fixed_source_extension(
             Some(pool_limit),
         );
         let variation = f64::from(selection.variation_percent) / 100.0;
-        let temperature = (requested.max(1) as f64 * (0.25 + 9.75 * variation)).max(1.0);
+        let temperature = (maximum_requested.max(1) as f64 * (0.25 + 9.75 * variation)).max(1.0);
         let mut rng = StdRng::seed_from_u64(selection.generation_seed);
         let mut sampled = selection_order
             .into_iter()
@@ -2864,188 +2878,236 @@ fn select_fixed_source_extension(
             .filter(|entry| !in_pool.contains(&entry.0)),
     );
 
-    // Membership selection follows relevance order while applying the
-    // necessary per-key capacity implied by each repeat window. Routing then
-    // optimizes the complete fixed membership, allowing added tracks to make a
-    // repeated-artist or repeated-album seed set feasible.
-    progress.update(
-        "extension_membership_selection",
-        format!(
-            "Selecting {requested} repeat-safe additions from {} ordered candidates",
-            selection_order.len()
-        ),
-        Some(0),
-        Some(requested),
+    let mut last_failure = CommandFailure::new(
+        "FIXED_SOURCE_EXTENSION_INFEASIBLE",
+        "no fixed-source extension target was evaluated",
     );
-    let artist_capacity = if route_config.artist_window == 0 {
-        usize::MAX
-    } else {
-        target_track_count.div_ceil(route_config.artist_window + 1)
-    };
-    let album_capacity = if route_config.album_window == 0 {
-        usize::MAX
-    } else {
-        target_track_count.div_ceil(route_config.album_window + 1)
-    };
-    let mut artist_counts = HashMap::<&str, usize>::new();
-    let mut album_counts = HashMap::<&str, usize>::new();
-    for index in source_library_indices {
-        *artist_counts.entry(&tracks[*index].artist_key).or_default() += 1;
-        *album_counts.entry(&tracks[*index].album_key).or_default() += 1;
-    }
-    if artist_counts.values().any(|count| *count > artist_capacity)
-        || album_counts.values().any(|count| *count > album_capacity)
-    {
-        return Err(CommandFailure::new(
-            "FIXED_SOURCE_EXTENSION_INFEASIBLE",
-            "the source membership exceeds the requested target's repeat-window capacity",
-        ));
-    }
-
-    let mut membership = selected_library_route.to_vec();
-    let mut additions = Vec::with_capacity(requested);
-    let mut considered = 0usize;
-    for (candidate, distance) in selection_order {
-        considered += 1;
-        let artist = tracks[candidate].artist_key.as_str();
-        let album = tracks[candidate].album_key.as_str();
-        if artist_counts.get(artist).copied().unwrap_or(0) >= artist_capacity
-            || album_counts.get(album).copied().unwrap_or(0) >= album_capacity
-        {
-            if considered.is_multiple_of(EXTENSION_PROGRESS_CHUNK) {
-                progress.update(
-                    "extension_membership_selection",
-                    format!(
-                        "Selected {}/{} additions after checking {considered} candidates",
-                        additions.len(),
-                        requested
-                    ),
-                    Some(source_library_indices.len() + additions.len()),
-                    Some(target_track_count),
-                );
-            }
-            continue;
-        }
-        membership.push(candidate);
-        additions.push((candidate, distance));
-        *artist_counts.entry(artist).or_default() += 1;
-        *album_counts.entry(album).or_default() += 1;
+    for candidate_target_track_count in target_track_count..=maximum_target_track_count {
+        let requested = candidate_target_track_count - source_library_indices.len();
+        // Membership selection follows relevance order while applying the
+        // necessary per-key capacity implied by each repeat window. Routing then
+        // optimizes the complete fixed membership, allowing added tracks to make a
+        // repeated-artist or repeated-album seed set feasible.
         progress.update(
             "extension_membership_selection",
-            format!(
-                "Selected {}/{} additions after checking {considered} candidates",
-                additions.len(),
-                requested
-            ),
-            Some(source_library_indices.len() + additions.len()),
-            Some(target_track_count),
-        );
-        if additions.len() == requested {
-            break;
-        }
-    }
-    if additions.len() != requested {
-        return Err(CommandFailure::new(
-            "FIXED_SOURCE_EXTENSION_INFEASIBLE",
-            format!(
-                "repeat-safe membership selection found {} of {requested} required additions",
-                additions.len()
-            ),
-        ));
-    }
-    let (final_route, selected_strategy, route_metrics) = if preserve_source_order {
-        progress.update(
-            "extension_route_placement",
-            format!(
-                "Placing {} additions around {} preserved source anchors",
-                additions.len(),
-                source_library_indices.len()
-            ),
-            Some(source_library_indices.len()),
-            Some(target_track_count),
-        );
-        let (route, metrics) = place_fixed_source_extension_additions_preserving_source_order(
-            selected_library_route,
-            &additions,
-            tracks,
-            learned_matrix,
-            route_config,
-        )?;
-        (route, "fixed-source-extension-preserve-order", metrics)
-    } else {
-        let route_message = format!(
-            "Routing {} selected tracks after choosing {} additions: fixed starts, {} restarts, reversal and relocation local search",
-            membership.len(),
-            additions.len(),
-            route_config.restart_count
-        );
-        progress.update("extension_route_search", &route_message, None, None);
-        let route_progress = Arc::new(Mutex::new(RouteProgressSnapshot {
-            total_tasks: route_config.restart_count * 2 + 5,
-            ..RouteProgressSnapshot::default()
-        }));
-        let heartbeat_progress = Arc::clone(&route_progress);
-        let track_count = membership.len();
-        let _heartbeat = progress.dynamic_heartbeat(
-            "extension_route_search",
-            Duration::from_secs(2),
-            move || {
-                let snapshot = heartbeat_progress
-                    .lock()
-                    .map(|guard| *guard)
-                    .unwrap_or_default();
-                let phase = match snapshot.phase {
-                    "adaptive" => "primary route",
-                    "adaptive-arc" => "energy-arc route",
-                    other => other,
-                };
+            if dynamic_target {
                 format!(
-                    "Routing {track_count} selected tracks: {phase}, completed {}/{} route tasks, {} local-search passes",
-                    snapshot.completed_tasks,
-                    snapshot.total_tasks,
-                    snapshot.local_search_passes
+                    "Trying repeat-safe target {candidate_target_track_count}/{maximum_target_track_count}: selecting {requested} additions from {} ordered candidates",
+                    selection_order.len()
+                )
+            } else {
+                format!(
+                    "Selecting {requested} repeat-safe additions from {} ordered candidates",
+                    selection_order.len()
                 )
             },
+            Some(source_library_indices.len()),
+            Some(candidate_target_track_count),
         );
-        let route_tracks = membership
-            .iter()
-            .map(|index| tracks[*index].clone())
-            .collect::<Vec<_>>();
-        let route_progress_writer = Arc::clone(&route_progress);
-        let result = route::optimize_adaptive_route_with_progress(
-            &route_tracks,
-            learned_matrix,
-            route_config,
-            move |event| {
-                if let Ok(mut snapshot) = route_progress_writer.lock() {
-                    *snapshot = RouteProgressSnapshot {
-                        phase: event.phase,
-                        completed_tasks: event.completed_tasks,
-                        total_tasks: event.total_tasks,
-                        local_search_passes: event.local_search_passes,
-                    };
+        let artist_capacity = if route_config.artist_window == 0 {
+            usize::MAX
+        } else {
+            candidate_target_track_count.div_ceil(route_config.artist_window + 1)
+        };
+        let album_capacity = if route_config.album_window == 0 {
+            usize::MAX
+        } else {
+            candidate_target_track_count.div_ceil(route_config.album_window + 1)
+        };
+        let mut artist_counts = HashMap::<&str, usize>::new();
+        let mut album_counts = HashMap::<&str, usize>::new();
+        for index in source_library_indices {
+            *artist_counts.entry(&tracks[*index].artist_key).or_default() += 1;
+            *album_counts.entry(&tracks[*index].album_key).or_default() += 1;
+        }
+        if artist_counts.values().any(|count| *count > artist_capacity)
+            || album_counts.values().any(|count| *count > album_capacity)
+        {
+            last_failure = CommandFailure::new(
+                "FIXED_SOURCE_EXTENSION_INFEASIBLE",
+                format!(
+                    "the source membership exceeds the repeat-window capacity at target {candidate_target_track_count}"
+                ),
+            );
+            continue;
+        }
+
+        let mut membership = selected_library_route.to_vec();
+        let mut additions = Vec::with_capacity(requested);
+        let mut considered = 0usize;
+        for (candidate, distance) in selection_order.iter().copied() {
+            considered += 1;
+            let artist = tracks[candidate].artist_key.as_str();
+            let album = tracks[candidate].album_key.as_str();
+            if artist_counts.get(artist).copied().unwrap_or(0) >= artist_capacity
+                || album_counts.get(album).copied().unwrap_or(0) >= album_capacity
+            {
+                if considered.is_multiple_of(EXTENSION_PROGRESS_CHUNK) {
+                    progress.update(
+                        "extension_membership_selection",
+                        format!(
+                            "Selected {}/{} additions after checking {considered} candidates for target {candidate_target_track_count}",
+                            additions.len(),
+                            requested
+                        ),
+                        Some(source_library_indices.len() + additions.len()),
+                        Some(candidate_target_track_count),
+                    );
                 }
-            },
-        )
-        .map_err(|error| {
-            CommandFailure::new("FIXED_SOURCE_EXTENSION_ROUTE_FAILED", error.to_string())
-        })?;
-        let selected_strategy = result.selected.strategy;
-        let route_metrics = result.selected.metrics;
-        let final_route = result
-            .selected
-            .route
-            .iter()
-            .map(|index| membership[*index])
-            .collect::<Vec<_>>();
-        (final_route, selected_strategy, route_metrics)
-    };
-    Ok(FixedSourceExtensionResult {
-        final_route,
-        additions,
-        selected_strategy,
-        route_metrics,
-    })
+                continue;
+            }
+            membership.push(candidate);
+            additions.push((candidate, distance));
+            *artist_counts.entry(artist).or_default() += 1;
+            *album_counts.entry(album).or_default() += 1;
+            progress.update(
+                "extension_membership_selection",
+                format!(
+                    "Selected {}/{} additions after checking {considered} candidates for target {candidate_target_track_count}",
+                    additions.len(),
+                    requested
+                ),
+                Some(source_library_indices.len() + additions.len()),
+                Some(candidate_target_track_count),
+            );
+            if additions.len() == requested {
+                break;
+            }
+        }
+        if additions.len() != requested {
+            last_failure = CommandFailure::new(
+                "FIXED_SOURCE_EXTENSION_INFEASIBLE",
+                format!(
+                    "repeat-safe membership selection found {} of {requested} required additions for target {candidate_target_track_count}",
+                    additions.len()
+                ),
+            );
+            continue;
+        }
+        let route_attempt = if preserve_source_order {
+            progress.update(
+                "extension_route_placement",
+                format!(
+                    "Placing {} additions around {} preserved source anchors for target {candidate_target_track_count}",
+                    additions.len(),
+                    source_library_indices.len()
+                ),
+                Some(source_library_indices.len()),
+                Some(candidate_target_track_count),
+            );
+            place_fixed_source_extension_additions_preserving_source_order(
+                selected_library_route,
+                &additions,
+                tracks,
+                learned_matrix,
+                route_config,
+            )
+            .map(|(route, metrics)| (route, "fixed-source-extension-preserve-order", metrics))
+        } else {
+            let route_message = format!(
+                "Routing {} selected tracks after choosing {} additions for target {candidate_target_track_count}: fixed starts, {} restarts, reversal and relocation local search",
+                membership.len(),
+                additions.len(),
+                route_config.restart_count
+            );
+            progress.update("extension_route_search", &route_message, None, None);
+            let route_progress = Arc::new(Mutex::new(RouteProgressSnapshot {
+                total_tasks: route_config.restart_count * 2 + 5,
+                ..RouteProgressSnapshot::default()
+            }));
+            let heartbeat_progress = Arc::clone(&route_progress);
+            let track_count = membership.len();
+            let _heartbeat = progress.dynamic_heartbeat(
+                "extension_route_search",
+                Duration::from_secs(2),
+                move || {
+                    let snapshot = heartbeat_progress
+                        .lock()
+                        .map(|guard| *guard)
+                        .unwrap_or_default();
+                    let phase = match snapshot.phase {
+                        "adaptive" => "primary route",
+                        "adaptive-arc" => "energy-arc route",
+                        other => other,
+                    };
+                    format!(
+                        "Routing {track_count} selected tracks: {phase}, completed {}/{} route tasks, {} local-search passes",
+                        snapshot.completed_tasks,
+                        snapshot.total_tasks,
+                        snapshot.local_search_passes
+                    )
+                },
+            );
+            let route_tracks = membership
+                .iter()
+                .map(|index| tracks[*index].clone())
+                .collect::<Vec<_>>();
+            let route_progress_writer = Arc::clone(&route_progress);
+            route::optimize_adaptive_route_with_progress(
+                &route_tracks,
+                learned_matrix,
+                route_config,
+                move |event| {
+                    if let Ok(mut snapshot) = route_progress_writer.lock() {
+                        *snapshot = RouteProgressSnapshot {
+                            phase: event.phase,
+                            completed_tasks: event.completed_tasks,
+                            total_tasks: event.total_tasks,
+                            local_search_passes: event.local_search_passes,
+                        };
+                    }
+                },
+            )
+            .map(|result| {
+                let final_route = result
+                    .selected
+                    .route
+                    .iter()
+                    .map(|index| membership[*index])
+                    .collect::<Vec<_>>();
+                (
+                    final_route,
+                    result.selected.strategy,
+                    result.selected.metrics,
+                )
+            })
+            .map_err(|error| {
+                CommandFailure::new("FIXED_SOURCE_EXTENSION_ROUTE_FAILED", error.to_string())
+            })
+        };
+        let (final_route, selected_strategy, route_metrics) = match route_attempt {
+            Ok(result) => result,
+            Err(error) => {
+                last_failure = error;
+                continue;
+            }
+        };
+        let repeat_violations = route::repeat_violations(&final_route, tracks, route_config);
+        if !repeat_violations.is_empty() {
+            last_failure = CommandFailure::new(
+                "FIXED_SOURCE_EXTENSION_ROUTE_FAILED",
+                format!("target {candidate_target_track_count} still violates repeat windows"),
+            );
+            continue;
+        }
+        if dynamic_target && candidate_target_track_count > target_track_count {
+            progress.update(
+                "extension_route_search",
+                format!(
+                    "Accepted dynamic repeat-safe target {candidate_target_track_count} after the minimum target {target_track_count} was not routeable"
+                ),
+                Some(candidate_target_track_count),
+                Some(maximum_target_track_count),
+            );
+        }
+        return Ok(FixedSourceExtensionResult {
+            final_route,
+            additions,
+            selected_strategy,
+            route_metrics,
+        });
+    }
+    Err(last_failure)
 }
 
 #[cfg(test)]
@@ -5054,6 +5116,10 @@ fn analyze_bridge_validated(
             );
             let extension_result = select_fixed_source_extension(
                 target_track_count,
+                request
+                    .extension
+                    .max_added_tracks
+                    .map(|maximum| source_library_indices.len() + maximum),
                 &source_library_indices,
                 &selected_library_route,
                 &eligible_candidates,
@@ -6719,6 +6785,7 @@ mod tests {
         let mut progress = ProgressReporter::disabled();
         let extension_result = select_fixed_source_extension(
             25,
+            None,
             &[0, 1],
             &[0, 1],
             &candidates,
@@ -6762,6 +6829,7 @@ mod tests {
         let mut progress = ProgressReporter::disabled();
         let preserved = select_fixed_source_extension(
             25,
+            None,
             &[0, 1],
             &[1, 0],
             &candidates,
@@ -6799,6 +6867,7 @@ mod tests {
             let mut progress = ProgressReporter::disabled();
             select_fixed_source_extension(
                 25,
+                None,
                 &[0, 1],
                 &[0, 1],
                 &candidates,
