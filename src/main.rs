@@ -4498,6 +4498,7 @@ fn analyze_bridge_validated(
             request.selection,
         );
         guidance_signal_count += guidance_batch.observed as usize;
+        let guidance_adjustments = guidance_batch.adjustment_by_candidate;
         preview_gaps.push(preview::AutomaticGap {
             original_position: position,
             left: selected_library_route[position - 1],
@@ -4505,7 +4506,7 @@ fn analyze_bridge_validated(
             direct_distance,
             direct_percentile,
             semantics: gap_semantics.clone(),
-            guidance_adjustments: guidance_batch.adjustment_by_candidate,
+            guidance_adjustments: guidance_adjustments.clone(),
         });
         let semantics_by_candidate = gap_semantics
             .candidates
@@ -4529,44 +4530,7 @@ fn analyze_bridge_validated(
         )
         .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
         strict_scoring_elapsed += scoring_started.elapsed();
-        evaluations.sort_by(|left, right| {
-            right
-                .accepted
-                .cmp(&left.accepted)
-                .then_with(|| {
-                    semantics_by_candidate[&left.candidate]
-                        .adjusted_percentile(
-                            left.max_percentile,
-                            request.selection.recording_guidance_percent,
-                            request.selection.artist_guidance_percent,
-                        )
-                        .total_cmp(
-                            &semantics_by_candidate[&right.candidate].adjusted_percentile(
-                                right.max_percentile,
-                                request.selection.recording_guidance_percent,
-                                request.selection.artist_guidance_percent,
-                            ),
-                        )
-                })
-                .then_with(|| {
-                    semantics_by_candidate[&left.candidate]
-                        .adjusted_percentile(
-                            left.detour_percentile,
-                            request.selection.recording_guidance_percent,
-                            request.selection.artist_guidance_percent,
-                        )
-                        .total_cmp(
-                            &semantics_by_candidate[&right.candidate].adjusted_percentile(
-                                right.detour_percentile,
-                                request.selection.recording_guidance_percent,
-                                request.selection.artist_guidance_percent,
-                            ),
-                        )
-                })
-                .then_with(|| left.max_percentile.total_cmp(&right.max_percentile))
-                .then_with(|| left.detour_percentile.total_cmp(&right.detour_percentile))
-                .then_with(|| left.candidate.cmp(&right.candidate))
-        });
+        preview::sort_guided_evaluations(&mut evaluations, &guidance_adjustments);
         let accepted_candidate_count = evaluations
             .iter()
             .filter(|candidate| candidate.accepted)

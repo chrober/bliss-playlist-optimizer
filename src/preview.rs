@@ -322,6 +322,36 @@ fn rank_guided_shortlist(
     ranked.into_iter().map(|(candidate, _)| candidate).collect()
 }
 
+/// Applies the shared bounded provider order to bridge evaluations. This is
+/// intentionally independent of `CandidateSemantics`: semantic artifacts may
+/// explain a result, but only provider guidance may alter a Bliss-qualified
+/// candidate order.
+pub fn sort_guided_evaluations(
+    evaluations: &mut [BridgeCandidateEvaluation],
+    adjustments: &BTreeMap<usize, f64>,
+) {
+    let guidance_rank = rank_guided_shortlist(
+        &evaluations
+            .iter()
+            .map(|evaluation| (evaluation.candidate, evaluation.max_percentile))
+            .collect::<Vec<_>>(),
+        adjustments,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(rank, candidate)| (candidate, rank))
+    .collect::<HashMap<_, _>>();
+    evaluations.sort_by(|left, right| {
+        right
+            .accepted
+            .cmp(&left.accepted)
+            .then_with(|| guidance_rank[&left.candidate].cmp(&guidance_rank[&right.candidate]))
+            .then_with(|| left.max_percentile.total_cmp(&right.max_percentile))
+            .then_with(|| left.detour_percentile.total_cmp(&right.detour_percentile))
+            .then_with(|| left.candidate.cmp(&right.candidate))
+    });
+}
+
 fn rank_for_evolving_route(
     route: &[usize],
     position: usize,
@@ -1866,6 +1896,44 @@ mod tests {
 
         assert_eq!(ranked, vec![3, 2]);
         assert!(!ranked.contains(&99));
+    }
+
+    #[test]
+    fn guided_evaluations_never_use_legacy_semantic_adjustments() {
+        let mut evaluations = vec![
+            BridgeCandidateEvaluation {
+                candidate: 2,
+                left_distance: 0.0,
+                right_distance: 0.0,
+                left_percentile: 0.40,
+                right_percentile: 0.40,
+                max_percentile: 0.40,
+                detour_percentile: 0.50,
+                repeat_safe: true,
+                accepted: true,
+            },
+            BridgeCandidateEvaluation {
+                candidate: 3,
+                left_distance: 0.0,
+                right_distance: 0.0,
+                left_percentile: 0.41,
+                right_percentile: 0.41,
+                max_percentile: 0.41,
+                detour_percentile: 0.51,
+                repeat_safe: true,
+                accepted: true,
+            },
+        ];
+
+        sort_guided_evaluations(&mut evaluations, &BTreeMap::from([(3_usize, 0.20_f64)]));
+
+        assert_eq!(
+            evaluations
+                .into_iter()
+                .map(|entry| entry.candidate)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
     }
     use crate::bridge::build_frozen_reference;
     use crate::semantic::SemanticTier;
