@@ -102,6 +102,13 @@ struct GuidanceAddonConfig {
     args: Vec<String>,
     #[serde(default)]
     options: Value,
+    /// Plugin-owned, hash-bound provider inputs. They are never populated
+    /// from user-facing job controls.
+    #[serde(default)]
+    artifacts: Vec<bliss_playlist_guidance_spi::ArtifactDescriptor>,
+    /// Plugin-owned read-only resources, such as Lyrion's persist.db.
+    #[serde(default)]
+    resources: Vec<bliss_playlist_guidance_spi::ResourceDescriptor>,
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
@@ -2194,26 +2201,9 @@ fn prepare_runtime_request(
     timings.record("source_resolution", started.elapsed());
 
     // Start optional guidance providers only after the request, database, and
-    // source identities have passed validation. The initial global score batch
-    // warms providers and exposes diagnostics; edge-scoped batches are owned
-    // by the route planners that need them.
-    let guidance_candidates = library
-        .metadata
-        .iter()
-        .enumerate()
-        .map(|(index, metadata)| {
-            let track = library.track(index);
-            bliss_playlist_guidance_spi::Candidate {
-                candidate_id: bridge_candidate_id(metadata.row_id),
-                database_file: Some(metadata.file.clone()),
-                title: Some(metadata.title_key.clone()),
-                artist: Some(track.artist_key.clone()),
-                album: None,
-                recording_mbid: None,
-                artist_mbids: Vec::new(),
-            }
-        })
-        .collect::<Vec<_>>();
+    // Source identities have passed validation. Providers receive only stable
+    // route anchors at preparation time; the planners later send their bounded
+    // acoustic shortlists at their shared ranking boundary.
     let guidance_anchors = request
         .source_tracks
         .iter()
@@ -2222,6 +2212,7 @@ fn prepare_runtime_request(
             anchor_id: track.id.clone(),
             track: bliss_playlist_guidance_spi::Candidate {
                 candidate_id: track.id.clone(),
+                lms_urlmd5: None,
                 database_file: track.database_file.clone(),
                 title: track.title.clone(),
                 artist: track.artist.clone(),
@@ -2232,23 +2223,8 @@ fn prepare_runtime_request(
         })
         .collect::<Vec<_>>();
     let mut guidance_host = guidance::GuidanceHost::start(&request.guidance_addons);
-    guidance_host.prepare(
-        &request.job_id,
-        guidance_candidates.clone(),
-        guidance_anchors,
-    );
-    let guidance_signal_count = guidance_host
-        .score(
-            "initial-global",
-            bliss_playlist_guidance_spi::ScoreContext {
-                scope: bliss_playlist_guidance_spi::GuidanceScope::Global,
-                left_anchor_id: None,
-                right_anchor_id: None,
-                context_track_ids: Vec::new(),
-            },
-            guidance_candidates,
-        )
-        .len();
+    guidance_host.prepare(&request.job_id, guidance_anchors);
+    let guidance_signal_count = 0;
     let guidance_addon_diagnostics = guidance_host.diagnostics.clone();
 
     let summary = ValidationSummary {

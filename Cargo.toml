@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 bliss-mixer-core = { git = "https://github.com/chrober/bliss-mixer-core.git", rev = "8022bc6" }
-bliss-playlist-guidance-spi = { git = "https://github.com/chrober/bliss-playlist-guidance-spi.git", rev = "c5169066e6cb84e869f63fe72d7230dcef54036f" }
+bliss-playlist-guidance-spi = { path = "../bliss-playlist-guidance-spi" }
 bincode = "1.3"
 jsonschema = { version = "0.33", default-features = false }
 rayon = "1.11"
