@@ -12,7 +12,7 @@ use bliss_playlist_guidance_spi::{
     SPI_VERSION,
 };
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -21,6 +21,8 @@ use std::time::Duration;
 use super::GuidanceAddonConfig;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+#[allow(dead_code)] // Used by the Task 5 shared planner boundary.
+const GUIDANCE_CAP: f64 = 0.75;
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct AddonDiagnostic {
@@ -39,6 +41,37 @@ pub(crate) struct ProviderPreparation {
     pub artifacts: Vec<ArtifactDescriptor>,
     pub resources: Vec<ResourceDescriptor>,
     pub anchors: Vec<Anchor>,
+}
+
+#[allow(dead_code)] // Constructed by the Task 5 shared planner boundary.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GuidanceWeights {
+    by_channel: BTreeMap<String, f64>,
+}
+
+impl GuidanceWeights {
+    #[allow(dead_code)] // The planner builds job-specific weights in Task 5.
+    pub(crate) fn from_channels(channels: impl IntoIterator<Item = (&'static str, f64)>) -> Self {
+        Self {
+            by_channel: channels
+                .into_iter()
+                .map(|(channel, weight)| (channel.to_owned(), weight))
+                .collect(),
+        }
+    }
+
+    fn weight(&self, channel: &str) -> f64 {
+        self.by_channel.get(channel).copied().unwrap_or(0.0)
+    }
+}
+
+#[allow(dead_code)] // Consumed by the Task 5 shared planner boundary.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GuidanceBatch {
+    pub adjustment_by_candidate: BTreeMap<usize, f64>,
+    pub observed: u64,
+    pub applied: u64,
+    pub diagnostics: Vec<AddonDiagnostic>,
 }
 
 struct Session {
@@ -325,7 +358,9 @@ impl GuidanceHost {
         request_id: &str,
         context: ScoreContext,
         candidates: Vec<Candidate>,
-    ) -> Vec<GuidanceSignal> {
+        weights: &GuidanceWeights,
+        candidate_index: &BTreeMap<String, usize>,
+    ) -> GuidanceBatch {
         let mut signals = Vec::new();
         for session in &mut self.sessions {
             if session.disabled {
@@ -339,7 +374,9 @@ impl GuidanceHost {
                 }
             }
         }
-        signals
+        let mut batch = aggregate_batch(signals, weights, candidate_index);
+        batch.diagnostics = self.diagnostics.clone();
+        batch
     }
 }
 
@@ -389,6 +426,41 @@ fn validate_batch_signals(
     Ok((returned, accepted))
 }
 
+#[allow(dead_code)] // Called by GuidanceHost::score at the planner boundary.
+fn aggregate_batch(
+    mut signals: Vec<GuidanceSignal>,
+    weights: &GuidanceWeights,
+    candidate_index: &BTreeMap<String, usize>,
+) -> GuidanceBatch {
+    signals.sort_by(|left, right| {
+        left.candidate_id
+            .cmp(&right.candidate_id)
+            .then_with(|| left.channel.cmp(&right.channel))
+    });
+    let observed = signals.len() as u64;
+    let mut adjustment_by_candidate = BTreeMap::<usize, f64>::new();
+    let mut applied = 0_u64;
+    for signal in signals {
+        let Some(candidate) = candidate_index.get(&signal.candidate_id).copied() else {
+            continue;
+        };
+        let contribution = weights.weight(&signal.channel) * signal.score * signal.confidence;
+        if contribution != 0.0 {
+            applied += 1;
+            *adjustment_by_candidate.entry(candidate).or_default() += contribution;
+        }
+    }
+    for adjustment in adjustment_by_candidate.values_mut() {
+        *adjustment = adjustment.clamp(-GUIDANCE_CAP, GUIDANCE_CAP);
+    }
+    GuidanceBatch {
+        adjustment_by_candidate,
+        observed,
+        applied,
+        diagnostics: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,7 +468,7 @@ mod tests {
     #[test]
     fn disabled_host_is_neutral() {
         let mut host = GuidanceHost::start(&[]);
-        let signals = host.score(
+        let batch = host.score(
             "test",
             ScoreContext {
                 scope: GuidanceScope::Global,
@@ -405,8 +477,10 @@ mod tests {
                 context_track_ids: vec![],
             },
             vec![],
+            &GuidanceWeights::default(),
+            &BTreeMap::new(),
         );
-        assert!(signals.is_empty());
+        assert!(batch.adjustment_by_candidate.is_empty());
         assert!(host.diagnostics.is_empty());
     }
 
@@ -427,5 +501,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("outside the score batch"));
+    }
+
+    #[test]
+    fn aggregation_combines_weighted_channels_with_a_stable_cap() {
+        let signals = vec![
+            GuidanceSignal {
+                candidate_id: "bliss-row-2".to_owned(),
+                channel: "lastfm_artist".to_owned(),
+                scope: GuidanceScope::Global,
+                score: 0.5,
+                confidence: 1.0,
+                rationale: None,
+                observed_at: None,
+            },
+            GuidanceSignal {
+                candidate_id: "bliss-row-2".to_owned(),
+                channel: "lastfm_track".to_owned(),
+                scope: GuidanceScope::Global,
+                score: 1.0,
+                confidence: 0.5,
+                rationale: None,
+                observed_at: None,
+            },
+        ];
+        let weights =
+            GuidanceWeights::from_channels([("lastfm_track", 0.8), ("lastfm_artist", 0.4)]);
+        let index = BTreeMap::from([("bliss-row-2".to_owned(), 2_usize)]);
+        let batch = aggregate_batch(signals, &weights, &index);
+        assert_eq!(batch.observed, 2);
+        assert_eq!(batch.applied, 2);
+        assert!((batch.adjustment_by_candidate[&2] - 0.6).abs() < f64::EPSILON);
     }
 }
