@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -2743,6 +2743,73 @@ fn bridge_candidate_id(row_id: u64) -> String {
     format!("bliss-row-{row_id}")
 }
 
+/// Requests optional provider guidance for one already membership-checked,
+/// acoustically short-listed source gap.  The provider receives no candidate
+/// outside that shortlist; an unavailable identity simply leaves the
+/// candidate without provider-specific metadata.
+fn score_guidance_for_gap(
+    host: &mut guidance::GuidanceHost,
+    job_id: &str,
+    left_anchor_id: &str,
+    right_anchor_id: &str,
+    candidates: &[usize],
+    library: &Library,
+    candidate_urlmd5: &HashMap<usize, String>,
+    selection: SelectionSettings,
+) -> guidance::GuidanceBatch {
+    let mut ordered = candidates.to_vec();
+    ordered.sort_by_key(|candidate| library.metadata(*candidate).row_id);
+    ordered.dedup();
+    let candidate_index = ordered
+        .iter()
+        .map(|candidate| {
+            (
+                bridge_candidate_id(library.metadata(*candidate).row_id),
+                *candidate,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let provider_candidates = ordered
+        .iter()
+        .map(|candidate| bliss_playlist_guidance_spi::Candidate {
+            candidate_id: bridge_candidate_id(library.metadata(*candidate).row_id),
+            lms_urlmd5: candidate_urlmd5.get(candidate).cloned(),
+            database_file: None,
+            title: None,
+            artist: None,
+            album: None,
+            recording_mbid: None,
+            artist_mbids: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let weights = guidance::GuidanceWeights::from_channels([
+        (
+            "lastfm_track",
+            f64::from(selection.recording_guidance_percent) / 100.0,
+        ),
+        (
+            "lastfm_artist",
+            f64::from(selection.artist_guidance_percent) / 100.0,
+        ),
+        (
+            "playcount",
+            f64::from(selection.playcount_influence) / 100.0,
+        ),
+    ]);
+    host.score(
+        &format!("{job_id}:gap:{left_anchor_id}:{right_anchor_id}"),
+        bliss_playlist_guidance_spi::ScoreContext {
+            scope: bliss_playlist_guidance_spi::GuidanceScope::Edge,
+            left_anchor_id: Some(left_anchor_id.to_owned()),
+            right_anchor_id: Some(right_anchor_id.to_owned()),
+            context_track_ids: vec![left_anchor_id.to_owned(), right_anchor_id.to_owned()],
+        },
+        provider_candidates,
+        &weights,
+        &candidate_index,
+    )
+}
+
 fn source_semantic_identity(
     source: &SourceTrack,
     metadata: &LibraryMetadata,
@@ -3626,6 +3693,8 @@ fn analyze_bridge_validated(
     learned_percent: u16,
     library: Library,
     local_candidate_rows: Option<HashSet<u64>>,
+    candidate_urlmd5: HashMap<usize, String>,
+    guidance_host: &mut guidance::GuidanceHost,
     timings: &mut StageTimings,
     progress: &mut ProgressReporter,
 ) -> Result<BridgeAnalysisArtifact, CommandFailure> {
@@ -4341,6 +4410,7 @@ fn analyze_bridge_validated(
     let mut gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut preview_gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut semantic_assisted = false;
+    let mut guidance_signal_count = 0_usize;
     let gap_positions = if request.extension.mode == "fixed_source_extension" {
         Vec::new()
     } else if destination_route {
@@ -4464,6 +4534,21 @@ fn analyze_bridge_validated(
         }
         shortlist_elapsed += shortlist_started.elapsed();
         let shortlisted_candidate_count = gap_semantics.candidates.len();
+        let guidance_batch = score_guidance_for_gap(
+            guidance_host,
+            &request.job_id,
+            &request.source_tracks[left_source_index].id,
+            &request.source_tracks[right_source_index].id,
+            &gap_semantics
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate)
+                .collect::<Vec<_>>(),
+            &library,
+            &candidate_urlmd5,
+            request.selection,
+        );
+        guidance_signal_count += guidance_batch.observed as usize;
         preview_gaps.push(preview::AutomaticGap {
             original_position: position,
             left: selected_library_route[position - 1],
@@ -4471,6 +4556,7 @@ fn analyze_bridge_validated(
             direct_distance,
             direct_percentile,
             semantics: gap_semantics.clone(),
+            guidance_adjustments: guidance_batch.adjustment_by_candidate,
         });
         let semantics_by_candidate = gap_semantics
             .candidates
@@ -5606,8 +5692,8 @@ fn analyze_bridge_validated(
             "bliss-only-no-usable-edges".to_owned()
         },
         provider_states: semantic_bundle.providers,
-        guidance_addon_diagnostics: validation.guidance_addon_diagnostics.clone(),
-        guidance_signal_count: validation.guidance_signal_count,
+        guidance_addon_diagnostics: guidance_host.diagnostics.clone(),
+        guidance_signal_count,
         gaps,
         selection_preview,
         scoring_provenance,
@@ -5636,9 +5722,9 @@ fn analyze_bridge_request_with_options(
         semantic_bundle,
         library,
         local_candidate_rows,
-        candidate_urlmd5: _,
+        candidate_urlmd5,
         database_cache,
-        guidance_host: _guidance_host,
+        mut guidance_host,
     } = validated;
     if !matches!(request.scoring.algorithm.as_str(), "adaptive" | "static") {
         return Err(CommandFailure::new(
@@ -5923,6 +6009,8 @@ fn analyze_bridge_request_with_options(
         learned_percent,
         library.expect("runtime validation always provides a decoded library"),
         local_candidate_rows,
+        candidate_urlmd5,
+        &mut guidance_host,
         &mut timings,
         &mut progress,
     )?;
@@ -7761,7 +7849,7 @@ mod tests {
         let conflict_path = Path::new("fixtures/synthetic/preserve-automatic-request.json");
         let mut conflict_timings = StageTimings::default();
         let mut conflict_progress = ProgressReporter::disabled();
-        let conflict = prepare_runtime_request(
+        let mut conflict = prepare_runtime_request(
             conflict_path,
             &RuntimeOptions::disabled(),
             &mut conflict_timings,
@@ -7791,6 +7879,8 @@ mod tests {
             conflict_learned_percent,
             conflict.library.unwrap(),
             conflict.local_candidate_rows,
+            conflict.candidate_urlmd5,
+            &mut conflict.guidance_host,
             &mut conflict_timings,
             &mut conflict_progress,
         )

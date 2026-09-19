@@ -29,6 +29,10 @@ pub struct AutomaticGap {
     pub direct_distance: f64,
     pub direct_percentile: f64,
     pub semantics: GapEvidence,
+    /// Bounded provider guidance prepared for this original source gap. The
+    /// map is intentionally keyed by an already-shortlisted library index,
+    /// so it can influence order but never candidate membership.
+    pub guidance_adjustments: BTreeMap<usize, f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -320,6 +324,33 @@ fn varied_pool_length(accepted: usize, variation: VariationConfig) -> usize {
     floor + (ceiling.saturating_sub(floor) * usize::from(variation.percent) / 100)
 }
 
+/// Orders an already acoustic, constraint-valid shortlist using bounded
+/// provider guidance. Guidance never creates candidates: entries absent from
+/// `acoustic` remain absent from the result. A positive adjustment reduces the
+/// effective percentile by at most ten percentage points, matching the
+/// historical maximum semantic shift while keeping Bliss as the authority.
+fn rank_guided_shortlist(
+    acoustic: &[(usize, f64)],
+    adjustments: &BTreeMap<usize, f64>,
+) -> Vec<usize> {
+    const MAX_GUIDANCE_SHIFT: f64 = 0.10;
+
+    let mut ranked = acoustic.to_vec();
+    ranked.sort_by(
+        |(left_candidate, left_percentile), (right_candidate, right_percentile)| {
+            let left_adjusted = left_percentile
+                - MAX_GUIDANCE_SHIFT * adjustments.get(left_candidate).copied().unwrap_or(0.0);
+            let right_adjusted = right_percentile
+                - MAX_GUIDANCE_SHIFT * adjustments.get(right_candidate).copied().unwrap_or(0.0);
+            left_adjusted
+                .total_cmp(&right_adjusted)
+                .then_with(|| left_percentile.total_cmp(right_percentile))
+                .then_with(|| left_candidate.cmp(right_candidate))
+        },
+    );
+    ranked.into_iter().map(|(candidate, _)| candidate).collect()
+}
+
 fn adjusted_candidate_percentile(
     semantics: &CandidateSemantics,
     acoustic_percentile: f64,
@@ -340,6 +371,7 @@ fn rank_for_evolving_route(
     route: &[usize],
     position: usize,
     semantics: &[CandidateSemantics],
+    guidance_adjustments: &BTreeMap<usize, f64>,
     context: GapRankingContext<'_>,
     guidance: GuidanceConfig,
     variation: VariationConfig,
@@ -376,10 +408,22 @@ fn rank_for_evolving_route(
         },
     )
     .map_err(PreviewError::Scoring)?;
+    let guidance_order = rank_guided_shortlist(
+        &evaluations
+            .iter()
+            .map(|evaluation| (evaluation.candidate, evaluation.max_percentile))
+            .collect::<Vec<_>>(),
+        guidance_adjustments,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(rank, candidate)| (candidate, rank))
+    .collect::<HashMap<_, _>>();
     evaluations.sort_by(|left, right| {
         acceptance
             .accepts(right, config)
             .cmp(&acceptance.accepts(left, config))
+            .then_with(|| guidance_order[&left.candidate].cmp(&guidance_order[&right.candidate]))
             .then_with(|| {
                 adjusted_candidate_percentile(
                     semantics_by_candidate[&left.candidate],
@@ -531,6 +575,7 @@ pub fn select_automatic_bridges(
                 &final_route,
                 position,
                 &gap.semantics.candidates,
+                &gap.guidance_adjustments,
                 GapRankingContext {
                     scoring: ExactScoringContext {
                         tracks,
@@ -715,6 +760,7 @@ fn final_exact_decisions(
                 &route_without_candidate,
                 position,
                 std::slice::from_ref(&semantics),
+                &gap.guidance_adjustments,
                 GapRankingContext {
                     scoring: ExactScoringContext {
                         tracks,
@@ -833,6 +879,7 @@ fn select_exact_count_multi_gap_bridges(
                             &variant.route,
                             position,
                             &gap.semantics.candidates,
+                            &gap.guidance_adjustments,
                             GapRankingContext {
                                 scoring: ExactScoringContext {
                                     tracks,
@@ -1784,6 +1831,7 @@ fn select_exact_count_single_gap_bridges(
                         &state.route,
                         position,
                         &gap.semantics.candidates,
+                        &gap.guidance_adjustments,
                         GapRankingContext {
                             scoring: ExactScoringContext {
                                 tracks,
@@ -1906,6 +1954,17 @@ fn select_exact_count_single_gap_bridges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planner_guidance_adjustment_reorders_only_the_acoustic_shortlist() {
+        let acoustic = vec![(2_usize, 0.40_f64), (3_usize, 0.41_f64)];
+        let adjustments = BTreeMap::from([(3_usize, 0.20_f64), (99_usize, 1.0_f64)]);
+
+        let ranked = rank_guided_shortlist(&acoustic, &adjustments);
+
+        assert_eq!(ranked, vec![3, 2]);
+        assert!(!ranked.contains(&99));
+    }
     use crate::bridge::build_frozen_reference;
     use crate::semantic::SemanticTier;
 
@@ -1958,6 +2017,7 @@ mod tests {
                 pool: SemanticPool::BlissOnly,
                 candidates: vec![semantics(candidate)],
             },
+            guidance_adjustments: BTreeMap::new(),
         }
     }
 
@@ -2221,6 +2281,7 @@ mod tests {
                 pool: SemanticPool::BlissOnly,
                 candidates: vec![semantics(1), semantics(2)],
             },
+            guidance_adjustments: BTreeMap::new(),
         }];
         let selection_config = ExactSelectionConfig {
             requested_added_tracks: 2,
@@ -2329,6 +2390,7 @@ mod tests {
                 pool: SemanticPool::BlissOnly,
                 candidates: vec![semantics(1), semantics(2)],
             },
+            guidance_adjustments: BTreeMap::new(),
         }];
         let exact = ExactSelectionConfig {
             requested_added_tracks: 1,
