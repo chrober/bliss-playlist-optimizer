@@ -19,7 +19,7 @@ use crate::route::RouteTrack;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnchoredPathCandidate {
     pub track: usize,
-    pub semantic_support: f64,
+    pub guidance_adjustment: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,14 +103,18 @@ struct PathState {
     worst_transition: f64,
     lower_sum: f64,
     lower_worst: f64,
-    semantic_support: f64,
+    guidance_adjustment: f64,
 }
 
 fn partial_path_order(left: &PathState, right: &PathState) -> std::cmp::Ordering {
     left.lower_worst
         .total_cmp(&right.lower_worst)
         .then_with(|| left.lower_sum.total_cmp(&right.lower_sum))
-        .then_with(|| right.semantic_support.total_cmp(&left.semantic_support))
+        .then_with(|| {
+            right
+                .guidance_adjustment
+                .total_cmp(&left.guidance_adjustment)
+        })
         .then_with(|| left.intermediates.cmp(&right.intermediates))
 }
 
@@ -118,7 +122,11 @@ fn complete_path_order(left: &PathState, right: &PathState) -> std::cmp::Orderin
     left.worst_transition
         .total_cmp(&right.worst_transition)
         .then_with(|| left.transition_sum.total_cmp(&right.transition_sum))
-        .then_with(|| right.semantic_support.total_cmp(&left.semantic_support))
+        .then_with(|| {
+            right
+                .guidance_adjustment
+                .total_cmp(&left.guidance_adjustment)
+        })
         .then_with(|| left.intermediates.cmp(&right.intermediates))
 }
 
@@ -247,7 +255,7 @@ where
     let mut candidates_by_track = BTreeMap::<usize, f64>::new();
     for candidate in request.candidates {
         if !unavailable.contains(&candidate.track) {
-            candidates_by_track.insert(candidate.track, candidate.semantic_support);
+            candidates_by_track.insert(candidate.track, candidate.guidance_adjustment);
         }
     }
     let candidates = candidates_by_track.keys().copied().collect::<Vec<_>>();
@@ -280,7 +288,7 @@ where
             worst_transition: 0.0,
             lower_sum: direct,
             lower_worst: direct / (requested + 1) as f64,
-            semantic_support: 0.0,
+            guidance_adjustment: 0.0,
         }];
 
         for layer in 0..requested {
@@ -340,7 +348,7 @@ where
                                 lower_sum: transition_sum + remaining_distance,
                                 lower_worst: worst_transition
                                     .max(remaining_distance / remaining_edges as f64),
-                                semantic_support: state.semantic_support
+                                guidance_adjustment: state.guidance_adjustment
                                     + candidates_by_track.get(&candidate).copied().unwrap_or(0.0),
                             })
                         })
@@ -482,11 +490,11 @@ mod tests {
         let candidates = [
             AnchoredPathCandidate {
                 track: 1,
-                semantic_support: 0.0,
+                guidance_adjustment: 0.0,
             },
             AnchoredPathCandidate {
                 track: 2,
-                semantic_support: 0.0,
+                guidance_adjustment: 0.0,
             },
         ];
         let options = search_anchored_paths(
@@ -519,7 +527,7 @@ mod tests {
         ];
         let candidates = [AnchoredPathCandidate {
             track: 1,
-            semantic_support: 0.0,
+            guidance_adjustment: 0.0,
         }];
         let options = search_anchored_paths(
             AnchoredPathRequest {
@@ -573,11 +581,11 @@ mod tests {
         let candidates = [
             AnchoredPathCandidate {
                 track: 1,
-                semantic_support: 0.0,
+                guidance_adjustment: 0.0,
             },
             AnchoredPathCandidate {
                 track: 2,
-                semantic_support: 0.0,
+                guidance_adjustment: 0.0,
             },
         ];
         let options = search_anchored_paths(
@@ -607,5 +615,50 @@ mod tests {
             one_intermediate[0].intermediates,
             one_intermediate[1].intermediates
         );
+    }
+    #[test]
+    fn provider_guidance_breaks_an_acoustic_tie_without_admitting_new_candidates() {
+        let tracks = vec![
+            track(0.0, "a", "a"),
+            track(1.0, "b", "b"),
+            track(1.0, "c", "c"),
+            track(2.0, "d", "d"),
+        ];
+        let candidates = [
+            AnchoredPathCandidate {
+                track: 1,
+                guidance_adjustment: 0.0,
+            },
+            AnchoredPathCandidate {
+                track: 2,
+                guidance_adjustment: 0.5,
+            },
+        ];
+        let options = search_anchored_paths(
+            AnchoredPathRequest {
+                route_prefix: &[0],
+                immutable_history: &[],
+                unavailable_tracks: &[],
+                left_anchor: 0,
+                right_anchor: 3,
+                candidates: &candidates,
+                tracks: &tracks,
+                config: AnchoredPathSearchConfig {
+                    max_intermediates: 1,
+                    candidate_limit: 2,
+                    beam_width: 2,
+                    alternatives_per_count: 1,
+                    variation_percent: 0,
+                    generation_seed: 1,
+                    artist_window: 0,
+                    album_window: 0,
+                    track_window: 0,
+                },
+            },
+            |left, right| (tracks[left].features[0] - tracks[right].features[0]).abs() as f64,
+        )
+        .unwrap();
+
+        assert_eq!(options[1].intermediates, vec![2]);
     }
 }
