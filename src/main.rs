@@ -1003,7 +1003,16 @@ struct FixedSourceExtensionContext<'a> {
     route_config: &'a route::SearchConfig,
     selection: SelectionSettings,
     shortlist_limit: usize,
+    guidance: Option<FixedSourceGuidance<'a>>,
     progress: &'a mut ProgressReporter,
+}
+
+struct FixedSourceGuidance<'a> {
+    host: &'a mut guidance::GuidanceHost,
+    job_id: &'a str,
+    source_anchor_ids: Vec<String>,
+    library: &'a Library,
+    candidate_urlmd5: &'a HashMap<usize, String>,
 }
 
 fn place_fixed_source_extension_additions_preserving_source_order(
@@ -2757,6 +2766,31 @@ fn score_guidance_for_gap(
     candidate_urlmd5: &HashMap<usize, String>,
     selection: SelectionSettings,
 ) -> guidance::GuidanceBatch {
+    score_guidance(
+        host,
+        &format!("{job_id}:gap:{left_anchor_id}:{right_anchor_id}"),
+        bliss_playlist_guidance_spi::ScoreContext {
+            scope: bliss_playlist_guidance_spi::GuidanceScope::Edge,
+            left_anchor_id: Some(left_anchor_id.to_owned()),
+            right_anchor_id: Some(right_anchor_id.to_owned()),
+            context_track_ids: vec![left_anchor_id.to_owned(), right_anchor_id.to_owned()],
+        },
+        candidates,
+        library,
+        candidate_urlmd5,
+        selection,
+    )
+}
+
+fn score_guidance(
+    host: &mut guidance::GuidanceHost,
+    request_id: &str,
+    context: bliss_playlist_guidance_spi::ScoreContext,
+    candidates: &[usize],
+    library: &Library,
+    candidate_urlmd5: &HashMap<usize, String>,
+    selection: SelectionSettings,
+) -> guidance::GuidanceBatch {
     let mut ordered = candidates.to_vec();
     ordered.sort_by_key(|candidate| library.metadata(*candidate).row_id);
     ordered.dedup();
@@ -2797,13 +2831,8 @@ fn score_guidance_for_gap(
         ),
     ]);
     host.score(
-        &format!("{job_id}:gap:{left_anchor_id}:{right_anchor_id}"),
-        bliss_playlist_guidance_spi::ScoreContext {
-            scope: bliss_playlist_guidance_spi::GuidanceScope::Edge,
-            left_anchor_id: Some(left_anchor_id.to_owned()),
-            right_anchor_id: Some(right_anchor_id.to_owned()),
-            context_track_ids: vec![left_anchor_id.to_owned(), right_anchor_id.to_owned()],
-        },
+        request_id,
+        context,
         provider_candidates,
         &weights,
         &candidate_index,
@@ -2905,6 +2934,7 @@ fn select_fixed_source_extension(
         route_config,
         selection,
         shortlist_limit,
+        mut guidance,
         progress,
     } = context;
     if target_track_count <= source_library_indices.len() {
@@ -3078,6 +3108,29 @@ fn select_fixed_source_extension(
         Some(ranked.len()),
     );
     let mut selection_order = ranked[..pool_limit].to_vec();
+    let provider_adjustments = guidance
+        .as_mut()
+        .map(|guidance| {
+            score_guidance(
+                guidance.host,
+                &format!("{}:fixed-source", guidance.job_id),
+                bliss_playlist_guidance_spi::ScoreContext {
+                    scope: bliss_playlist_guidance_spi::GuidanceScope::Global,
+                    left_anchor_id: None,
+                    right_anchor_id: None,
+                    context_track_ids: guidance.source_anchor_ids.clone(),
+                },
+                &selection_order
+                    .iter()
+                    .map(|entry| entry.0)
+                    .collect::<Vec<_>>(),
+                guidance.library,
+                guidance.candidate_urlmd5,
+                selection,
+            )
+            .adjustment_by_candidate
+        })
+        .unwrap_or_default();
     if selection.variation_percent > 0 {
         progress.update(
             "extension_selection_pool",
@@ -3105,12 +3158,15 @@ fn select_fixed_source_extension(
                     })
                     .unwrap_or(0.0);
                 let semantic_weight = (2.0 * guidance).exp();
+                let provider_weight =
+                    (2.0 * provider_adjustments.get(&entry.0).copied().unwrap_or(0.0)).exp();
                 let playcount_weight = (std::f64::consts::LN_10
                     * (f64::from(selection.playcount_influence) / 100.0)
                     * tracks[entry.0].play_count_percentile)
                     .exp();
                 let uniform = rng.gen::<f64>().max(f64::MIN_POSITIVE);
-                let key = -uniform.ln() / (acoustic_weight * semantic_weight * playcount_weight);
+                let key = -uniform.ln()
+                    / (acoustic_weight * semantic_weight * provider_weight * playcount_weight);
                 (key, rank, entry)
             })
             .collect::<Vec<_>>();
@@ -3148,8 +3204,10 @@ fn select_fixed_source_extension(
                     .unwrap_or(0.0);
                 let playcount_preference = (f64::from(selection.playcount_influence) / 100.0)
                     * tracks[entry.0].play_count_percentile;
+                let provider_guidance = provider_adjustments.get(&entry.0).copied().unwrap_or(0.0);
                 (
-                    rank as f64 - maximum_shift * (guidance + playcount_preference),
+                    rank as f64
+                        - maximum_shift * (guidance + playcount_preference + provider_guidance),
                     rank,
                     entry,
                 )
@@ -5465,6 +5523,17 @@ fn analyze_bridge_validated(
                     route_config: &route_config,
                     selection: request.selection,
                     shortlist_limit,
+                    guidance: Some(FixedSourceGuidance {
+                        host: guidance_host,
+                        job_id: &request.job_id,
+                        source_anchor_ids: request
+                            .source_tracks
+                            .iter()
+                            .map(|track| track.id.clone())
+                            .collect(),
+                        library: &library,
+                        candidate_urlmd5: &candidate_urlmd5,
+                    }),
                     progress,
                 },
             )?;
@@ -7154,6 +7223,7 @@ mod tests {
                 route_config: &config,
                 selection: SelectionSettings::default(),
                 shortlist_limit: 256,
+                guidance: None,
                 progress: &mut progress,
             },
         )
@@ -7199,6 +7269,7 @@ mod tests {
                 route_config: &config,
                 selection: SelectionSettings::default(),
                 shortlist_limit: 256,
+                guidance: None,
                 progress: &mut progress,
             },
         )
@@ -7296,6 +7367,7 @@ mod tests {
                     artist_guidance_percent: 0,
                     playcount_influence: 0,
                 },
+                guidance: None,
                 shortlist_limit: 256,
                 progress: &mut progress,
             },
@@ -7332,6 +7404,7 @@ mod tests {
                         artist_guidance_percent: 0,
                         playcount_influence: 0,
                     },
+                    guidance: None,
                     shortlist_limit: 256,
                     progress: &mut progress,
                 },
