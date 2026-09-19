@@ -46,23 +46,35 @@ pub(crate) struct ProviderPreparation {
 #[allow(dead_code)] // Constructed by the Task 5 shared planner boundary.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GuidanceWeights {
-    by_channel: BTreeMap<String, f64>,
+    by_provider_channel: BTreeMap<(String, String), f64>,
 }
 
 impl GuidanceWeights {
-    #[allow(dead_code)] // The planner builds job-specific weights in Task 5.
-    pub(crate) fn from_channels(channels: impl IntoIterator<Item = (&'static str, f64)>) -> Self {
+    pub(crate) fn from_provider_channels(
+        channels: impl IntoIterator<Item = ((&'static str, &'static str), f64)>,
+    ) -> Self {
         Self {
-            by_channel: channels
+            by_provider_channel: channels
                 .into_iter()
-                .map(|(channel, weight)| (channel.to_owned(), weight))
+                .map(|((provider_id, channel), weight)| {
+                    ((provider_id.to_owned(), channel.to_owned()), weight)
+                })
                 .collect(),
         }
     }
 
-    fn weight(&self, channel: &str) -> f64 {
-        self.by_channel.get(channel).copied().unwrap_or(0.0)
+    fn weight(&self, provider_id: &str, channel: &str) -> f64 {
+        self.by_provider_channel
+            .get(&(provider_id.to_owned(), channel.to_owned()))
+            .copied()
+            .unwrap_or(0.0)
     }
+}
+
+#[derive(Clone, Debug)]
+struct ProviderSignal {
+    provider_id: String,
+    signal: GuidanceSignal,
 }
 
 #[allow(dead_code)] // Consumed by the Task 5 shared planner boundary.
@@ -248,7 +260,7 @@ impl Session {
         request_id: &str,
         context: ScoreContext,
         candidates: Vec<Candidate>,
-    ) -> Result<Vec<GuidanceSignal>, String> {
+    ) -> Result<Vec<ProviderSignal>, String> {
         let candidate_ids = candidates
             .iter()
             .map(|candidate| candidate.candidate_id.clone())
@@ -262,10 +274,21 @@ impl Session {
         match response {
             GuidanceResponse::Scores { signals, .. } => {
                 let accepted = validate_batch_signals(&candidate_ids, signals)?;
+                let manifest = self.manifest.as_ref().ok_or_else(|| {
+                    "guidance addon was scored before manifest negotiation".to_owned()
+                })?;
+                validate_manifest_signals(manifest, &accepted.1)?;
                 self.score_batches += 1;
                 self.returned_signals += accepted.0;
                 self.accepted_signals += accepted.1.len() as u64;
-                Ok(accepted.1)
+                Ok(accepted
+                    .1
+                    .into_iter()
+                    .map(|signal| ProviderSignal {
+                        provider_id: manifest.provider_id.clone(),
+                        signal,
+                    })
+                    .collect())
             }
             GuidanceResponse::Error { message, .. } => Err(message),
             other => Err(format!(
@@ -426,25 +449,54 @@ fn validate_batch_signals(
     Ok((returned, accepted))
 }
 
+fn validate_manifest_signals(
+    manifest: &Manifest,
+    signals: &[GuidanceSignal],
+) -> Result<(), String> {
+    for signal in signals {
+        let Some(channel) = manifest
+            .channels
+            .iter()
+            .find(|channel| channel.channel == signal.channel)
+        else {
+            return Err(format!(
+                "guidance addon returned undeclared channel '{}'",
+                signal.channel
+            ));
+        };
+        if !channel.scopes.contains(&signal.scope) {
+            return Err(format!(
+                "guidance addon returned channel '{}' for undeclared scope {:?}",
+                signal.channel, signal.scope
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(dead_code)] // Called by GuidanceHost::score at the planner boundary.
 fn aggregate_batch(
-    mut signals: Vec<GuidanceSignal>,
+    mut signals: Vec<ProviderSignal>,
     weights: &GuidanceWeights,
     candidate_index: &BTreeMap<String, usize>,
 ) -> GuidanceBatch {
     signals.sort_by(|left, right| {
-        left.candidate_id
-            .cmp(&right.candidate_id)
-            .then_with(|| left.channel.cmp(&right.channel))
+        left.provider_id
+            .cmp(&right.provider_id)
+            .then_with(|| left.signal.candidate_id.cmp(&right.signal.candidate_id))
+            .then_with(|| left.signal.channel.cmp(&right.signal.channel))
     });
     let observed = signals.len() as u64;
     let mut adjustment_by_candidate = BTreeMap::<usize, f64>::new();
     let mut applied = 0_u64;
-    for signal in signals {
+    for provider_signal in signals {
+        let signal = provider_signal.signal;
         let Some(candidate) = candidate_index.get(&signal.candidate_id).copied() else {
             continue;
         };
-        let contribution = weights.weight(&signal.channel) * signal.score * signal.confidence;
+        let contribution = weights.weight(&provider_signal.provider_id, &signal.channel)
+            * signal.score
+            * signal.confidence;
         if contribution != 0.0 {
             applied += 1;
             *adjustment_by_candidate.entry(candidate).or_default() += contribution;
@@ -506,31 +558,62 @@ mod tests {
     #[test]
     fn aggregation_combines_weighted_channels_with_a_stable_cap() {
         let signals = vec![
-            GuidanceSignal {
-                candidate_id: "bliss-row-2".to_owned(),
-                channel: "lastfm_artist".to_owned(),
-                scope: GuidanceScope::Global,
-                score: 0.5,
-                confidence: 1.0,
-                rationale: None,
-                observed_at: None,
+            ProviderSignal {
+                provider_id: "lastfm-guidance".to_owned(),
+                signal: GuidanceSignal {
+                    candidate_id: "bliss-row-2".to_owned(),
+                    channel: "lastfm_artist".to_owned(),
+                    scope: GuidanceScope::Global,
+                    score: 0.5,
+                    confidence: 1.0,
+                    rationale: None,
+                    observed_at: None,
+                },
             },
-            GuidanceSignal {
-                candidate_id: "bliss-row-2".to_owned(),
-                channel: "lastfm_track".to_owned(),
-                scope: GuidanceScope::Global,
-                score: 1.0,
-                confidence: 0.5,
-                rationale: None,
-                observed_at: None,
+            ProviderSignal {
+                provider_id: "lastfm-guidance".to_owned(),
+                signal: GuidanceSignal {
+                    candidate_id: "bliss-row-2".to_owned(),
+                    channel: "lastfm_track".to_owned(),
+                    scope: GuidanceScope::Global,
+                    score: 1.0,
+                    confidence: 0.5,
+                    rationale: None,
+                    observed_at: None,
+                },
             },
         ];
-        let weights =
-            GuidanceWeights::from_channels([("lastfm_track", 0.8), ("lastfm_artist", 0.4)]);
+        let weights = GuidanceWeights::from_provider_channels([
+            (("lastfm-guidance", "lastfm_track"), 0.8),
+            (("lastfm-guidance", "lastfm_artist"), 0.4),
+        ]);
         let index = BTreeMap::from([("bliss-row-2".to_owned(), 2_usize)]);
         let batch = aggregate_batch(signals, &weights, &index);
         assert_eq!(batch.observed, 2);
         assert_eq!(batch.applied, 2);
         assert!((batch.adjustment_by_candidate[&2] - 0.6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn aggregation_uses_provider_and_channel_as_the_policy_key() {
+        let signals = vec![ProviderSignal {
+            provider_id: "future-provider".to_owned(),
+            signal: GuidanceSignal {
+                candidate_id: "bliss-row-2".to_owned(),
+                channel: "preference".to_owned(),
+                scope: GuidanceScope::Global,
+                score: 1.0,
+                confidence: 1.0,
+                rationale: None,
+                observed_at: None,
+            },
+        }];
+        let weights =
+            GuidanceWeights::from_provider_channels([(("future-provider", "preference"), 0.5)]);
+        let index = BTreeMap::from([("bliss-row-2".to_owned(), 2_usize)]);
+
+        let batch = aggregate_batch(signals, &weights, &index);
+
+        assert!((batch.adjustment_by_candidate[&2] - 0.5).abs() < f64::EPSILON);
     }
 }

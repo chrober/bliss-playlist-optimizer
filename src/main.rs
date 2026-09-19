@@ -2811,17 +2811,17 @@ fn score_guidance(
             artist_mbids: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let weights = guidance::GuidanceWeights::from_channels([
+    let weights = guidance::GuidanceWeights::from_provider_channels([
         (
-            "lastfm_track",
+            ("lastfm-guidance", "lastfm_track"),
             f64::from(selection.recording_guidance_percent) / 100.0,
         ),
         (
-            "lastfm_artist",
+            ("lastfm-guidance", "lastfm_artist"),
             f64::from(selection.artist_guidance_percent) / 100.0,
         ),
         (
-            "playcount",
+            ("playcount-guidance", "playcount"),
             f64::from(selection.playcount_influence) / 100.0,
         ),
     ]);
