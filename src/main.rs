@@ -25,6 +25,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use bliss_playlist_optimizer::{bridge, preview, route, semantic};
+mod guidance;
 
 const PROGRAM: &str = "bliss-playlist-optimizer";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -86,6 +87,23 @@ struct Request {
     repeat_windows: RepeatWindows,
     extension: ExtensionSettings,
     semantic_evidence: Artifact,
+    #[serde(default)]
+    guidance_addons: Vec<GuidanceAddonConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GuidanceAddonConfig {
+    /// Stable provider identifier reported by the addon's manifest.
+    id: String,
+    /// Trusted executable path. Runtime integrations must not accept this
+    /// value from an untrusted request file.
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    options: Value,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -259,6 +277,14 @@ struct ValidationSummary {
     local_candidate_track_count: Option<usize>,
     semantic_evidence_sha256: String,
     source_track_count: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    guidance_signal_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    guidance_addon_diagnostics: Vec<guidance::AddonDiagnostic>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 fn aggregate_destination_option_stats(
@@ -566,6 +592,10 @@ struct RouteArtifact {
     database_sha256: String,
     learned_matrix_sha256: String,
     semantic_evidence_sha256: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    guidance_addon_diagnostics: Vec<guidance::AddonDiagnostic>,
+    #[serde(skip_serializing_if = "is_zero")]
+    guidance_signal_count: usize,
     algorithm_requested: String,
     learned_percent: u16,
     seed_limit: usize,
@@ -646,6 +676,10 @@ struct BridgeAnalysisArtifact {
     retained_candidate_limit: usize,
     semantic_mode: String,
     provider_states: Vec<semantic::ProviderState>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    guidance_addon_diagnostics: Vec<guidance::AddonDiagnostic>,
+    #[serde(skip_serializing_if = "is_zero")]
+    guidance_signal_count: usize,
     gaps: Vec<BridgeGapArtifact>,
     selection_preview: SelectionPreviewArtifact,
     scoring_provenance: ScoringProvenanceArtifact,
@@ -1378,6 +1412,7 @@ struct ValidatedRequest {
     library: Option<Library>,
     local_candidate_rows: Option<HashSet<u64>>,
     database_cache: &'static str,
+    guidance_host: guidance::GuidanceHost,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2158,6 +2193,64 @@ fn prepare_runtime_request(
     }
     timings.record("source_resolution", started.elapsed());
 
+    // Start optional guidance providers only after the request, database, and
+    // source identities have passed validation. The initial global score batch
+    // warms providers and exposes diagnostics; edge-scoped batches are owned
+    // by the route planners that need them.
+    let guidance_candidates = library
+        .metadata
+        .iter()
+        .enumerate()
+        .map(|(index, metadata)| {
+            let track = library.track(index);
+            bliss_playlist_guidance_spi::Candidate {
+                candidate_id: bridge_candidate_id(metadata.row_id),
+                database_file: Some(metadata.file.clone()),
+                title: Some(metadata.title_key.clone()),
+                artist: Some(track.artist_key.clone()),
+                album: None,
+                recording_mbid: None,
+                artist_mbids: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let guidance_anchors = request
+        .source_tracks
+        .iter()
+        .chain(request.history_tracks.iter())
+        .map(|track| bliss_playlist_guidance_spi::Anchor {
+            anchor_id: track.id.clone(),
+            track: bliss_playlist_guidance_spi::Candidate {
+                candidate_id: track.id.clone(),
+                database_file: track.database_file.clone(),
+                title: track.title.clone(),
+                artist: track.artist.clone(),
+                album: track.album.clone(),
+                recording_mbid: track.recording_mbid.clone(),
+                artist_mbids: track.artist_mbids.clone(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut guidance_host = guidance::GuidanceHost::start(&request.guidance_addons);
+    guidance_host.prepare(
+        &request.job_id,
+        guidance_candidates.clone(),
+        guidance_anchors,
+    );
+    let guidance_signal_count = guidance_host
+        .score(
+            "initial-global",
+            bliss_playlist_guidance_spi::ScoreContext {
+                scope: bliss_playlist_guidance_spi::GuidanceScope::Global,
+                left_anchor_id: None,
+                right_anchor_id: None,
+                context_track_ids: Vec::new(),
+            },
+            guidance_candidates,
+        )
+        .len();
+    let guidance_addon_diagnostics = guidance_host.diagnostics.clone();
+
     let summary = ValidationSummary {
         schema_version: 1,
         program: PROGRAM,
@@ -2175,6 +2268,8 @@ fn prepare_runtime_request(
         local_candidate_track_count: local_candidate_rows.as_ref().map(HashSet::len),
         semantic_evidence_sha256,
         source_track_count: request.source_tracks.len(),
+        guidance_addon_diagnostics: guidance_addon_diagnostics.clone(),
+        guidance_signal_count,
     };
     Ok(ValidatedRequest {
         summary,
@@ -2184,6 +2279,7 @@ fn prepare_runtime_request(
         library: Some(library),
         local_candidate_rows,
         database_cache,
+        guidance_host,
     })
 }
 
@@ -2357,6 +2453,8 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         local_candidate_track_count: local_candidate_rows.as_ref().map(HashSet::len),
         semantic_evidence_sha256,
         source_track_count: request.source_tracks.len(),
+        guidance_addon_diagnostics: Vec::new(),
+        guidance_signal_count: 0,
     })
 }
 
@@ -3157,6 +3255,7 @@ fn optimize_route_request_with_options(
         library,
         local_candidate_rows: _,
         database_cache,
+        guidance_host: _,
     } = validated;
     if !matches!(request.scoring.algorithm.as_str(), "adaptive" | "static") {
         return Err(CommandFailure::new(
@@ -3371,6 +3470,8 @@ fn optimize_route_request_with_options(
         database_sha256: validation.database_sha256,
         learned_matrix_sha256: scoring_matrix_sha256,
         semantic_evidence_sha256: validation.semantic_evidence_sha256,
+        guidance_addon_diagnostics: validation.guidance_addon_diagnostics.clone(),
+        guidance_signal_count: validation.guidance_signal_count,
         algorithm_requested: request.scoring.algorithm,
         learned_percent,
         seed_limit,
@@ -5385,6 +5486,8 @@ fn analyze_bridge_validated(
             "bliss-only-no-usable-edges".to_owned()
         },
         provider_states: semantic_bundle.providers,
+        guidance_addon_diagnostics: validation.guidance_addon_diagnostics.clone(),
+        guidance_signal_count: validation.guidance_signal_count,
         gaps,
         selection_preview,
         scoring_provenance,
@@ -5414,6 +5517,7 @@ fn analyze_bridge_request_with_options(
         library,
         local_candidate_rows,
         database_cache,
+        guidance_host: _guidance_host,
     } = validated;
     if !matches!(request.scoring.algorithm.as_str(), "adaptive" | "static") {
         return Err(CommandFailure::new(

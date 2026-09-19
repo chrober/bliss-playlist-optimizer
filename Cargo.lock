@@ -104,11 +104,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bliss-playlist-guidance-spi"
+version = "0.1.0"
+source = "git+https://github.com/chrober/bliss-playlist-guidance-spi.git?rev=c5169066e6cb84e869f63fe72d7230dcef54036f#c5169066e6cb84e869f63fe72d7230dcef54036f"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bliss-playlist-optimizer"
 version = "0.1.12"
 dependencies = [
  "bincode",
  "bliss-mixer-core",
+ "bliss-playlist-guidance-spi",
  "jsonschema",
  "ndarray",
  "rand",

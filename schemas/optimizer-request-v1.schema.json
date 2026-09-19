@@ -276,6 +276,22 @@
       ]
     },
     "semantic_evidence": { "$ref": "#/$defs/artifact" },
+    "guidance_addons": {
+      "type": "array",
+      "description": "Optional trusted process guidance addons. Addon output is advisory and failures degrade to neutral guidance.",
+      "items": {
+        "type": "object",
+        "required": ["id", "program"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "program": { "type": "string", "minLength": 1 },
+          "args": { "type": "array", "items": { "type": "string" } },
+          "options": { "type": "object" },
+          "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 300000 }
+        },
+        "additionalProperties": false
+      }
+    },
     "output": {
       "type": "object",
       "additionalProperties": false,

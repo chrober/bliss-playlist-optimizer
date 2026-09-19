@@ -203,6 +203,30 @@ counts remain distinguishable in the snapshot and rank with zero plays. This
 guidance changes only generated-track selection; it does not reorder existing
 membership or weaken acoustic, local-library, uniqueness, or repeat gates.
 
+## Optional guidance addons
+
+The optimizer owns a small process-based guidance SPI, shared by the
+[`bliss-playlist-guidance-spi`](https://github.com/chrober/bliss-playlist-guidance-spi)
+crate and independent addon repositories. The initial addon implementations
+are [`bliss-guidance-lastfm`](https://github.com/chrober/bliss-guidance-lastfm),
+which adapts the raw `semantic-evidence-v1` snapshot into contextual Last.fm
+guidance, and [`bliss-guidance-playcounts`](https://github.com/chrober/bliss-guidance-playcounts),
+which adapts the raw `lms-play-counts-v1` snapshot into global play-count
+guidance. “Evidence” names are retained for those existing raw artifact
+schemas; addon output is called guidance because it is advisory input to
+candidate reranking.
+
+An addon is a trusted executable speaking versioned JSONL over stdin/stdout.
+The optimizer discovers and prepares configured addons, batches candidate
+requests, bounds their signals, and treats a timeout or provider failure as
+neutral guidance. Provider acquisition, network access, and LMS integration
+remain outside the native engine. The `guidance_addons` request field is an
+initial host contract: it initializes configured add-ons and records bounded
+signals and diagnostics in the native artifact. A subsequent integration gate
+will apply those provider-neutral indexes consistently to each planner's
+candidate reranking policy. Existing request-level selection fields remain the
+active compatibility path until then.
+
 Adaptive transition scores are cached privately within each restart. Independent
 restarts run through indexed Rayon iteration and are reduced with stable
 tie-breaking, so results are byte-identical across worker counts. By default the
