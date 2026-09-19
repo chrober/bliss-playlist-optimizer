@@ -138,6 +138,7 @@ struct Artifacts {
     database: Artifact,
     learned_matrix: Option<Artifact>,
     local_candidate_inventory: Option<Artifact>,
+    candidate_identities: Option<Artifact>,
     play_counts: Option<Artifact>,
 }
 
@@ -154,6 +155,21 @@ struct LocalCandidateInventory {
     schema_identity: String,
     database_cache_identity: String,
     allowed_row_ids: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateIdentityInventory {
+    schema_identity: String,
+    database_cache_identity: String,
+    candidates: Vec<CandidateIdentity>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateIdentity {
+    candidate_id: String,
+    row_id: u64,
+    #[serde(default)]
+    lms_urlmd5: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +294,7 @@ struct ValidationSummary {
     database_sha256: String,
     learned_matrix_sha256: Option<String>,
     local_candidate_inventory_sha256: Option<String>,
+    candidate_identities_sha256: Option<String>,
     play_counts_sha256: Option<String>,
     play_count_known_tracks: Option<usize>,
     play_count_unknown_tracks: Option<usize>,
@@ -1418,6 +1435,7 @@ struct ValidatedRequest {
     semantic_bundle: semantic::EvidenceBundle,
     library: Option<Library>,
     local_candidate_rows: Option<HashSet<u64>>,
+    candidate_urlmd5: HashMap<usize, String>,
     database_cache: &'static str,
     guidance_host: guidance::GuidanceHost,
 }
@@ -1783,6 +1801,99 @@ fn load_local_candidate_inventory(
     Ok((rows, hash))
 }
 
+fn load_candidate_identities(
+    artifact: &Artifact,
+    database_artifact: &Artifact,
+    library: &Library,
+    allowed_rows: &HashSet<u64>,
+) -> Result<(HashMap<usize, String>, String), CommandFailure> {
+    if artifact.schema_identity.as_deref() != Some("eligible-candidate-identities-v1") {
+        return Err(CommandFailure::new(
+            "CANDIDATE_IDENTITIES_SCHEMA_MISMATCH",
+            "artifacts.candidate_identities must declare eligible-candidate-identities-v1",
+        ));
+    }
+    let database_identity = database_artifact.cache_identity.as_deref().ok_or_else(|| {
+        CommandFailure::new(
+            "CANDIDATE_IDENTITIES_DATABASE_IDENTITY_REQUIRED",
+            "the database cache identity is required when candidate identities are supplied",
+        )
+    })?;
+    let (bytes, hash) = read_artifact(artifact, "candidate identities")?;
+    let inventory: CandidateIdentityInventory =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            CommandFailure::new(
+                "CANDIDATE_IDENTITIES_INVALID",
+                format!("failed to decode candidate identities: {error}"),
+            )
+        })?;
+    if inventory.schema_identity != "eligible-candidate-identities-v1" {
+        return Err(CommandFailure::new(
+            "CANDIDATE_IDENTITIES_SCHEMA_MISMATCH",
+            "the candidate-identity payload has an unsupported schema identity",
+        ));
+    }
+    if inventory.database_cache_identity != database_identity {
+        return Err(CommandFailure::new(
+            "CANDIDATE_IDENTITIES_DATABASE_MISMATCH",
+            "candidate identities were generated for a different bliss.db identity",
+        ));
+    }
+    let row_to_index = library
+        .metadata
+        .iter()
+        .enumerate()
+        .map(|(index, metadata)| (metadata.row_id, index))
+        .collect::<HashMap<_, _>>();
+    let mut identities = HashMap::new();
+    let mut candidate_ids = HashSet::new();
+    let mut row_ids = HashSet::new();
+    for identity in inventory.candidates {
+        if !candidate_ids.insert(identity.candidate_id.clone()) || !row_ids.insert(identity.row_id)
+        {
+            return Err(CommandFailure::new(
+                "CANDIDATE_IDENTITIES_DUPLICATE",
+                "candidate identities contain a duplicate candidate or Bliss row ID",
+            ));
+        }
+        if identity.candidate_id != bridge_candidate_id(identity.row_id) {
+            return Err(CommandFailure::new(
+                "CANDIDATE_IDENTITIES_ROW_MISMATCH",
+                "candidate identity does not match its Bliss row ID",
+            ));
+        }
+        if !allowed_rows.contains(&identity.row_id) {
+            return Err(CommandFailure::new(
+                "CANDIDATE_IDENTITIES_NONLOCAL_ROW",
+                "candidate identities contain a row outside the selected local candidate library",
+            ));
+        }
+        let index = row_to_index.get(&identity.row_id).copied().ok_or_else(|| {
+            CommandFailure::new(
+                "CANDIDATE_IDENTITIES_UNKNOWN_ROW",
+                "candidate identities contain an unknown or unusable Bliss row",
+            )
+        })?;
+        let urlmd5 = identity
+            .lms_urlmd5
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                CommandFailure::new(
+                    "CANDIDATE_IDENTITIES_URLMD5_REQUIRED",
+                    "candidate identities require an LMS URLMD5 for every eligible row",
+                )
+            })?;
+        identities.insert(index, urlmd5);
+    }
+    if identities.len() != allowed_rows.len() {
+        return Err(CommandFailure::new(
+            "CANDIDATE_IDENTITIES_INCOMPLETE",
+            "candidate identities do not cover every selected local candidate row",
+        ));
+    }
+    Ok((identities, hash))
+}
+
 fn load_play_counts(
     artifact: &Artifact,
     database_artifact: &Artifact,
@@ -2051,6 +2162,35 @@ fn prepare_runtime_request(
         };
     timings.record("local_candidate_inventory_load", started.elapsed());
 
+    progress.update(
+        "candidate_identities_load",
+        "Loading provider candidate identities",
+        None,
+        None,
+    );
+    let started = Instant::now();
+    let (candidate_urlmd5, candidate_identities_sha256) =
+        if let Some(identities) = &request.artifacts.candidate_identities {
+            let allowed_rows = local_candidate_rows.as_ref().ok_or_else(|| {
+                CommandFailure::new(
+                    "CANDIDATE_IDENTITIES_LOCAL_INVENTORY_REQUIRED",
+                    "candidate identities require artifacts.local_candidate_inventory",
+                )
+            })?;
+            let (identities, hash) = load_candidate_identities(
+                identities,
+                &request.artifacts.database,
+                library
+                    .as_ref()
+                    .expect("runtime preparation always loads the library"),
+                allowed_rows,
+            )?;
+            (identities, Some(hash))
+        } else {
+            (HashMap::new(), None)
+        };
+    timings.record("candidate_identities_load", started.elapsed());
+
     let (play_counts_sha256, play_count_stats) =
         if let Some(play_counts) = &request.artifacts.play_counts {
             progress.update("play_counts_load", "Loading LMS play counts", None, None);
@@ -2238,6 +2378,7 @@ fn prepare_runtime_request(
         database_sha256,
         learned_matrix_sha256,
         local_candidate_inventory_sha256,
+        candidate_identities_sha256,
         play_counts_sha256,
         play_count_known_tracks: play_count_stats.map(|stats| stats.known),
         play_count_unknown_tracks: play_count_stats.map(|stats| stats.unknown),
@@ -2254,6 +2395,7 @@ fn prepare_runtime_request(
         semantic_bundle,
         library: Some(library),
         local_candidate_rows,
+        candidate_urlmd5,
         database_cache,
         guidance_host,
     })
@@ -2423,6 +2565,7 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         database_sha256,
         learned_matrix_sha256,
         local_candidate_inventory_sha256,
+        candidate_identities_sha256: None,
         play_counts_sha256,
         play_count_known_tracks: play_count_stats.map(|stats| stats.known),
         play_count_unknown_tracks: play_count_stats.map(|stats| stats.unknown),
@@ -3230,6 +3373,7 @@ fn optimize_route_request_with_options(
         semantic_bundle: _,
         library,
         local_candidate_rows: _,
+        candidate_urlmd5: _,
         database_cache,
         guidance_host: _,
     } = validated;
@@ -5492,6 +5636,7 @@ fn analyze_bridge_request_with_options(
         semantic_bundle,
         library,
         local_candidate_rows,
+        candidate_urlmd5: _,
         database_cache,
         guidance_host: _guidance_host,
     } = validated;
@@ -7219,6 +7364,74 @@ mod tests {
                 .unwrap_err();
         assert_eq!(failure.code, "CANDIDATE_INVENTORY_DATABASE_MISMATCH");
 
+        let _ = fs::remove_dir_all(temporary_root);
+        std::env::set_current_dir(original).unwrap();
+    }
+
+    #[test]
+    fn candidate_identity_inventory_is_hash_bound_and_limited_to_allowed_rows() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let temporary_root = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-identities-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temporary_root).unwrap();
+        let mut request = decode_request(Path::new(
+            "fixtures/synthetic/automatic-bridge-request.json",
+        ))
+        .unwrap();
+        request.artifacts.database.cache_identity = Some("identities-fixture-v1".to_owned());
+        let database = BlissDatabase::open_read_only(&request.artifacts.database.path).unwrap();
+        let library = load_usable_library(&database).unwrap();
+        let allowed_rows = HashSet::from([library.metadata(0).row_id]);
+        let path = temporary_root.join("identities.json");
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "schema_identity": "eligible-candidate-identities-v1",
+            "database_cache_identity": "identities-fixture-v1",
+            "candidates": [{
+                "candidate_id": format!("bliss-row-{}", library.metadata(0).row_id),
+                "row_id": library.metadata(0).row_id,
+                "lms_urlmd5": "url-0"
+            }]
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let artifact = Artifact {
+            path: path.to_string_lossy().into_owned(),
+            sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
+            schema_identity: Some("eligible-candidate-identities-v1".to_owned()),
+            cache_identity: None,
+        };
+
+        let (identities, _) = load_candidate_identities(
+            &artifact,
+            &request.artifacts.database,
+            &library,
+            &allowed_rows,
+        )
+        .unwrap();
+        assert_eq!(identities[&0], "url-0");
+
+        let mut disallowed = payload;
+        disallowed["candidates"][0]["row_id"] = serde_json::json!(library.metadata(1).row_id);
+        disallowed["candidates"][0]["candidate_id"] =
+            serde_json::json!(format!("bliss-row-{}", library.metadata(1).row_id));
+        let disallowed_bytes = serde_json::to_vec(&disallowed).unwrap();
+        fs::write(&path, &disallowed_bytes).unwrap();
+        let failure = load_candidate_identities(
+            &Artifact {
+                sha256: Some(format!("{:x}", Sha256::digest(&disallowed_bytes))),
+                ..artifact
+            },
+            &request.artifacts.database,
+            &library,
+            &allowed_rows,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "CANDIDATE_IDENTITIES_NONLOCAL_ROW");
         let _ = fs::remove_dir_all(temporary_root);
         std::env::set_current_dir(original).unwrap();
     }
