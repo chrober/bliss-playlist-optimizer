@@ -184,6 +184,7 @@ jobs:
             gh release upload "$TAG" release-assets/* --clobber
           else
             gh release create "$TAG" release-assets/* \
+              --target "$GITHUB_SHA" \
               --title "bliss-playlist-optimizer $VERSION" \
               --notes-file "$notes" \
               "${prerelease_flag[@]}"
