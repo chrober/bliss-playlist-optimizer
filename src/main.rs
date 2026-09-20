@@ -2592,18 +2592,22 @@ fn bridge_candidate_id(row_id: u64) -> String {
 /// acoustically short-listed source gap.  The provider receives no candidate
 /// outside that shortlist; an unavailable identity simply leaves the
 /// candidate without provider-specific metadata.
+struct GuidanceRuntime<'a> {
+    host: &'a mut guidance::GuidanceHost,
+    library: &'a Library,
+    candidate_urlmd5: &'a HashMap<usize, String>,
+    weights: &'a guidance::GuidanceWeights,
+}
+
 fn score_guidance_for_gap(
-    host: &mut guidance::GuidanceHost,
+    runtime: &mut GuidanceRuntime<'_>,
     job_id: &str,
     left_anchor_id: &str,
     right_anchor_id: &str,
     candidates: &[usize],
-    library: &Library,
-    candidate_urlmd5: &HashMap<usize, String>,
-    weights: &guidance::GuidanceWeights,
 ) -> guidance::GuidanceBatch {
     score_guidance(
-        host,
+        runtime.host,
         &format!("{job_id}:gap:{left_anchor_id}:{right_anchor_id}"),
         bliss_playlist_guidance_spi::ScoreContext {
             scope: bliss_playlist_guidance_spi::GuidanceScope::Edge,
@@ -2612,9 +2616,9 @@ fn score_guidance_for_gap(
             context_track_ids: vec![left_anchor_id.to_owned(), right_anchor_id.to_owned()],
         },
         candidates,
-        library,
-        candidate_urlmd5,
-        weights,
+        runtime.library,
+        runtime.candidate_urlmd5,
+        runtime.weights,
     )
 }
 
@@ -4309,8 +4313,14 @@ fn analyze_bridge_validated(
         }
         shortlist_elapsed += shortlist_started.elapsed();
         let shortlisted_candidate_count = gap_semantics.candidates.len();
+        let mut guidance_runtime = GuidanceRuntime {
+            host: guidance_host,
+            library: &library,
+            candidate_urlmd5: &candidate_urlmd5,
+            weights: &guidance_weights,
+        };
         let guidance_batch = score_guidance_for_gap(
-            guidance_host,
+            &mut guidance_runtime,
             &request.job_id,
             &request.source_tracks[left_source_index].id,
             &request.source_tracks[right_source_index].id,
@@ -4319,9 +4329,6 @@ fn analyze_bridge_validated(
                 .iter()
                 .map(|candidate| candidate.candidate)
                 .collect::<Vec<_>>(),
-            &library,
-            &candidate_urlmd5,
-            &guidance_weights,
         );
         guidance_signal_count += guidance_batch.observed as usize;
         let guidance_adjustments = guidance_batch.adjustment_by_candidate;
