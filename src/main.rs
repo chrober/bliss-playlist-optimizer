@@ -5438,7 +5438,9 @@ fn analyze_bridge_validated(
         },
         provider_states: semantic_bundle.providers,
         guidance_addon_diagnostics: guidance_host.diagnostics.clone(),
-        guidance_signal_count,
+        guidance_signal_count: guidance_host
+            .accepted_signal_count()
+            .max(guidance_signal_count),
         gaps,
         selection_preview,
         scoring_provenance,

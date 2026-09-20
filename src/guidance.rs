@@ -377,9 +377,19 @@ impl GuidanceHost {
                     returned_signals: session.returned_signals,
                     accepted_signals: session.accepted_signals,
                 }),
-                Err(message) => host_failure(&mut self.diagnostics, session, message),
+                Err(message) => {
+                    session.disable();
+                    host_failure(&mut self.diagnostics, session, message);
+                }
             }
         }
+    }
+
+    pub(crate) fn accepted_signal_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.accepted_signals as usize)
+            .sum()
     }
 
     #[allow(dead_code)] // Activated by the shared planner boundary in Task 5.
@@ -397,7 +407,16 @@ impl GuidanceHost {
                 continue;
             }
             match session.score(request_id, context.clone(), candidates.clone()) {
-                Ok(mut values) => signals.append(&mut values),
+                Ok(mut values) => {
+                    refresh_prepared_diagnostic(
+                        &mut self.diagnostics,
+                        &session.configured_id,
+                        session.score_batches,
+                        session.returned_signals,
+                        session.accepted_signals,
+                    );
+                    signals.append(&mut values);
+                }
                 Err(message) => {
                     session.disable();
                     host_failure(&mut self.diagnostics, session, message);
@@ -407,6 +426,22 @@ impl GuidanceHost {
         let mut batch = aggregate_batch(signals, weights, candidate_index);
         batch.diagnostics = self.diagnostics.clone();
         batch
+    }
+}
+
+fn refresh_prepared_diagnostic(
+    diagnostics: &mut [AddonDiagnostic],
+    configured_id: &str,
+    score_batches: u64,
+    returned_signals: u64,
+    accepted_signals: u64,
+) {
+    if let Some(diagnostic) = diagnostics.iter_mut().rev().find(|diagnostic| {
+        diagnostic.configured_id == configured_id && diagnostic.state == "prepared"
+    }) {
+        diagnostic.score_batches = score_batches;
+        diagnostic.returned_signals = returned_signals;
+        diagnostic.accepted_signals = accepted_signals;
     }
 }
 
@@ -633,5 +668,26 @@ mod tests {
         let batch = aggregate_batch(signals, &weights, &index);
 
         assert!((batch.adjustment_by_candidate[&2] - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn refreshes_prepared_diagnostic_with_final_score_counts() {
+        let mut diagnostics = vec![AddonDiagnostic {
+            configured_id: "lastfm-guidance".to_owned(),
+            provider_id: Some("lastfm-guidance".to_owned()),
+            state: "prepared",
+            message: None,
+            prepared: true,
+            score_batches: 0,
+            returned_signals: 0,
+            accepted_signals: 0,
+        }];
+
+        refresh_prepared_diagnostic(&mut diagnostics, "lastfm-guidance", 3, 12, 10);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].score_batches, 3);
+        assert_eq!(diagnostics[0].returned_signals, 12);
+        assert_eq!(diagnostics[0].accepted_signals, 10);
     }
 }
