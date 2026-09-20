@@ -1521,6 +1521,12 @@ fn usage() -> &'static str {
     "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>\n  bliss-playlist-optimizer route --request <request.json> [--timings] [--cache-dir <directory>] [--progress <progress.json>] [--trusted-request]\n  bliss-playlist-optimizer bridge --request <request.json> [--timings] [--cache-dir <directory>] [--progress <progress.json>] [--trusted-request]"
 }
 
+fn version_metadata_json() -> String {
+    format!(
+        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"guidance_spi_v2\":true}}"
+    )
+}
+
 fn parse_request_command(args: &[String]) -> Option<(&str, &Path, RuntimeOptions)> {
     if args.len() < 3 || args[1] != "--request" {
         return None;
@@ -6036,9 +6042,7 @@ fn main() {
     match args.as_slice() {
         [command] if command == "version" => println!("{PROGRAM} {VERSION}"),
         [command, format] if command == "version" && format == "--json" => {
-            println!(
-                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"play_count_guidance\":true,\"resolved_candidate_guidance\":true}}"
-            );
+            println!("{}", version_metadata_json());
         }
         _ => {
             eprintln!("{}", usage());
@@ -6260,6 +6264,11 @@ mod tests {
             "--trusted-request".to_owned(),
         ];
         assert!(parse_request_command(&validate_args).is_none());
+    }
+
+    #[test]
+    fn version_metadata_advertises_guidance_spi_v2() {
+        assert!(version_metadata_json().contains("\"guidance_spi_v2\":true"));
     }
 
     #[test]
