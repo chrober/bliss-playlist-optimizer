@@ -33,8 +33,6 @@ pub struct RouteTrack {
     pub features: FeatureVector,
     pub artist_key: String,
     pub album_key: String,
-    #[serde(default)]
-    pub play_count_percentile: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -706,7 +704,6 @@ mod tests {
             features: std::array::from_fn(|index| value * (index + 1) as f32 / 10.0),
             artist_key: artist.to_owned(),
             album_key: format!("album-{value}"),
-            play_count_percentile: 0.0,
         }
     }
 

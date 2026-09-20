@@ -167,6 +167,25 @@ fn published_examples_satisfy_their_v1_contracts() {
 }
 
 #[test]
+fn optimizer_request_contract_rejects_legacy_play_count_artifact() {
+    let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut request = read_json(&repository_path(
+        "fixtures/synthetic/adaptive-scoring-request.json",
+    ));
+    request["artifacts"]["play_counts"] = serde_json::json!({
+        "path": "/legacy/play-counts.json",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "schema_identity": "lms-play-counts-v1"
+    });
+
+    assert!(
+        !validator.is_valid(&request),
+        "the SPI migration must not retain the full-library play-count artifact"
+    );
+}
+
+#[test]
 fn semantic_contract_rejects_cross_kind_and_recording_collection_edges() {
     let schema = read_json(&repository_path("schemas/semantic-evidence-v1.schema.json"));
     let validator = jsonschema::validator_for(&schema).unwrap();

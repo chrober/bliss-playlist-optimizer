@@ -33,7 +33,6 @@ const REQUEST_SCHEMA: &str = include_str!("../schemas/optimizer-request-v1.schem
 const SEMANTIC_SCHEMA: &str = include_str!("../schemas/semantic-evidence-v1.schema.json");
 const LOCAL_CANDIDATE_INVENTORY_SCHEMA: &str =
     include_str!("../schemas/lms-local-candidate-inventory-v1.schema.json");
-const PLAY_COUNTS_SCHEMA: &str = include_str!("../schemas/lms-play-counts-v1.schema.json");
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 const EXACT_COUNT_BEAM_WIDTH: usize = 64;
 const LIBRARY_CACHE_VERSION: u8 = 4;
@@ -138,7 +137,6 @@ struct Artifacts {
     learned_matrix: Option<Artifact>,
     local_candidate_inventory: Option<Artifact>,
     candidate_identities: Option<Artifact>,
-    play_counts: Option<Artifact>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,19 +167,6 @@ struct CandidateIdentity {
     row_id: u64,
     #[serde(default)]
     lms_urlmd5: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PlayCountInventory {
-    schema_identity: String,
-    database_cache_identity: String,
-    tracks: Vec<PlayCountTrack>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PlayCountTrack {
-    database_file: String,
-    play_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,9 +279,6 @@ struct ValidationSummary {
     learned_matrix_sha256: Option<String>,
     local_candidate_inventory_sha256: Option<String>,
     candidate_identities_sha256: Option<String>,
-    play_counts_sha256: Option<String>,
-    play_count_known_tracks: Option<usize>,
-    play_count_unknown_tracks: Option<usize>,
     local_candidate_track_count: Option<usize>,
     semantic_evidence_sha256: String,
     source_track_count: usize,
@@ -1444,11 +1426,6 @@ struct ValidatedRequest {
     guidance_host: guidance::GuidanceHost,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct PlayCountStats {
-    known: usize,
-    unknown: usize,
-}
 #[derive(Debug, Serialize)]
 struct CommandFailure {
     schema_version: u8,
@@ -1898,91 +1875,6 @@ fn load_candidate_identities(
     Ok((identities, hash))
 }
 
-fn load_play_counts(
-    artifact: &Artifact,
-    database_artifact: &Artifact,
-    library: &mut Library,
-    validate_contracts: bool,
-) -> Result<(String, PlayCountStats), CommandFailure> {
-    if artifact.schema_identity.as_deref() != Some("lms-play-counts-v1") {
-        return Err(CommandFailure::new(
-            "PLAY_COUNTS_SCHEMA_MISMATCH",
-            "artifacts.play_counts must declare lms-play-counts-v1",
-        ));
-    }
-    let database_identity = database_artifact.cache_identity.as_deref().ok_or_else(|| {
-        CommandFailure::new(
-            "PLAY_COUNTS_DATABASE_IDENTITY_REQUIRED",
-            "the database cache identity is required when play counts are supplied",
-        )
-    })?;
-    let (bytes, hash) = read_artifact(artifact, "play counts")?;
-    let value = parse_json(&bytes, "play counts")?;
-    if validate_contracts {
-        validate_json(&value, PLAY_COUNTS_SCHEMA, "play counts")?;
-    }
-    let inventory: PlayCountInventory = serde_json::from_value(value).map_err(|error| {
-        CommandFailure::new(
-            "PLAY_COUNTS_INVALID",
-            format!("failed to decode play counts: {error}"),
-        )
-    })?;
-    if inventory.schema_identity != "lms-play-counts-v1" {
-        return Err(CommandFailure::new(
-            "PLAY_COUNTS_SCHEMA_MISMATCH",
-            "the play-count payload has an unsupported schema identity",
-        ));
-    }
-    if inventory.database_cache_identity != database_identity {
-        return Err(CommandFailure::new(
-            "PLAY_COUNTS_DATABASE_MISMATCH",
-            "the play-count snapshot was generated for a different bliss.db identity",
-        ));
-    }
-
-    let mut by_file = HashMap::new();
-    for track in inventory.tracks {
-        if by_file
-            .insert(track.database_file.clone(), track.play_count)
-            .is_some()
-        {
-            return Err(CommandFailure::new(
-                "PLAY_COUNTS_INVALID",
-                format!("duplicate play-count identity '{}'", track.database_file),
-            ));
-        }
-    }
-    let values = by_file.values().copied().collect::<Vec<_>>();
-    let known = values.iter().filter(|value| value.is_some()).count();
-    let unknown = values.len().saturating_sub(known);
-    let counts = values
-        .iter()
-        .map(|value| value.unwrap_or(0))
-        .collect::<Vec<_>>();
-    let mut sorted = counts.clone();
-    sorted.sort_unstable();
-    let denominator = sorted.len().saturating_sub(1) as f64;
-    let mut percentile_by_count = HashMap::new();
-    for count in counts {
-        let percentile = if denominator == 0.0 {
-            0.0
-        } else {
-            let first = sorted.partition_point(|value| *value < count);
-            let after = sorted.partition_point(|value| *value <= count);
-            let average_rank = (first + after.saturating_sub(1)) as f64 / 2.0;
-            2.0 * (average_rank / denominator) - 1.0
-        };
-        percentile_by_count.insert(count, percentile);
-    }
-    for (index, metadata) in library.metadata.iter().enumerate() {
-        let Some(value) = by_file.get(&metadata.file) else {
-            continue;
-        };
-        library.tracks[index].play_count_percentile = percentile_by_count[&value.unwrap_or(0)];
-    }
-    Ok((hash, PlayCountStats { known, unknown }))
-}
-
 fn validate_json(
     value: &Value,
     schema_source: &str,
@@ -2084,7 +1976,7 @@ fn prepare_runtime_request(
         .and_then(|cache_dir| load_library_cache(cache_dir, &request.artifacts.database));
     timings.record("database_cache_read", started.elapsed());
 
-    let (database_sha256, mut library, database_cache) = if let Some(cache) = cached {
+    let (database_sha256, library, database_cache) = if let Some(cache) = cached {
         (cache.database_sha256, Some(cache.library), "hit")
     } else {
         progress.update("database_hash", "Hashing Bliss database", None, None);
@@ -2194,30 +2086,6 @@ fn prepare_runtime_request(
             (HashMap::new(), None)
         };
     timings.record("candidate_identities_load", started.elapsed());
-
-    let (play_counts_sha256, play_count_stats) =
-        if let Some(play_counts) = &request.artifacts.play_counts {
-            progress.update("play_counts_load", "Loading LMS play counts", None, None);
-            let started = Instant::now();
-            let (hash, stats) = load_play_counts(
-                play_counts,
-                &request.artifacts.database,
-                library
-                    .as_mut()
-                    .expect("runtime preparation always loads the library"),
-                options.validate_contracts,
-            )?;
-            timings.record("play_counts_load", started.elapsed());
-            (Some(hash), Some(stats))
-        } else {
-            if request.selection.playcount_influence != 0 {
-                return Err(CommandFailure::new(
-                    "PLAY_COUNTS_REQUIRED",
-                    "non-zero selection.playcount_influence requires artifacts.play_counts",
-                ));
-            }
-            (None, None)
-        };
 
     progress.update("learned_matrix_load", "Loading scoring matrix", None, None);
     let started = Instant::now();
@@ -2383,9 +2251,6 @@ fn prepare_runtime_request(
         learned_matrix_sha256,
         local_candidate_inventory_sha256,
         candidate_identities_sha256,
-        play_counts_sha256,
-        play_count_known_tracks: play_count_stats.map(|stats| stats.known),
-        play_count_unknown_tracks: play_count_stats.map(|stats| stats.unknown),
         local_candidate_track_count: local_candidate_rows.as_ref().map(HashSet::len),
         semantic_evidence_sha256,
         source_track_count: request.source_tracks.len(),
@@ -2430,9 +2295,7 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         .quick_check()
         .map_err(|error| CommandFailure::new("DATABASE_INTEGRITY_FAILED", error.to_string()))?;
 
-    let mut validation_library = if request.artifacts.local_candidate_inventory.is_some()
-        || request.artifacts.play_counts.is_some()
-    {
+    let validation_library = if request.artifacts.local_candidate_inventory.is_some() {
         Some(load_usable_library(&database)?)
     } else {
         None
@@ -2451,27 +2314,6 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         } else {
             (None, None)
         };
-    let (play_counts_sha256, play_count_stats) =
-        if let Some(play_counts) = &request.artifacts.play_counts {
-            let (hash, stats) = load_play_counts(
-                play_counts,
-                &request.artifacts.database,
-                validation_library
-                    .as_mut()
-                    .expect("validation library loaded"),
-                true,
-            )?;
-            (Some(hash), Some(stats))
-        } else {
-            if request.selection.playcount_influence != 0 {
-                return Err(CommandFailure::new(
-                    "PLAY_COUNTS_REQUIRED",
-                    "non-zero selection.playcount_influence requires artifacts.play_counts",
-                ));
-            }
-            (None, None)
-        };
-
     let learned_matrix_sha256 = if let Some(matrix) = &request.artifacts.learned_matrix {
         let (_, hash) = read_artifact(matrix, "learned matrix")?;
         bliss_mixer_core::matrix::load_learned_matrix(&matrix.path)
@@ -2570,9 +2412,6 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         learned_matrix_sha256,
         local_candidate_inventory_sha256,
         candidate_identities_sha256: None,
-        play_counts_sha256,
-        play_count_known_tracks: play_count_stats.map(|stats| stats.known),
-        play_count_unknown_tracks: play_count_stats.map(|stats| stats.unknown),
         local_candidate_track_count: local_candidate_rows.as_ref().map(HashSet::len),
         semantic_evidence_sha256,
         source_track_count: request.source_tracks.len(),
@@ -2734,7 +2573,6 @@ fn load_usable_library(database: &BlissDatabase) -> Result<Library, CommandFailu
             features,
             artist_key,
             album_key,
-            play_count_percentile: 0.0,
         });
     }
     Ok(Library {
@@ -3516,7 +3354,6 @@ fn optimize_route_request_with_options(
             features: route_track.features,
             artist_key: repeat_key(&artist),
             album_key: repeat_key(&album),
-            play_count_percentile: route_track.play_count_percentile,
         });
     }
     timings.record("source_track_materialization", started.elapsed());
@@ -3817,7 +3654,6 @@ fn analyze_bridge_validated(
             features: route_track.features,
             artist_key,
             album_key,
-            play_count_percentile: route_track.play_count_percentile,
         });
     }
     let mut history_library_indices = Vec::with_capacity(request.history_tracks.len());
@@ -6478,7 +6314,6 @@ mod tests {
                 }),
                 artist_key: format!("artist-{track}"),
                 album_key: format!("album-{track}"),
-                play_count_percentile: 0.0,
             })
             .collect::<Vec<_>>();
         let mut matrix = Array2::<f32>::zeros((FEATURE_COUNT, FEATURE_COUNT));
@@ -6518,7 +6353,6 @@ mod tests {
                 ),
                 artist_key: format!("artist-{position}"),
                 album_key: format!("album-{position}"),
-                play_count_percentile: 0.0,
             })
             .collect::<Vec<_>>();
         let matrix = Array2::<f32>::eye(FEATURE_COUNT);
@@ -6997,7 +6831,6 @@ mod tests {
                 }),
                 artist_key: format!("artist-{index}"),
                 album_key: format!("album-{index}"),
-                play_count_percentile: 0.0,
             })
             .collect::<Vec<_>>();
         let config = route::SearchConfig {
@@ -7295,59 +7128,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(failure.code, "CANDIDATE_IDENTITIES_NONLOCAL_ROW");
-        let _ = fs::remove_dir_all(temporary_root);
-        std::env::set_current_dir(original).unwrap();
-    }
-
-    #[test]
-    fn play_count_snapshot_is_hash_and_database_bound_and_assigns_tied_percentiles() {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(repository).unwrap();
-        let temporary_root = std::env::temp_dir().join(format!(
-            "bliss-playlist-optimizer-playcount-test-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&temporary_root).unwrap();
-        let mut request = decode_request(Path::new(
-            "fixtures/synthetic/automatic-bridge-request.json",
-        ))
-        .unwrap();
-        request.artifacts.database.cache_identity = Some("playcount-fixture-v1".to_owned());
-        let database = BlissDatabase::open_read_only(&request.artifacts.database.path).unwrap();
-        let mut library = load_usable_library(&database).unwrap();
-        let inventory_path = temporary_root.join("play-counts.json");
-        let inventory = serde_json::json!({
-            "schema_version": 1,
-            "schema_identity": "lms-play-counts-v1",
-            "generated_at": 1,
-            "database_cache_identity": "playcount-fixture-v1",
-            "tracks": [
-                {"database_file": library.metadata(0).file, "play_count": 0},
-                {"database_file": library.metadata(1).file, "play_count": 10},
-                {"database_file": library.metadata(2).file, "play_count": null}
-            ]
-        });
-        let bytes = serde_json::to_vec(&inventory).unwrap();
-        fs::write(&inventory_path, &bytes).unwrap();
-        let artifact = Artifact {
-            path: inventory_path.to_string_lossy().into_owned(),
-            sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
-            schema_identity: Some("lms-play-counts-v1".to_owned()),
-            cache_identity: None,
-        };
-
-        let (_, stats) =
-            load_play_counts(&artifact, &request.artifacts.database, &mut library, true).unwrap();
-        assert_eq!(stats.known, 2);
-        assert_eq!(stats.unknown, 1);
-        assert!(library.track(1).play_count_percentile > library.track(0).play_count_percentile);
-
-        request.artifacts.database.cache_identity = Some("changed".to_owned());
-        let failure = load_play_counts(&artifact, &request.artifacts.database, &mut library, true)
-            .unwrap_err();
-        assert_eq!(failure.code, "PLAY_COUNTS_DATABASE_MISMATCH");
-
         let _ = fs::remove_dir_all(temporary_root);
         std::env::set_current_dir(original).unwrap();
     }
