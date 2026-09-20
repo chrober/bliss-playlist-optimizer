@@ -50,17 +50,24 @@ pub(crate) struct GuidanceWeights {
 }
 
 impl GuidanceWeights {
-    pub(crate) fn from_provider_channels(
-        channels: impl IntoIterator<Item = ((&'static str, &'static str), f64)>,
-    ) -> Self {
+    pub(crate) fn from_policy(policy: &[super::GuidancePolicyEntry]) -> Self {
         Self {
-            by_provider_channel: channels
-                .into_iter()
-                .map(|((provider_id, channel), weight)| {
-                    ((provider_id.to_owned(), channel.to_owned()), weight)
+            by_provider_channel: policy
+                .iter()
+                .map(|entry| {
+                    (
+                        (entry.provider_id.clone(), entry.channel.clone()),
+                        entry.weight.clamp(-1.0, 1.0),
+                    )
                 })
                 .collect(),
         }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.by_provider_channel
+            .values()
+            .any(|weight| *weight != 0.0)
     }
 
     fn weight(&self, provider_id: &str, channel: &str) -> f64 {
@@ -583,9 +590,17 @@ mod tests {
                 },
             },
         ];
-        let weights = GuidanceWeights::from_provider_channels([
-            (("lastfm-guidance", "lastfm_track"), 0.8),
-            (("lastfm-guidance", "lastfm_artist"), 0.4),
+        let weights = GuidanceWeights::from_policy(&[
+            crate::GuidancePolicyEntry {
+                provider_id: "lastfm-guidance".to_owned(),
+                channel: "lastfm_track".to_owned(),
+                weight: 0.8,
+            },
+            crate::GuidancePolicyEntry {
+                provider_id: "lastfm-guidance".to_owned(),
+                channel: "lastfm_artist".to_owned(),
+                weight: 0.4,
+            },
         ]);
         let index = BTreeMap::from([("bliss-row-2".to_owned(), 2_usize)]);
         let batch = aggregate_batch(signals, &weights, &index);
@@ -608,8 +623,11 @@ mod tests {
                 observed_at: None,
             },
         }];
-        let weights =
-            GuidanceWeights::from_provider_channels([(("future-provider", "preference"), 0.5)]);
+        let weights = GuidanceWeights::from_policy(&[crate::GuidancePolicyEntry {
+            provider_id: "future-provider".to_owned(),
+            channel: "preference".to_owned(),
+            weight: 0.5,
+        }]);
         let index = BTreeMap::from([("bliss-row-2".to_owned(), 2_usize)]);
 
         let batch = aggregate_batch(signals, &weights, &index);

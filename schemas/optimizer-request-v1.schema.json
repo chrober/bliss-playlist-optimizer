@@ -90,45 +90,6 @@
           "type": "integer",
           "minimum": 0,
           "description": "Reproducible per-job seed used by every scoring strategy and selection workflow."
-        },
-        "recording_guidance_percent": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 100,
-          "description": "Bounded influence of caller-resolved recording-level guidance after acoustic qualification; zero ignores recording guidance."
-        },
-        "artist_guidance_percent": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 100,
-          "description": "Bounded influence of caller-resolved artist-level guidance after acoustic qualification; zero ignores artist guidance."
-        },
-        "lastfm_track_guidance_percent": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 100,
-          "deprecated": true,
-          "description": "Legacy alias for recording_guidance_percent."
-        },
-        "lastfm_artist_guidance_percent": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 100,
-          "deprecated": true,
-          "description": "Legacy alias for artist_guidance_percent."
-        },
-        "lastfm_artist_probability": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 100,
-          "deprecated": true,
-          "description": "Legacy alias for artist_guidance_percent."
-        },
-        "playcount_influence": {
-          "type": "integer",
-          "minimum": -100,
-          "maximum": 100,
-          "description": "Strategy-neutral preference for less-played (negative) or frequently played (positive) generated tracks; zero disables it."
         }
       }
     },
@@ -314,6 +275,20 @@
             }
           },
           "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 300000 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "guidance_policy": {
+      "type": "array",
+      "description": "Trusted per-job advisory weights keyed by provider and provider-local channel.",
+      "items": {
+        "type": "object",
+        "required": ["provider_id", "channel", "weight"],
+        "properties": {
+          "provider_id": { "type": "string", "minLength": 1 },
+          "channel": { "type": "string", "minLength": 1 },
+          "weight": { "type": "number", "minimum": -1, "maximum": 1 }
         },
         "additionalProperties": false
       }

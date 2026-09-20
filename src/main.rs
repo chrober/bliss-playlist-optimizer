@@ -87,6 +87,15 @@ struct Request {
     semantic_evidence: Artifact,
     #[serde(default)]
     guidance_addons: Vec<GuidanceAddonConfig>,
+    #[serde(default)]
+    guidance_policy: Vec<GuidancePolicyEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GuidancePolicyEntry {
+    provider_id: String,
+    channel: String,
+    weight: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -198,16 +207,6 @@ struct AdaptiveSettings {
 struct SelectionSettings {
     variation_percent: u8,
     generation_seed: u64,
-    #[serde(default, alias = "lastfm_track_guidance_percent")]
-    recording_guidance_percent: u8,
-    #[serde(
-        default,
-        alias = "lastfm_artist_guidance_percent",
-        alias = "lastfm_artist_probability"
-    )]
-    artist_guidance_percent: u8,
-    #[serde(default)]
-    playcount_influence: i8,
 }
 
 impl Default for SelectionSettings {
@@ -215,9 +214,6 @@ impl Default for SelectionSettings {
         Self {
             variation_percent: 0,
             generation_seed: 20_260_721,
-            recording_guidance_percent: 0,
-            artist_guidance_percent: 0,
-            playcount_influence: 0,
         }
     }
 }
@@ -990,6 +986,7 @@ struct FixedSourceGuidance<'a> {
     source_anchor_ids: Vec<String>,
     library: &'a Library,
     candidate_urlmd5: &'a HashMap<usize, String>,
+    weights: &'a guidance::GuidanceWeights,
 }
 
 fn place_fixed_source_extension_additions_preserving_source_order(
@@ -2597,7 +2594,7 @@ fn score_guidance_for_gap(
     candidates: &[usize],
     library: &Library,
     candidate_urlmd5: &HashMap<usize, String>,
-    selection: SelectionSettings,
+    weights: &guidance::GuidanceWeights,
 ) -> guidance::GuidanceBatch {
     score_guidance(
         host,
@@ -2611,7 +2608,7 @@ fn score_guidance_for_gap(
         candidates,
         library,
         candidate_urlmd5,
-        selection,
+        weights,
     )
 }
 
@@ -2622,7 +2619,7 @@ fn score_guidance(
     candidates: &[usize],
     library: &Library,
     candidate_urlmd5: &HashMap<usize, String>,
-    selection: SelectionSettings,
+    weights: &guidance::GuidanceWeights,
 ) -> guidance::GuidanceBatch {
     let mut ordered = candidates.to_vec();
     ordered.sort_by_key(|candidate| library.metadata(*candidate).row_id);
@@ -2649,25 +2646,11 @@ fn score_guidance(
             artist_mbids: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let weights = guidance::GuidanceWeights::from_provider_channels([
-        (
-            ("lastfm-guidance", "lastfm_track"),
-            f64::from(selection.recording_guidance_percent) / 100.0,
-        ),
-        (
-            ("lastfm-guidance", "lastfm_artist"),
-            f64::from(selection.artist_guidance_percent) / 100.0,
-        ),
-        (
-            ("playcount-guidance", "playcount"),
-            f64::from(selection.playcount_influence) / 100.0,
-        ),
-    ]);
     host.score(
         request_id,
         context,
         provider_candidates,
-        &weights,
+        weights,
         &candidate_index,
     )
 }
@@ -2870,9 +2853,9 @@ fn select_fixed_source_extension(
 
     // Variation is deliberately downstream of Bliss relevance. Optional
     // providers only reorder this bounded, quality-controlled pool.
-    let guidance_enabled = selection.recording_guidance_percent > 0
-        || selection.artist_guidance_percent > 0
-        || selection.playcount_influence != 0;
+    let guidance_enabled = guidance
+        .as_ref()
+        .is_some_and(|guidance| guidance.weights.is_enabled());
     let pool_limit = if selection.variation_percent == 0 && !guidance_enabled {
         maximum_requested
     } else {
@@ -2908,7 +2891,7 @@ fn select_fixed_source_extension(
                     .collect::<Vec<_>>(),
                 guidance.library,
                 guidance.candidate_urlmd5,
-                selection,
+                guidance.weights,
             )
             .adjustment_by_candidate
         })
@@ -3503,6 +3486,7 @@ fn analyze_bridge_validated(
     timings: &mut StageTimings,
     progress: &mut ProgressReporter,
 ) -> Result<BridgeAnalysisArtifact, CommandFailure> {
+    let guidance_weights = guidance::GuidanceWeights::from_policy(&request.guidance_policy);
     let adaptive = request.scoring.adaptive.as_ref().ok_or_else(|| {
         CommandFailure::new(
             "ADAPTIVE_SETTINGS_REQUIRED",
@@ -4331,7 +4315,7 @@ fn analyze_bridge_validated(
                 .collect::<Vec<_>>(),
             &library,
             &candidate_urlmd5,
-            request.selection,
+            &guidance_weights,
         );
         guidance_signal_count += guidance_batch.observed as usize;
         let guidance_adjustments = guidance_batch.adjustment_by_candidate;
@@ -5211,6 +5195,7 @@ fn analyze_bridge_validated(
                             .collect(),
                         library: &library,
                         candidate_urlmd5: &candidate_urlmd5,
+                        weights: &guidance_weights,
                     }),
                     progress,
                 },
@@ -6386,9 +6371,7 @@ mod tests {
         });
         request["selection"] = serde_json::json!({
             "variation_percent": 75,
-            "generation_seed": 1234,
-            "recording_guidance_percent": 0,
-            "artist_guidance_percent": 0
+            "generation_seed": 1234
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6470,9 +6453,7 @@ mod tests {
         });
         request["selection"] = serde_json::json!({
             "variation_percent": 0,
-            "generation_seed": 1234,
-            "recording_guidance_percent": 0,
-            "artist_guidance_percent": 0
+            "generation_seed": 1234
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6559,9 +6540,7 @@ mod tests {
             });
             request["selection"] = serde_json::json!({
                 "variation_percent": 25,
-                "generation_seed": 1234,
-                "recording_guidance_percent": 0,
-                "artist_guidance_percent": 0
+                "generation_seed": 1234
             });
 
             let temporary = std::env::temp_dir().join(format!(
@@ -6625,9 +6604,7 @@ mod tests {
         });
         request["selection"] = serde_json::json!({
             "variation_percent": 0,
-            "generation_seed": 1234,
-            "recording_guidance_percent": 0,
-            "artist_guidance_percent": 0
+            "generation_seed": 1234
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6761,9 +6738,7 @@ mod tests {
         });
         request["selection"] = serde_json::json!({
             "variation_percent": 0,
-            "generation_seed": 1234,
-            "recording_guidance_percent": 0,
-            "artist_guidance_percent": 0
+            "generation_seed": 1234
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6935,9 +6910,6 @@ mod tests {
                     selection: SelectionSettings {
                         variation_percent: 100,
                         generation_seed: seed,
-                        recording_guidance_percent: 0,
-                        artist_guidance_percent: 0,
-                        playcount_influence: 0,
                     },
                     guidance: None,
                     shortlist_limit: 256,
