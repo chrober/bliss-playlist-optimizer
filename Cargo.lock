@@ -106,7 +106,7 @@ dependencies = [
 [[package]]
 name = "bliss-playlist-guidance-spi"
 version = "0.1.0"
-source = "git+https://github.com/chrober/bliss-playlist-guidance-spi.git?rev=ec385df#ec385df885748626b663b722bcebac846a44ad73"
+source = "git+https://github.com/chrober/bliss-playlist-guidance-spi.git?rev=6fa2d55#6fa2d55d972aa5a8220fdd170dcf5df398acbd07"
 dependencies = [
  "serde",
  "serde_json",
