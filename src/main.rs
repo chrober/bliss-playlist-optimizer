@@ -874,6 +874,8 @@ struct BridgeCandidateArtifact {
     candidate_id: String,
     semantic_tier: semantic::SemanticTier,
     semantic_evidence: Vec<semantic::MatchedEvidence>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    guidance_contributions: Vec<guidance::AppliedGuidanceContribution>,
     left_distance: f64,
     right_distance: f64,
     left_percentile: f64,
@@ -954,6 +956,8 @@ struct FixedSourceExtensionAdditionArtifact {
     semantic_pool: semantic::SemanticPool,
     semantic_tier: semantic::SemanticTier,
     semantic_evidence: Vec<semantic::MatchedEvidence>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    guidance_contributions: Vec<guidance::AppliedGuidanceContribution>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -961,6 +965,7 @@ struct FixedSourceExtensionAddition {
     candidate: usize,
     relevance_distance: f64,
     semantics: semantic::CandidateSemantics,
+    guidance_contributions: Vec<guidance::AppliedGuidanceContribution>,
 }
 
 struct FixedSourceExtensionResult {
@@ -2713,12 +2718,14 @@ fn candidate_semantic_identity(
 fn bridge_candidate_artifact(
     evaluation: &bridge::BridgeCandidateEvaluation,
     semantics: &semantic::CandidateSemantics,
+    guidance_contributions: Vec<guidance::AppliedGuidanceContribution>,
     library: &Library,
 ) -> BridgeCandidateArtifact {
     BridgeCandidateArtifact {
         candidate_id: bridge_candidate_id(library.metadata(evaluation.candidate).row_id),
         semantic_tier: semantics.tier,
         semantic_evidence: semantics.evidence.clone(),
+        guidance_contributions,
         left_distance: evaluation.left_distance,
         right_distance: evaluation.right_distance,
         left_percentile: evaluation.left_percentile,
@@ -2883,7 +2890,7 @@ fn select_fixed_source_extension(
         Some(ranked.len()),
     );
     let mut selection_order = ranked[..pool_limit].to_vec();
-    let provider_adjustments = guidance
+    let provider_guidance = guidance
         .as_mut()
         .map(|guidance| {
             score_guidance(
@@ -2903,9 +2910,10 @@ fn select_fixed_source_extension(
                 guidance.candidate_urlmd5,
                 guidance.weights,
             )
-            .adjustment_by_candidate
         })
         .unwrap_or_default();
+    let provider_adjustments = provider_guidance.adjustment_by_candidate;
+    let provider_contributions = provider_guidance.contributions_by_candidate;
     if selection.variation_percent > 0 {
         progress.update(
             "extension_selection_pool",
@@ -3065,6 +3073,10 @@ fn select_fixed_source_extension(
                     tier: semantic::SemanticTier::BlissOnly,
                     evidence: Vec::new(),
                 },
+                guidance_contributions: provider_contributions
+                    .get(&candidate)
+                    .cloned()
+                    .unwrap_or_default(),
             });
             *artist_counts.entry(artist).or_default() += 1;
             *album_counts.entry(album).or_default() += 1;
@@ -4209,6 +4221,8 @@ fn analyze_bridge_validated(
     let mut preview_gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut semantic_assisted = false;
     let mut guidance_signal_count = 0_usize;
+    let mut guidance_contributions_by_gap =
+        HashMap::<usize, BTreeMap<usize, Vec<guidance::AppliedGuidanceContribution>>>::new();
     let gap_positions = if request.extension.mode == "fixed_source_extension" {
         Vec::new()
     } else if destination_route {
@@ -4332,6 +4346,8 @@ fn analyze_bridge_validated(
         );
         guidance_signal_count += guidance_batch.observed as usize;
         let guidance_adjustments = guidance_batch.adjustment_by_candidate;
+        let guidance_contributions = guidance_batch.contributions_by_candidate;
+        guidance_contributions_by_gap.insert(position, guidance_contributions.clone());
         preview_gaps.push(preview::AutomaticGap {
             original_position: position,
             left: selected_library_route[position - 1],
@@ -4382,6 +4398,10 @@ fn analyze_bridge_validated(
                 bridge_candidate_artifact(
                     candidate,
                     semantics_by_candidate[&candidate.candidate],
+                    guidance_contributions
+                        .get(&candidate.candidate)
+                        .cloned()
+                        .unwrap_or_default(),
                     &library,
                 )
             })
@@ -4503,6 +4523,13 @@ fn analyze_bridge_validated(
                         bridge_candidate_artifact(
                             &selected.evaluation,
                             &selected.semantics,
+                            guidance_contributions_by_gap
+                                .get(&decision.original_position)
+                                .and_then(|candidates| {
+                                    candidates.get(&selected.evaluation.candidate)
+                                })
+                                .cloned()
+                                .unwrap_or_default(),
                             &library,
                         )
                     }),
@@ -5063,6 +5090,13 @@ fn analyze_bridge_validated(
                         bridge_candidate_artifact(
                             &selected.evaluation,
                             &selected.semantics,
+                            guidance_contributions_by_gap
+                                .get(&decision.original_position)
+                                .and_then(|candidates| {
+                                    candidates.get(&selected.evaluation.candidate)
+                                })
+                                .cloned()
+                                .unwrap_or_default(),
                             &library,
                         )
                     }),
@@ -5326,6 +5360,7 @@ fn analyze_bridge_validated(
                         },
                         semantic_tier: addition.semantics.tier,
                         semantic_evidence: addition.semantics.evidence,
+                        guidance_contributions: addition.guidance_contributions,
                     })
                     .collect(),
             })

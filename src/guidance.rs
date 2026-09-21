@@ -11,6 +11,7 @@ use bliss_playlist_guidance_spi::{
     GuidanceScope, GuidanceSignal, Manifest, ResourceDescriptor, ScoreContext, PROTOCOL_NAME,
     SPI_VERSION,
 };
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
@@ -84,10 +85,27 @@ struct ProviderSignal {
     signal: GuidanceSignal,
 }
 
+/// A provider signal that survived policy weighting and changed an already
+/// Bliss-qualified candidate's score. This is emitted with selected results so
+/// hosts can explain an actual selection without recreating provider logic.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct AppliedGuidanceContribution {
+    pub provider_id: String,
+    pub channel: String,
+    pub scope: GuidanceScope,
+    pub signal_score: f64,
+    pub confidence: f64,
+    pub policy_weight: f64,
+    pub contribution: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+}
+
 #[allow(dead_code)] // Consumed by the Task 5 shared planner boundary.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GuidanceBatch {
     pub adjustment_by_candidate: BTreeMap<usize, f64>,
+    pub contributions_by_candidate: BTreeMap<usize, Vec<AppliedGuidanceContribution>>,
     pub observed: u64,
     pub applied: u64,
     pub diagnostics: Vec<AddonDiagnostic>,
@@ -531,17 +549,33 @@ fn aggregate_batch(
     let observed = signals.len() as u64;
     let mut adjustment_by_candidate = BTreeMap::<usize, f64>::new();
     let mut applied = 0_u64;
+    let mut contributions_by_candidate = BTreeMap::<usize, Vec<AppliedGuidanceContribution>>::new();
     for provider_signal in signals {
-        let signal = provider_signal.signal;
+        let ProviderSignal {
+            provider_id,
+            signal,
+        } = provider_signal;
         let Some(candidate) = candidate_index.get(&signal.candidate_id).copied() else {
             continue;
         };
-        let contribution = weights.weight(&provider_signal.provider_id, &signal.channel)
-            * signal.score
-            * signal.confidence;
+        let policy_weight = weights.weight(&provider_id, &signal.channel);
+        let contribution = policy_weight * signal.score * signal.confidence;
         if contribution != 0.0 {
             applied += 1;
             *adjustment_by_candidate.entry(candidate).or_default() += contribution;
+            contributions_by_candidate
+                .entry(candidate)
+                .or_default()
+                .push(AppliedGuidanceContribution {
+                    provider_id,
+                    channel: signal.channel,
+                    scope: signal.scope,
+                    signal_score: signal.score,
+                    confidence: signal.confidence,
+                    policy_weight,
+                    contribution,
+                    rationale: signal.rationale,
+                });
         }
     }
     for adjustment in adjustment_by_candidate.values_mut() {
@@ -549,6 +583,7 @@ fn aggregate_batch(
     }
     GuidanceBatch {
         adjustment_by_candidate,
+        contributions_by_candidate,
         observed,
         applied,
         diagnostics: Vec::new(),
@@ -642,6 +677,16 @@ mod tests {
         assert_eq!(batch.observed, 2);
         assert_eq!(batch.applied, 2);
         assert!((batch.adjustment_by_candidate[&2] - 0.6).abs() < f64::EPSILON);
+        let contributions = batch
+            .contributions_by_candidate
+            .get(&2)
+            .expect("applied guidance is retained for result provenance");
+        assert_eq!(contributions.len(), 2);
+        assert_eq!(contributions[0].provider_id, "lastfm-guidance");
+        assert_eq!(contributions[0].channel, "lastfm_artist");
+        assert!((contributions[0].contribution - 0.2).abs() < f64::EPSILON);
+        assert_eq!(contributions[1].channel, "lastfm_track");
+        assert!((contributions[1].contribution - 0.4).abs() < f64::EPSILON);
     }
 
     #[test]
