@@ -51,6 +51,35 @@ pub(crate) struct GuidanceWeights {
     target_by_provider_channel: BTreeMap<(String, String), u8>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct TargetShareDiagnostic {
+    pub provider_id: String,
+    pub channel: String,
+    pub target_percent: u8,
+    pub supported_candidate_count: usize,
+    pub multiplier: f64,
+}
+
+struct TargetShareDetails {
+    provider_id: String,
+    channel: String,
+    target_percent: u8,
+    supported: BTreeSet<usize>,
+    multiplier: f64,
+}
+
+fn has_positive_support(
+    items: Option<&Vec<AppliedGuidanceContribution>>,
+    provider_id: &str,
+    channel: &str,
+) -> bool {
+    items.is_some_and(|items| {
+        items.iter().any(|item| {
+            item.provider_id == provider_id && item.channel == channel && item.contribution > 0.0
+        })
+    })
+}
+
 impl GuidanceWeights {
     pub(crate) fn from_policy(policy: &[super::GuidancePolicyEntry]) -> Self {
         Self {
@@ -66,12 +95,10 @@ impl GuidanceWeights {
             target_by_provider_channel: policy
                 .iter()
                 .filter_map(|entry| {
-                    entry.target_percent.filter(|target| *target > 0).map(|target| {
-                        (
-                            (entry.provider_id.clone(), entry.channel.clone()),
-                            target,
-                        )
-                    })
+                    entry
+                        .target_percent
+                        .filter(|target| *target > 0)
+                        .map(|target| ((entry.provider_id.clone(), entry.channel.clone()), target))
                 })
                 .collect(),
         }
@@ -87,11 +114,132 @@ impl GuidanceWeights {
         !self.target_by_provider_channel.is_empty()
     }
 
+    /// Finds the smallest Bliss-ranked prefix that gives every configured
+    /// target channel enough supported alternatives to plausibly meet its
+    /// requested share. The provider can still be unavailable or have too few
+    /// matches; in that case the complete supplied discovery pool is retained
+    /// and the caller reports that limitation explicitly.
+    pub(crate) fn target_share_minimum_pool_limit(
+        &self,
+        candidates: &[usize],
+        contributions: &BTreeMap<usize, Vec<AppliedGuidanceContribution>>,
+        requested_selection_count: usize,
+        minimum_pool_limit: usize,
+    ) -> usize {
+        let minimum_pool_limit = minimum_pool_limit.min(candidates.len());
+        if candidates.is_empty() || self.target_by_provider_channel.is_empty() {
+            return minimum_pool_limit;
+        }
+
+        let required = self
+            .target_by_provider_channel
+            .iter()
+            .map(|(channel, target_percent)| {
+                let target_count = requested_selection_count
+                    .saturating_mul(usize::from(*target_percent))
+                    .div_ceil(100);
+                (channel.clone(), target_count)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut supported = required
+            .keys()
+            .cloned()
+            .map(|channel| (channel, 0_usize))
+            .collect::<BTreeMap<_, _>>();
+
+        for (index, candidate) in candidates.iter().copied().enumerate() {
+            let items = contributions.get(&candidate);
+            for channel in required.keys() {
+                let has_support = has_positive_support(items, &channel.0, &channel.1);
+                if has_support {
+                    *supported.entry(channel.clone()).or_default() += 1;
+                }
+            }
+            let prefix_length = index + 1;
+            if prefix_length >= minimum_pool_limit
+                && required.iter().all(|(channel, target)| {
+                    supported.get(channel).copied().unwrap_or_default() >= *target
+                })
+            {
+                return prefix_length;
+            }
+        }
+        candidates.len()
+    }
+
     fn weight(&self, provider_id: &str, channel: &str) -> f64 {
         self.by_provider_channel
             .get(&(provider_id.to_owned(), channel.to_owned()))
             .copied()
             .unwrap_or(0.0)
+    }
+
+    fn target_share_details(
+        &self,
+        candidates: &[usize],
+        contributions: &BTreeMap<usize, Vec<AppliedGuidanceContribution>>,
+    ) -> Vec<TargetShareDetails> {
+        let pool_size = candidates.len();
+        self.target_by_provider_channel
+            .iter()
+            .map(|((provider_id, channel), target_percent)| {
+                let mut supported_base_weight = 0.0_f64;
+                let mut other_base_weight = 0.0_f64;
+                let mut supported = BTreeSet::new();
+                for (rank, candidate) in candidates.iter().copied().enumerate() {
+                    let rank_fraction = if pool_size > 1 {
+                        rank as f64 / (pool_size - 1) as f64
+                    } else {
+                        0.0
+                    };
+                    // Identical to BlissMixer's candidate-selection base curve:
+                    // the least acoustically suitable member of the pool retains
+                    // one tenth of the top member's base weight.
+                    let base_weight = (-std::f64::consts::LN_10 * rank_fraction).exp();
+                    if has_positive_support(contributions.get(&candidate), provider_id, channel) {
+                        supported.insert(candidate);
+                        supported_base_weight += base_weight;
+                    } else {
+                        other_base_weight += base_weight;
+                    }
+                }
+                let multiplier = if supported.is_empty() || other_base_weight <= 0.0 {
+                    1.0
+                } else {
+                    let target = f64::from(*target_percent) / 100.0;
+                    if target >= 1.0 {
+                        1_000_000.0
+                    } else {
+                        ((target * other_base_weight) / ((1.0 - target) * supported_base_weight))
+                            .max(0.000_001)
+                    }
+                };
+                TargetShareDetails {
+                    provider_id: provider_id.clone(),
+                    channel: channel.clone(),
+                    target_percent: *target_percent,
+                    supported,
+                    multiplier,
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn target_share_diagnostics(
+        &self,
+        candidates: &[usize],
+        contributions: &BTreeMap<usize, Vec<AppliedGuidanceContribution>>,
+    ) -> Vec<TargetShareDiagnostic> {
+        self.target_share_details(candidates, contributions)
+            .into_iter()
+            .map(|details| TargetShareDiagnostic {
+                provider_id: details.provider_id,
+                channel: details.channel,
+                target_percent: details.target_percent,
+                supported_candidate_count: details.supported.len(),
+                multiplier: details.multiplier,
+            })
+            .collect()
     }
 
     /// Returns DSTM-style per-candidate multipliers for channels configured
@@ -112,50 +260,9 @@ impl GuidanceWeights {
             return weights;
         }
 
-        let pool_size = candidates.len();
-        for ((provider_id, channel), target_percent) in &self.target_by_provider_channel {
-            let mut supported_base_weight = 0.0_f64;
-            let mut other_base_weight = 0.0_f64;
-            let mut supported = BTreeSet::new();
-            for (rank, candidate) in candidates.iter().copied().enumerate() {
-                let rank_fraction = if pool_size > 1 {
-                    rank as f64 / (pool_size - 1) as f64
-                } else {
-                    0.0
-                };
-                // Identical to BlissMixer's candidate-selection base curve:
-                // the least acoustically suitable member of the pool retains
-                // one tenth of the top member's base weight.
-                let base_weight = (-std::f64::consts::LN_10 * rank_fraction).exp();
-                let is_supported = contributions
-                    .get(&candidate)
-                    .is_some_and(|items| {
-                        items.iter().any(|item| {
-                            item.provider_id == *provider_id
-                                && item.channel == *channel
-                                && item.contribution > 0.0
-                        })
-                    });
-                if is_supported {
-                    supported.insert(candidate);
-                    supported_base_weight += base_weight;
-                } else {
-                    other_base_weight += base_weight;
-                }
-            }
-            // A target only has meaning while both populations are present.
-            // Otherwise no multiplier can create a meaningful alternative.
-            if supported.is_empty() || other_base_weight <= 0.0 {
-                continue;
-            }
-            let target = f64::from(*target_percent) / 100.0;
-            let multiplier = if target >= 1.0 {
-                1_000_000.0
-            } else {
-                (target * other_base_weight) / ((1.0 - target) * supported_base_weight)
-            };
-            for candidate in supported {
-                *weights.entry(candidate).or_insert(1.0) *= multiplier.max(0.000_001);
+        for details in self.target_share_details(candidates, contributions) {
+            for candidate in details.supported {
+                *weights.entry(candidate).or_insert(1.0) *= details.multiplier;
             }
         }
         weights
@@ -796,8 +903,7 @@ mod tests {
             }],
         )]);
 
-        let candidate_weights =
-            weights.target_share_weights(&[1, 2, 3, 4], &contributions);
+        let candidate_weights = weights.target_share_weights(&[1, 2, 3, 4], &contributions);
 
         assert!(candidate_weights[&2] > 1.0);
         assert_eq!(candidate_weights[&1], 1.0);
@@ -831,6 +937,38 @@ mod tests {
             weights.target_share_weights(&[1, 2], &contributions),
             BTreeMap::from([(1, 1.0), (2, 1.0)])
         );
+    }
+
+    #[test]
+    fn target_share_diagnostics_explain_supported_candidates_and_multiplier() {
+        let weights = GuidanceWeights::from_policy(&[crate::GuidancePolicyEntry {
+            provider_id: "lastfm-guidance".to_owned(),
+            channel: "lastfm_artist".to_owned(),
+            weight: 1.0,
+            target_percent: Some(75),
+        }]);
+        let contributions = BTreeMap::from([(
+            2_usize,
+            vec![AppliedGuidanceContribution {
+                provider_id: "lastfm-guidance".to_owned(),
+                channel: "lastfm_artist".to_owned(),
+                scope: GuidanceScope::Global,
+                signal_score: 1.0,
+                confidence: 1.0,
+                policy_weight: 1.0,
+                contribution: 1.0,
+                rationale: None,
+            }],
+        )]);
+
+        let diagnostics = weights.target_share_diagnostics(&[1, 2, 3], &contributions);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].provider_id, "lastfm-guidance");
+        assert_eq!(diagnostics[0].channel, "lastfm_artist");
+        assert_eq!(diagnostics[0].target_percent, 75);
+        assert_eq!(diagnostics[0].supported_candidate_count, 1);
+        assert!(diagnostics[0].multiplier > 1.0);
     }
 
     #[test]

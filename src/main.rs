@@ -35,6 +35,11 @@ const LOCAL_CANDIDATE_INVENTORY_SCHEMA: &str =
     include_str!("../schemas/lms-local-candidate-inventory-v1.schema.json");
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 const EXACT_COUNT_BEAM_WIDTH: usize = 64;
+// Mirrors BlissMixer's Last.fm candidate-pool multiplier while keeping the
+// discovery batch bounded for large libraries. The optimizer still ranks this
+// entire batch by Bliss relevance before optional guidance can influence it.
+const TARGET_GUIDANCE_DISCOVERY_MULTIPLIER: usize = 10;
+const MAX_TARGET_GUIDANCE_DISCOVERY_CANDIDATES: usize = 4_096;
 const LIBRARY_CACHE_VERSION: u8 = 4;
 const MAX_LIBRARY_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v4\n";
@@ -919,6 +924,8 @@ struct FixedSourceExtensionSelectionArtifact {
     relevance_reference_track_count: usize,
     relevance_summary: FixedSourceExtensionRelevanceSummaryArtifact,
     route_summary: FixedSourceExtensionRouteSummaryArtifact,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance_candidate_pool: Option<FixedSourceGuidanceCandidatePoolArtifact>,
     acceptance_proofs: FixedSourceExtensionAcceptanceProofsArtifact,
     final_sequence: Vec<PreviewSequenceEntryArtifact>,
     selected_additions: Vec<FixedSourceExtensionAdditionArtifact>,
@@ -975,6 +982,78 @@ struct FixedSourceExtensionResult {
     additions: Vec<FixedSourceExtensionAddition>,
     selected_strategy: &'static str,
     route_metrics: route::RouteMetrics,
+    guidance_candidate_pool: Option<FixedSourceGuidanceCandidatePoolArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct FixedSourceGuidanceCandidatePoolArtifact {
+    bliss_ranked_candidate_count: usize,
+    baseline_candidate_pool_count: usize,
+    provider_scored_candidate_count: usize,
+    selected_candidate_pool_count: usize,
+    expanded_for_target_support: bool,
+    target_channels: Vec<guidance::TargetShareDiagnostic>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FixedSourceGuidancePoolPlan {
+    baseline_limit: usize,
+    provider_scored_limit: usize,
+    selection_limit: usize,
+    expanded_for_target_support: bool,
+}
+
+fn fixed_source_guidance_pool_plan(
+    maximum_requested: usize,
+    shortlist_limit: usize,
+    variation_percent: u8,
+    weights: &guidance::GuidanceWeights,
+    candidates: &[usize],
+    contributions: &BTreeMap<usize, Vec<guidance::AppliedGuidanceContribution>>,
+) -> FixedSourceGuidancePoolPlan {
+    let guidance_enabled = weights.is_enabled();
+    let mut baseline_limit = if variation_percent == 0 && !guidance_enabled {
+        maximum_requested
+    } else {
+        maximum_requested.saturating_mul(TARGET_GUIDANCE_DISCOVERY_MULTIPLIER)
+    }
+    .min(shortlist_limit)
+    .min(candidates.len());
+
+    if !weights.has_target_shares() {
+        return FixedSourceGuidancePoolPlan {
+            baseline_limit,
+            provider_scored_limit: baseline_limit,
+            selection_limit: baseline_limit,
+            expanded_for_target_support: false,
+        };
+    }
+
+    // The caller-facing shortlist is the normal acoustic working set. Last.fm
+    // target shares need a wider, but still finite, Bliss-ranked discovery
+    // batch: otherwise an empty first 256 candidates makes a target inert.
+    baseline_limit = baseline_limit
+        .max(maximum_requested.saturating_mul(TARGET_GUIDANCE_DISCOVERY_MULTIPLIER))
+        .min(candidates.len());
+    let provider_scored_limit = baseline_limit
+        .max(
+            shortlist_limit
+                .saturating_mul(TARGET_GUIDANCE_DISCOVERY_MULTIPLIER)
+                .min(MAX_TARGET_GUIDANCE_DISCOVERY_CANDIDATES),
+        )
+        .min(candidates.len());
+    let selection_limit = weights.target_share_minimum_pool_limit(
+        &candidates[..provider_scored_limit],
+        contributions,
+        maximum_requested,
+        baseline_limit,
+    );
+    FixedSourceGuidancePoolPlan {
+        baseline_limit,
+        provider_scored_limit,
+        selection_limit,
+        expanded_for_target_support: selection_limit > baseline_limit,
+    }
 }
 
 struct FixedSourceExtensionContext<'a> {
@@ -2871,27 +2950,34 @@ fn select_fixed_source_extension(
     });
 
     // Variation is deliberately downstream of Bliss relevance. Optional
-    // providers only reorder this bounded, quality-controlled pool.
-    let guidance_enabled = guidance
+    // providers only reorder a bounded, quality-controlled pool. A target
+    // share receives a wider Bliss-ranked discovery batch first, then narrows
+    // back to the smallest prefix that contains enough supported candidates.
+    let guidance_weights = guidance
         .as_ref()
-        .is_some_and(|guidance| guidance.weights.is_enabled());
-    let pool_limit = if selection.variation_percent == 0 && !guidance_enabled {
-        maximum_requested
-    } else {
-        maximum_requested.saturating_mul(10).max(maximum_requested)
-    }
-    .min(shortlist_limit)
-    .min(ranked.len());
+        .map(|guidance| guidance.weights.clone())
+        .unwrap_or_default();
+    let guidance_enabled = guidance_weights.is_enabled();
+    let ranked_candidate_ids = ranked.iter().map(|entry| entry.0).collect::<Vec<_>>();
+    let no_contributions = BTreeMap::new();
+    let discovery_plan = fixed_source_guidance_pool_plan(
+        maximum_requested,
+        shortlist_limit,
+        selection.variation_percent,
+        &guidance_weights,
+        &ranked_candidate_ids,
+        &no_contributions,
+    );
     progress.update(
         "extension_selection_pool",
         format!(
-            "Preparing quality-controlled addition pool: {pool_limit}/{} candidates",
-            ranked.len()
+            "Preparing Bliss-ranked guidance discovery pool: {}/{} candidates",
+            discovery_plan.provider_scored_limit,
+            ranked.len(),
         ),
-        Some(pool_limit),
+        Some(discovery_plan.provider_scored_limit),
         Some(ranked.len()),
     );
-    let mut selection_order = ranked[..pool_limit].to_vec();
     let provider_guidance = guidance
         .as_mut()
         .map(|guidance| {
@@ -2904,7 +2990,7 @@ fn select_fixed_source_extension(
                     right_anchor_id: None,
                     context_track_ids: guidance.source_anchor_ids.clone(),
                 },
-                &selection_order
+                &ranked[..discovery_plan.provider_scored_limit]
                     .iter()
                     .map(|entry| entry.0)
                     .collect::<Vec<_>>(),
@@ -2916,21 +3002,46 @@ fn select_fixed_source_extension(
         .unwrap_or_default();
     let provider_adjustments = provider_guidance.adjustment_by_candidate;
     let provider_contributions = provider_guidance.contributions_by_candidate;
-    let target_share_weights = guidance
-        .as_ref()
-        .map(|guidance| {
-            guidance.weights.target_share_weights(
-                &selection_order
-                    .iter()
-                    .map(|entry| entry.0)
-                    .collect::<Vec<_>>(),
+    let selection_plan = fixed_source_guidance_pool_plan(
+        maximum_requested,
+        shortlist_limit,
+        selection.variation_percent,
+        &guidance_weights,
+        &ranked_candidate_ids,
+        &provider_contributions,
+    );
+    let pool_limit = selection_plan.selection_limit;
+    if selection_plan.expanded_for_target_support {
+        progress.update(
+            "extension_selection_pool",
+            format!(
+                "Expanded Bliss-qualified addition pool to {pool_limit} candidates so configured guidance targets have supported alternatives"
+            ),
+            Some(pool_limit),
+            Some(discovery_plan.provider_scored_limit),
+        );
+    }
+    let guidance_candidate_pool =
+        guidance_enabled.then(|| FixedSourceGuidanceCandidatePoolArtifact {
+            bliss_ranked_candidate_count: ranked.len(),
+            baseline_candidate_pool_count: selection_plan.baseline_limit,
+            provider_scored_candidate_count: discovery_plan.provider_scored_limit,
+            selected_candidate_pool_count: pool_limit,
+            expanded_for_target_support: selection_plan.expanded_for_target_support,
+            target_channels: guidance_weights.target_share_diagnostics(
+                &ranked_candidate_ids[..pool_limit],
                 &provider_contributions,
-            )
-        })
-        .unwrap_or_default();
-    let has_target_shares = guidance
-        .as_ref()
-        .is_some_and(|guidance| guidance.weights.has_target_shares());
+            ),
+        });
+    let mut selection_order = ranked[..pool_limit].to_vec();
+    let target_share_weights = guidance_weights.target_share_weights(
+        &selection_order
+            .iter()
+            .map(|entry| entry.0)
+            .collect::<Vec<_>>(),
+        &provider_contributions,
+    );
+    let has_target_shares = guidance_weights.has_target_shares();
     if selection.variation_percent > 0 {
         progress.update(
             "extension_selection_pool",
@@ -2953,8 +3064,7 @@ fn select_fixed_source_extension(
                 let target_share_weight =
                     target_share_weights.get(&entry.0).copied().unwrap_or(1.0);
                 let uniform = rng.gen::<f64>().max(f64::MIN_POSITIVE);
-                let key = -uniform.ln()
-                    / (acoustic_weight * provider_weight * target_share_weight);
+                let key = -uniform.ln() / (acoustic_weight * provider_weight * target_share_weight);
                 (key, rank, entry)
             })
             .collect::<Vec<_>>();
@@ -2993,8 +3103,8 @@ fn select_fixed_source_extension(
                 let acoustic_weight = (-std::f64::consts::LN_10 * rank_fraction).exp();
                 let target_share_weight =
                     target_share_weights.get(&entry.0).copied().unwrap_or(1.0);
-                let target_rank = -(acoustic_weight * target_share_weight).ln()
-                    - 2.0 * provider_guidance;
+                let target_rank =
+                    -(acoustic_weight * target_share_weight).ln() - 2.0 * provider_guidance;
                 (
                     if has_target_shares {
                         target_rank
@@ -3266,6 +3376,7 @@ fn select_fixed_source_extension(
             additions,
             selected_strategy,
             route_metrics,
+            guidance_candidate_pool,
         });
     }
     Err(last_failure)
@@ -4360,7 +4471,10 @@ fn analyze_bridge_validated(
                 })?
             };
             acoustic_candidate_order = acoustic;
-            let selected = acoustic_candidate_order.iter().copied().collect::<HashSet<_>>();
+            let selected = acoustic_candidate_order
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
             gap_semantics
                 .candidates
                 .retain(|candidate| selected.contains(&candidate.candidate));
@@ -4405,10 +4519,8 @@ fn analyze_bridge_validated(
         guidance_signal_count += guidance_batch.observed as usize;
         let guidance_adjustments = guidance_batch.adjustment_by_candidate;
         let guidance_contributions = guidance_batch.contributions_by_candidate;
-        let guidance_target_weights = guidance_weights.target_share_weights(
-            &acoustic_candidate_order,
-            &guidance_contributions,
-        );
+        let guidance_target_weights = guidance_weights
+            .target_share_weights(&acoustic_candidate_order, &guidance_contributions);
         guidance_contributions_by_gap.insert(position, guidance_contributions.clone());
         preview_gaps.push(preview::AutomaticGap {
             original_position: position,
@@ -5397,6 +5509,7 @@ fn analyze_bridge_validated(
                     objective: extension_result.route_metrics.objective,
                     arc_error: extension_result.route_metrics.arc_error,
                 },
+                guidance_candidate_pool: extension_result.guidance_candidate_pool,
                 acceptance_proofs: FixedSourceExtensionAcceptanceProofsArtifact {
                     exact_target_satisfied: extension_result.final_route.len()
                         == target_track_count,
@@ -7050,6 +7163,43 @@ mod tests {
                 .map(|entry| entry.candidate)
                 .collect::<HashSet<_>>()
         );
+    }
+
+    #[test]
+    fn fixed_source_lastfm_target_expands_the_bliss_pool_until_supported_candidates_are_reachable()
+    {
+        let weights = guidance::GuidanceWeights::from_policy(&[GuidancePolicyEntry {
+            provider_id: "lastfm-guidance".to_owned(),
+            channel: "lastfm_artist".to_owned(),
+            weight: 1.0,
+            target_percent: Some(75),
+        }]);
+        let candidates = (0..3_000).collect::<Vec<_>>();
+        let contributions = (500..527)
+            .map(|candidate| {
+                (
+                    candidate,
+                    vec![guidance::AppliedGuidanceContribution {
+                        provider_id: "lastfm-guidance".to_owned(),
+                        channel: "lastfm_artist".to_owned(),
+                        scope: bliss_playlist_guidance_spi::GuidanceScope::Global,
+                        signal_score: 1.0,
+                        confidence: 1.0,
+                        policy_weight: 1.0,
+                        contribution: 1.0,
+                        rationale: None,
+                    }],
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let plan =
+            fixed_source_guidance_pool_plan(35, 256, 0, &weights, &candidates, &contributions);
+
+        assert_eq!(plan.baseline_limit, 350);
+        assert_eq!(plan.provider_scored_limit, 2_560);
+        assert_eq!(plan.selection_limit, 527);
+        assert!(plan.expanded_for_target_support);
     }
 
     #[test]
