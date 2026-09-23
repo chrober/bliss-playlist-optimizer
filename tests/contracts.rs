@@ -186,6 +186,28 @@ fn optimizer_request_contract_rejects_legacy_play_count_artifact() {
 }
 
 #[test]
+fn optimizer_request_contract_accepts_bounded_guidance_channel_targets() {
+    let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut request = read_json(&repository_path(
+        "fixtures/synthetic/adaptive-scoring-request.json",
+    ));
+    request["guidance_policy"] = serde_json::json!([
+        {
+            "provider_id": "lastfm-guidance",
+            "channel": "lastfm_track",
+            "weight": 1.0,
+            "target_percent": 75
+        }
+    ]);
+
+    assert!(validator.is_valid(&request));
+
+    request["guidance_policy"][0]["target_percent"] = Value::from(101);
+    assert!(!validator.is_valid(&request));
+}
+
+#[test]
 fn semantic_contract_rejects_cross_kind_and_recording_collection_edges() {
     let schema = read_json(&repository_path("schemas/semantic-evidence-v1.schema.json"));
     let validator = jsonschema::validator_for(&schema).unwrap();

@@ -96,6 +96,8 @@ struct GuidancePolicyEntry {
     provider_id: String,
     channel: String,
     weight: f64,
+    #[serde(default)]
+    target_percent: Option<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -288,7 +288,8 @@
         "properties": {
           "provider_id": { "type": "string", "minLength": 1 },
           "channel": { "type": "string", "minLength": 1 },
-          "weight": { "type": "number", "minimum": -1, "maximum": 1 }
+          "weight": { "type": "number", "minimum": -1, "maximum": 1 },
+          "target_percent": { "type": "integer", "minimum": 0, "maximum": 100 }
         },
         "additionalProperties": false
       }
