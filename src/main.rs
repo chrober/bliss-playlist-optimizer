@@ -2916,6 +2916,21 @@ fn select_fixed_source_extension(
         .unwrap_or_default();
     let provider_adjustments = provider_guidance.adjustment_by_candidate;
     let provider_contributions = provider_guidance.contributions_by_candidate;
+    let target_share_weights = guidance
+        .as_ref()
+        .map(|guidance| {
+            guidance.weights.target_share_weights(
+                &selection_order
+                    .iter()
+                    .map(|entry| entry.0)
+                    .collect::<Vec<_>>(),
+                &provider_contributions,
+            )
+        })
+        .unwrap_or_default();
+    let has_target_shares = guidance
+        .as_ref()
+        .is_some_and(|guidance| guidance.weights.has_target_shares());
     if selection.variation_percent > 0 {
         progress.update(
             "extension_selection_pool",
@@ -2935,8 +2950,11 @@ fn select_fixed_source_extension(
                 let acoustic_weight = (-(rank as f64) / temperature).exp().max(1e-12);
                 let provider_weight =
                     (2.0 * provider_adjustments.get(&entry.0).copied().unwrap_or(0.0)).exp();
+                let target_share_weight =
+                    target_share_weights.get(&entry.0).copied().unwrap_or(1.0);
                 let uniform = rng.gen::<f64>().max(f64::MIN_POSITIVE);
-                let key = -uniform.ln() / (acoustic_weight * provider_weight);
+                let key = -uniform.ln()
+                    / (acoustic_weight * provider_weight * target_share_weight);
                 (key, rank, entry)
             })
             .collect::<Vec<_>>();
@@ -2955,16 +2973,37 @@ fn select_fixed_source_extension(
             Some(0),
             Some(pool_limit),
         );
-        // With zero Variation the result stays deterministic. Guidance may
-        // move an endorsed track up by at most 20% of this Bliss-qualified
-        // pool; it cannot import or rescue a candidate outside the pool.
-        let maximum_shift = selection_order.len() as f64 * 0.20;
+        // With zero Variation the result remains deterministic. Target-share
+        // multipliers mirror DSTM's acoustic base curve inside the same
+        // Bliss-qualified pool; unconfigured channels retain the historical
+        // bounded provider adjustment.
+        let pool_size = selection_order.len();
+        let maximum_shift = pool_size as f64 * 0.20;
         let mut guided = selection_order
             .into_iter()
             .enumerate()
             .map(|(rank, entry)| {
                 let provider_guidance = provider_adjustments.get(&entry.0).copied().unwrap_or(0.0);
-                (rank as f64 - maximum_shift * provider_guidance, rank, entry)
+                let historical_rank = rank as f64 - maximum_shift * provider_guidance;
+                let rank_fraction = if pool_size > 1 {
+                    rank as f64 / (pool_size - 1) as f64
+                } else {
+                    0.0
+                };
+                let acoustic_weight = (-std::f64::consts::LN_10 * rank_fraction).exp();
+                let target_share_weight =
+                    target_share_weights.get(&entry.0).copied().unwrap_or(1.0);
+                let target_rank = -(acoustic_weight * target_share_weight).ln()
+                    - 2.0 * provider_guidance;
+                (
+                    if has_target_shares {
+                        target_rank
+                    } else {
+                        historical_rank
+                    },
+                    rank,
+                    entry,
+                )
             })
             .collect::<Vec<_>>();
         guided.sort_by(|left, right| {
@@ -4282,8 +4321,20 @@ fn analyze_bridge_validated(
         semantic_assisted |= gap_semantics.pool != semantic::SemanticPool::BlissOnly;
         let semantic_candidate_count = eligible_candidates.len();
         let shortlist_started = Instant::now();
+        let mut acoustic_candidate_order = Vec::new();
         if !eligible_candidates.is_empty() {
-            let acoustic_limit = eligible_candidates.len().min(shortlist_limit);
+            let baseline_acoustic_limit = eligible_candidates.len().min(shortlist_limit);
+            // Last.fm target shares use the same minimum 10x Bliss-derived
+            // candidate opportunity as DSTM.  A caller's larger acoustic
+            // shortlist remains intact; guidance still cannot admit a track
+            // outside this Bliss-selected population.
+            let target_acoustic_limit = retained_candidate_limit.saturating_mul(10);
+            let acoustic_limit = if guidance_weights.has_target_shares() {
+                baseline_acoustic_limit.max(target_acoustic_limit)
+            } else {
+                baseline_acoustic_limit
+            }
+            .min(eligible_candidates.len());
             let acoustic = if let Some(distance_index) = distance_index.as_ref() {
                 distance_index.destination_prefilter(
                     selected_library_route[position - 1],
@@ -4308,7 +4359,8 @@ fn analyze_bridge_validated(
                     CommandFailure::new("BRIDGE_SHORTLIST_FAILED", error.to_string())
                 })?
             };
-            let selected = acoustic.into_iter().collect::<HashSet<_>>();
+            acoustic_candidate_order = acoustic;
+            let selected = acoustic_candidate_order.iter().copied().collect::<HashSet<_>>();
             gap_semantics
                 .candidates
                 .retain(|candidate| selected.contains(&candidate.candidate));
@@ -4329,6 +4381,14 @@ fn analyze_bridge_validated(
         }
         shortlist_elapsed += shortlist_started.elapsed();
         let shortlisted_candidate_count = gap_semantics.candidates.len();
+        if acoustic_candidate_order.is_empty() {
+            acoustic_candidate_order = gap_semantics
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate)
+                .collect();
+            acoustic_candidate_order.sort_unstable();
+        }
         let mut guidance_runtime = GuidanceRuntime {
             host: guidance_host,
             library: &library,
@@ -4340,15 +4400,15 @@ fn analyze_bridge_validated(
             &request.job_id,
             &request.source_tracks[left_source_index].id,
             &request.source_tracks[right_source_index].id,
-            &gap_semantics
-                .candidates
-                .iter()
-                .map(|candidate| candidate.candidate)
-                .collect::<Vec<_>>(),
+            &acoustic_candidate_order,
         );
         guidance_signal_count += guidance_batch.observed as usize;
         let guidance_adjustments = guidance_batch.adjustment_by_candidate;
         let guidance_contributions = guidance_batch.contributions_by_candidate;
+        let guidance_target_weights = guidance_weights.target_share_weights(
+            &acoustic_candidate_order,
+            &guidance_contributions,
+        );
         guidance_contributions_by_gap.insert(position, guidance_contributions.clone());
         preview_gaps.push(preview::AutomaticGap {
             original_position: position,
@@ -4358,6 +4418,7 @@ fn analyze_bridge_validated(
             direct_percentile,
             semantics: gap_semantics.clone(),
             guidance_adjustments: guidance_adjustments.clone(),
+            guidance_target_weights: guidance_target_weights.clone(),
         });
         let semantics_by_candidate = gap_semantics
             .candidates
@@ -4381,7 +4442,11 @@ fn analyze_bridge_validated(
         )
         .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
         strict_scoring_elapsed += scoring_started.elapsed();
-        preview::sort_guided_evaluations(&mut evaluations, &guidance_adjustments);
+        preview::sort_guided_evaluations(
+            &mut evaluations,
+            &guidance_adjustments,
+            &guidance_target_weights,
+        );
         let accepted_candidate_count = evaluations
             .iter()
             .filter(|candidate| candidate.accepted)

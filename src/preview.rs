@@ -33,6 +33,9 @@ pub struct AutomaticGap {
     /// map is intentionally keyed by an already-shortlisted library index,
     /// so it can influence order but never candidate membership.
     pub guidance_adjustments: BTreeMap<usize, f64>,
+    /// DSTM-style per-candidate target-share multipliers calculated from this
+    /// same Bliss-qualified pool. They cannot add new candidates.
+    pub guidance_target_weights: BTreeMap<usize, f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -303,16 +306,27 @@ fn varied_pool_length(accepted: usize, variation: VariationConfig) -> usize {
 fn rank_guided_shortlist(
     acoustic: &[(usize, f64)],
     adjustments: &BTreeMap<usize, f64>,
+    target_share_weights: &BTreeMap<usize, f64>,
 ) -> Vec<usize> {
     const MAX_GUIDANCE_SHIFT: f64 = 0.10;
 
     let mut ranked = acoustic.to_vec();
     ranked.sort_by(
         |(left_candidate, left_percentile), (right_candidate, right_percentile)| {
-            let left_adjusted = left_percentile
-                - MAX_GUIDANCE_SHIFT * adjustments.get(left_candidate).copied().unwrap_or(0.0);
-            let right_adjusted = right_percentile
-                - MAX_GUIDANCE_SHIFT * adjustments.get(right_candidate).copied().unwrap_or(0.0);
+            let left_adjusted = (left_percentile
+                - MAX_GUIDANCE_SHIFT * adjustments.get(left_candidate).copied().unwrap_or(0.0))
+                / target_share_weights
+                    .get(left_candidate)
+                    .copied()
+                    .unwrap_or(1.0)
+                    .max(0.000_001);
+            let right_adjusted = (right_percentile
+                - MAX_GUIDANCE_SHIFT * adjustments.get(right_candidate).copied().unwrap_or(0.0))
+                / target_share_weights
+                    .get(right_candidate)
+                    .copied()
+                    .unwrap_or(1.0)
+                    .max(0.000_001);
             left_adjusted
                 .total_cmp(&right_adjusted)
                 .then_with(|| left_percentile.total_cmp(right_percentile))
@@ -329,6 +343,7 @@ fn rank_guided_shortlist(
 pub fn sort_guided_evaluations(
     evaluations: &mut [BridgeCandidateEvaluation],
     adjustments: &BTreeMap<usize, f64>,
+    target_share_weights: &BTreeMap<usize, f64>,
 ) {
     let guidance_rank = rank_guided_shortlist(
         &evaluations
@@ -336,6 +351,7 @@ pub fn sort_guided_evaluations(
             .map(|evaluation| (evaluation.candidate, evaluation.max_percentile))
             .collect::<Vec<_>>(),
         adjustments,
+        target_share_weights,
     )
     .into_iter()
     .enumerate()
@@ -357,6 +373,7 @@ fn rank_for_evolving_route(
     position: usize,
     semantics: &[CandidateSemantics],
     guidance_adjustments: &BTreeMap<usize, f64>,
+    guidance_target_weights: &BTreeMap<usize, f64>,
     context: GapRankingContext<'_>,
     variation: VariationConfig,
     acceptance: EvolvingAcceptance,
@@ -394,6 +411,7 @@ fn rank_for_evolving_route(
             .map(|evaluation| (evaluation.candidate, evaluation.max_percentile))
             .collect::<Vec<_>>(),
         guidance_adjustments,
+        guidance_target_weights,
     )
     .into_iter()
     .enumerate()
@@ -528,6 +546,7 @@ pub fn select_automatic_bridges(
                 position,
                 &gap.semantics.candidates,
                 &gap.guidance_adjustments,
+                &gap.guidance_target_weights,
                 GapRankingContext {
                     scoring: ExactScoringContext {
                         tracks,
@@ -712,6 +731,7 @@ fn final_exact_decisions(
                 position,
                 std::slice::from_ref(&semantics),
                 &gap.guidance_adjustments,
+                &gap.guidance_target_weights,
                 GapRankingContext {
                     scoring: ExactScoringContext {
                         tracks,
@@ -830,6 +850,7 @@ fn select_exact_count_multi_gap_bridges(
                             position,
                             &gap.semantics.candidates,
                             &gap.guidance_adjustments,
+                            &gap.guidance_target_weights,
                             GapRankingContext {
                                 scoring: ExactScoringContext {
                                     tracks,
@@ -1005,7 +1026,14 @@ where
                 .guidance_adjustments
                 .get(&candidate.candidate)
                 .copied()
-                .unwrap_or(0.0),
+                .unwrap_or(0.0)
+                + gap
+                    .guidance_target_weights
+                    .get(&candidate.candidate)
+                    .copied()
+                    .unwrap_or(1.0)
+                    .max(0.000_001)
+                    .ln(),
         })
         .collect::<Vec<_>>();
     let anchored_options = search_anchored_paths(
@@ -1765,6 +1793,7 @@ fn select_exact_count_single_gap_bridges(
                         position,
                         &gap.semantics.candidates,
                         &gap.guidance_adjustments,
+                        &gap.guidance_target_weights,
                         GapRankingContext {
                             scoring: ExactScoringContext {
                                 tracks,
@@ -1892,7 +1921,18 @@ mod tests {
         let acoustic = vec![(2_usize, 0.40_f64), (3_usize, 0.41_f64)];
         let adjustments = BTreeMap::from([(3_usize, 0.20_f64), (99_usize, 1.0_f64)]);
 
-        let ranked = rank_guided_shortlist(&acoustic, &adjustments);
+        let ranked = rank_guided_shortlist(&acoustic, &adjustments, &BTreeMap::new());
+
+        assert_eq!(ranked, vec![3, 2]);
+        assert!(!ranked.contains(&99));
+    }
+
+    #[test]
+    fn target_share_weight_reorders_only_the_acoustic_shortlist() {
+        let acoustic = vec![(2_usize, 0.40_f64), (3_usize, 0.41_f64)];
+        let target_weights = BTreeMap::from([(3_usize, 10.0), (99_usize, 1_000_000.0)]);
+
+        let ranked = rank_guided_shortlist(&acoustic, &BTreeMap::new(), &target_weights);
 
         assert_eq!(ranked, vec![3, 2]);
         assert!(!ranked.contains(&99));
@@ -1925,7 +1965,11 @@ mod tests {
             },
         ];
 
-        sort_guided_evaluations(&mut evaluations, &BTreeMap::from([(3_usize, 0.20_f64)]));
+        sort_guided_evaluations(
+            &mut evaluations,
+            &BTreeMap::from([(3_usize, 0.20_f64)]),
+            &BTreeMap::new(),
+        );
 
         assert_eq!(
             evaluations
@@ -1966,6 +2010,7 @@ mod tests {
                 candidates: vec![semantics(candidate)],
             },
             guidance_adjustments: BTreeMap::new(),
+            guidance_target_weights: BTreeMap::new(),
         }
     }
 
@@ -2221,6 +2266,7 @@ mod tests {
                 candidates: vec![semantics(1), semantics(2)],
             },
             guidance_adjustments: BTreeMap::new(),
+            guidance_target_weights: BTreeMap::new(),
         }];
         let selection_config = ExactSelectionConfig {
             requested_added_tracks: 2,
@@ -2327,6 +2373,7 @@ mod tests {
                 candidates: vec![semantics(1), semantics(2)],
             },
             guidance_adjustments: BTreeMap::new(),
+            guidance_target_weights: BTreeMap::new(),
         }];
         let exact = ExactSelectionConfig {
             requested_added_tracks: 1,

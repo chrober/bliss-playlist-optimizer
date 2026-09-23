@@ -48,6 +48,7 @@ pub(crate) struct ProviderPreparation {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GuidanceWeights {
     by_provider_channel: BTreeMap<(String, String), f64>,
+    target_by_provider_channel: BTreeMap<(String, String), u8>,
 }
 
 impl GuidanceWeights {
@@ -62,6 +63,17 @@ impl GuidanceWeights {
                     )
                 })
                 .collect(),
+            target_by_provider_channel: policy
+                .iter()
+                .filter_map(|entry| {
+                    entry.target_percent.filter(|target| *target > 0).map(|target| {
+                        (
+                            (entry.provider_id.clone(), entry.channel.clone()),
+                            target,
+                        )
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -71,11 +83,82 @@ impl GuidanceWeights {
             .any(|weight| *weight != 0.0)
     }
 
+    pub(crate) fn has_target_shares(&self) -> bool {
+        !self.target_by_provider_channel.is_empty()
+    }
+
     fn weight(&self, provider_id: &str, channel: &str) -> f64 {
         self.by_provider_channel
             .get(&(provider_id.to_owned(), channel.to_owned()))
             .copied()
             .unwrap_or(0.0)
+    }
+
+    /// Returns DSTM-style per-candidate multipliers for channels configured
+    /// as best-effort target shares.  The caller supplies an already
+    /// Bliss-ranked, bounded candidate pool: a target may change selection
+    /// inside this pool but can never nominate a candidate outside it.
+    pub(crate) fn target_share_weights(
+        &self,
+        candidates: &[usize],
+        contributions: &BTreeMap<usize, Vec<AppliedGuidanceContribution>>,
+    ) -> BTreeMap<usize, f64> {
+        let mut weights = candidates
+            .iter()
+            .copied()
+            .map(|candidate| (candidate, 1.0))
+            .collect::<BTreeMap<_, _>>();
+        if candidates.is_empty() || self.target_by_provider_channel.is_empty() {
+            return weights;
+        }
+
+        let pool_size = candidates.len();
+        for ((provider_id, channel), target_percent) in &self.target_by_provider_channel {
+            let mut supported_base_weight = 0.0_f64;
+            let mut other_base_weight = 0.0_f64;
+            let mut supported = BTreeSet::new();
+            for (rank, candidate) in candidates.iter().copied().enumerate() {
+                let rank_fraction = if pool_size > 1 {
+                    rank as f64 / (pool_size - 1) as f64
+                } else {
+                    0.0
+                };
+                // Identical to BlissMixer's candidate-selection base curve:
+                // the least acoustically suitable member of the pool retains
+                // one tenth of the top member's base weight.
+                let base_weight = (-std::f64::consts::LN_10 * rank_fraction).exp();
+                let is_supported = contributions
+                    .get(&candidate)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.provider_id == *provider_id
+                                && item.channel == *channel
+                                && item.contribution > 0.0
+                        })
+                    });
+                if is_supported {
+                    supported.insert(candidate);
+                    supported_base_weight += base_weight;
+                } else {
+                    other_base_weight += base_weight;
+                }
+            }
+            // A target only has meaning while both populations are present.
+            // Otherwise no multiplier can create a meaningful alternative.
+            if supported.is_empty() || other_base_weight <= 0.0 {
+                continue;
+            }
+            let target = f64::from(*target_percent) / 100.0;
+            let multiplier = if target >= 1.0 {
+                1_000_000.0
+            } else {
+                (target * other_base_weight) / ((1.0 - target) * supported_base_weight)
+            };
+            for candidate in supported {
+                *weights.entry(candidate).or_insert(1.0) *= multiplier.max(0.000_001);
+            }
+        }
+        weights
     }
 }
 
@@ -665,11 +748,13 @@ mod tests {
                 provider_id: "lastfm-guidance".to_owned(),
                 channel: "lastfm_track".to_owned(),
                 weight: 0.8,
+                target_percent: None,
             },
             crate::GuidancePolicyEntry {
                 provider_id: "lastfm-guidance".to_owned(),
                 channel: "lastfm_artist".to_owned(),
                 weight: 0.4,
+                target_percent: None,
             },
         ]);
         let index = BTreeMap::from([("bliss-row-2".to_owned(), 2_usize)]);
@@ -690,6 +775,65 @@ mod tests {
     }
 
     #[test]
+    fn target_share_weights_promote_supported_candidates_from_the_same_bliss_pool() {
+        let weights = GuidanceWeights::from_policy(&[crate::GuidancePolicyEntry {
+            provider_id: "lastfm-guidance".to_owned(),
+            channel: "lastfm_track".to_owned(),
+            weight: 1.0,
+            target_percent: Some(75),
+        }]);
+        let contributions = BTreeMap::from([(
+            2_usize,
+            vec![AppliedGuidanceContribution {
+                provider_id: "lastfm-guidance".to_owned(),
+                channel: "lastfm_track".to_owned(),
+                scope: GuidanceScope::Global,
+                signal_score: 1.0,
+                confidence: 1.0,
+                policy_weight: 1.0,
+                contribution: 1.0,
+                rationale: None,
+            }],
+        )]);
+
+        let candidate_weights =
+            weights.target_share_weights(&[1, 2, 3, 4], &contributions);
+
+        assert!(candidate_weights[&2] > 1.0);
+        assert_eq!(candidate_weights[&1], 1.0);
+        assert_eq!(candidate_weights[&3], 1.0);
+        assert_eq!(candidate_weights[&4], 1.0);
+    }
+
+    #[test]
+    fn zero_target_does_not_change_the_bliss_order_weight() {
+        let weights = GuidanceWeights::from_policy(&[crate::GuidancePolicyEntry {
+            provider_id: "lastfm-guidance".to_owned(),
+            channel: "lastfm_track".to_owned(),
+            weight: 1.0,
+            target_percent: Some(0),
+        }]);
+        let contributions = BTreeMap::from([(
+            2_usize,
+            vec![AppliedGuidanceContribution {
+                provider_id: "lastfm-guidance".to_owned(),
+                channel: "lastfm_track".to_owned(),
+                scope: GuidanceScope::Global,
+                signal_score: 1.0,
+                confidence: 1.0,
+                policy_weight: 1.0,
+                contribution: 1.0,
+                rationale: None,
+            }],
+        )]);
+
+        assert_eq!(
+            weights.target_share_weights(&[1, 2], &contributions),
+            BTreeMap::from([(1, 1.0), (2, 1.0)])
+        );
+    }
+
+    #[test]
     fn aggregation_uses_provider_and_channel_as_the_policy_key() {
         let signals = vec![ProviderSignal {
             provider_id: "future-provider".to_owned(),
@@ -707,6 +851,7 @@ mod tests {
             provider_id: "future-provider".to_owned(),
             channel: "preference".to_owned(),
             weight: 0.5,
+            target_percent: None,
         }]);
         let index = BTreeMap::from([("bliss-row-2".to_owned(), 2_usize)]);
 
