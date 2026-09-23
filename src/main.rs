@@ -1056,6 +1056,29 @@ fn fixed_source_guidance_pool_plan(
     }
 }
 
+/// Returns the relative draw weight for a varied fixed-source addition.
+///
+/// Target-share multipliers are derived from BlissMixer's DSTM-style rank
+/// curve (top of the bounded Bliss pool is 1.0, bottom is 0.1). The varied
+/// path must use that same curve. Using an absolute-rank exponential here
+/// would make a supported candidate discovered hundreds of positions down the
+/// intentionally expanded pool practically impossible to draw.
+fn fixed_source_variation_candidate_weight(
+    rank: usize,
+    pool_size: usize,
+    target_share_weight: f64,
+    provider_adjustment: f64,
+) -> f64 {
+    let rank_fraction = if pool_size > 1 {
+        rank as f64 / (pool_size - 1) as f64
+    } else {
+        0.0
+    };
+    let acoustic_weight = (-std::f64::consts::LN_10 * rank_fraction).exp();
+    let provider_weight = (2.0 * provider_adjustment).exp();
+    (acoustic_weight * provider_weight * target_share_weight).max(1e-12)
+}
+
 struct FixedSourceExtensionContext<'a> {
     tracks: &'a [route::RouteTrack],
     learned_matrix: &'a Array2<f32>,
@@ -3052,19 +3075,26 @@ fn select_fixed_source_extension(
             Some(pool_limit),
         );
         let variation = f64::from(selection.variation_percent) / 100.0;
-        let temperature = (maximum_requested.max(1) as f64 * (0.25 + 9.75 * variation)).max(1.0);
         let mut rng = StdRng::seed_from_u64(selection.generation_seed);
+        let pool_size = selection_order.len();
         let mut sampled = selection_order
             .into_iter()
             .enumerate()
             .map(|(rank, entry)| {
-                let acoustic_weight = (-(rank as f64) / temperature).exp().max(1e-12);
-                let provider_weight =
-                    (2.0 * provider_adjustments.get(&entry.0).copied().unwrap_or(0.0)).exp();
                 let target_share_weight =
                     target_share_weights.get(&entry.0).copied().unwrap_or(1.0);
+                let guidance_weight = fixed_source_variation_candidate_weight(
+                    rank,
+                    pool_size,
+                    target_share_weight,
+                    provider_adjustments.get(&entry.0).copied().unwrap_or(0.0),
+                );
                 let uniform = rng.gen::<f64>().max(f64::MIN_POSITIVE);
-                let key = -uniform.ln() / (acoustic_weight * provider_weight * target_share_weight);
+                // Variation changes the random draw, not the target-share
+                // calculation. Its small temperature exponent keeps greater
+                // variation from collapsing the candidate choice back to the
+                // very top of the Bliss-ranked pool.
+                let key = -uniform.ln() / guidance_weight.powf(1.0 - variation * 0.5);
                 (key, rank, entry)
             })
             .collect::<Vec<_>>();
@@ -7200,6 +7230,23 @@ mod tests {
         assert_eq!(plan.provider_scored_limit, 2_560);
         assert_eq!(plan.selection_limit, 527);
         assert!(plan.expanded_for_target_support);
+    }
+
+    #[test]
+    fn variation_target_share_keeps_a_deep_lastfm_supported_candidate_selectable() {
+        // This mirrors the Pi failure: the eligible Bliss-ranked pool had
+        // 2,560 tracks, but the available Last.fm evidence first appeared
+        // hundreds of places below the acoustic top. A DSTM-style target
+        // multiplier must still make that candidate competitive when
+        // Variation is enabled; absolute-rank exponential decay reduced its
+        // weight to virtually zero.
+        let supported = fixed_source_variation_candidate_weight(500, 2_560, 460.0, 0.0);
+        let top_bliss_only = fixed_source_variation_candidate_weight(0, 2_560, 1.0, 0.0);
+
+        assert!(
+            supported > top_bliss_only,
+            "target support must remain selectable inside the expanded Bliss pool"
+        );
     }
 
     #[test]
