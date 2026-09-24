@@ -126,6 +126,20 @@ struct GapRankingContext<'a> {
     frozen_matrix: Option<&'a Array2<f32>>,
 }
 
+/// All inputs to one contextual bridge-ranking operation. Keeping these
+/// coupled prevents callers from accidentally applying guidance, acceptance,
+/// or variation to a different route/context than the one being scored.
+struct EvolvingRouteRankingRequest<'a> {
+    route: &'a [usize],
+    position: usize,
+    semantics: &'a [CandidateSemantics],
+    guidance_adjustments: &'a BTreeMap<usize, f64>,
+    guidance_target_weights: &'a BTreeMap<usize, f64>,
+    context: GapRankingContext<'a>,
+    variation: VariationConfig,
+    acceptance: EvolvingAcceptance,
+}
+
 #[derive(Clone, Copy)]
 pub struct DestinationRepeatContext<'a> {
     pub history_route: &'a [usize],
@@ -369,15 +383,18 @@ pub fn sort_guided_evaluations(
 }
 
 fn rank_for_evolving_route(
-    route: &[usize],
-    position: usize,
-    semantics: &[CandidateSemantics],
-    guidance_adjustments: &BTreeMap<usize, f64>,
-    guidance_target_weights: &BTreeMap<usize, f64>,
-    context: GapRankingContext<'_>,
-    variation: VariationConfig,
-    acceptance: EvolvingAcceptance,
+    request: EvolvingRouteRankingRequest<'_>,
 ) -> Result<Vec<BridgeCandidateEvaluation>, PreviewError> {
+    let EvolvingRouteRankingRequest {
+        route,
+        position,
+        semantics,
+        guidance_adjustments,
+        guidance_target_weights,
+        context,
+        variation,
+        acceptance,
+    } = request;
     let GapRankingContext {
         scoring:
             ExactScoringContext {
@@ -541,13 +558,13 @@ pub fn select_automatic_bridges(
             let frozen_matrix =
                 gap_context_matrix(&final_route, position, tracks, learned_matrix, config)
                     .map_err(PreviewError::Scoring)?;
-            let evaluations = rank_for_evolving_route(
-                &final_route,
+            let evaluations = rank_for_evolving_route(EvolvingRouteRankingRequest {
+                route: &final_route,
                 position,
-                &gap.semantics.candidates,
-                &gap.guidance_adjustments,
-                &gap.guidance_target_weights,
-                GapRankingContext {
+                semantics: &gap.semantics.candidates,
+                guidance_adjustments: &gap.guidance_adjustments,
+                guidance_target_weights: &gap.guidance_target_weights,
+                context: GapRankingContext {
                     scoring: ExactScoringContext {
                         tracks,
                         learned_matrix,
@@ -556,9 +573,9 @@ pub fn select_automatic_bridges(
                     },
                     frozen_matrix: frozen_matrix.as_ref(),
                 },
-                selection_config.variation(),
-                EvolvingAcceptance::FullBridge,
-            )?;
+                variation: selection_config.variation(),
+                acceptance: EvolvingAcceptance::FullBridge,
+            })?;
             if let Some(evaluation) = evaluations.iter().find(|candidate| {
                 let inserted = local_objective(
                     candidate.left_distance + candidate.right_distance,
@@ -726,13 +743,13 @@ fn final_exact_decisions(
                 config,
             )
             .map_err(PreviewError::Scoring)?;
-            let evaluation = rank_for_evolving_route(
-                &route_without_candidate,
+            let evaluation = rank_for_evolving_route(EvolvingRouteRankingRequest {
+                route: &route_without_candidate,
                 position,
-                std::slice::from_ref(&semantics),
-                &gap.guidance_adjustments,
-                &gap.guidance_target_weights,
-                GapRankingContext {
+                semantics: std::slice::from_ref(&semantics),
+                guidance_adjustments: &gap.guidance_adjustments,
+                guidance_target_weights: &gap.guidance_target_weights,
+                context: GapRankingContext {
                     scoring: ExactScoringContext {
                         tracks,
                         learned_matrix,
@@ -741,9 +758,9 @@ fn final_exact_decisions(
                     },
                     frozen_matrix: frozen_matrix.as_ref(),
                 },
-                selection_config.variation(),
-                EvolvingAcceptance::FullBridge,
-            )?
+                variation: selection_config.variation(),
+                acceptance: EvolvingAcceptance::FullBridge,
+            })?
             .into_iter()
             .next()
             .ok_or(PreviewError::FinalRouteInvalid(
@@ -845,13 +862,13 @@ fn select_exact_count_multi_gap_bridges(
                     for (variant, selected, _) in frontier {
                         let position = gap_right_position(&variant.route, gap)
                             .ok_or(PreviewError::InvalidOriginalGap(gap.original_position))?;
-                        let evaluations = rank_for_evolving_route(
-                            &variant.route,
+                        let evaluations = rank_for_evolving_route(EvolvingRouteRankingRequest {
+                            route: &variant.route,
                             position,
-                            &gap.semantics.candidates,
-                            &gap.guidance_adjustments,
-                            &gap.guidance_target_weights,
-                            GapRankingContext {
+                            semantics: &gap.semantics.candidates,
+                            guidance_adjustments: &gap.guidance_adjustments,
+                            guidance_target_weights: &gap.guidance_target_weights,
+                            context: GapRankingContext {
                                 scoring: ExactScoringContext {
                                     tracks,
                                     learned_matrix,
@@ -860,9 +877,9 @@ fn select_exact_count_multi_gap_bridges(
                                 },
                                 frozen_matrix: frozen_matrix.as_ref(),
                             },
-                            selection_config.variation(),
-                            EvolvingAcceptance::ReachableFromLeft,
-                        )?;
+                            variation: selection_config.variation(),
+                            acceptance: EvolvingAcceptance::ReachableFromLeft,
+                        })?;
                         for evaluation in evaluations
                             .into_iter()
                             .filter(|candidate| {
@@ -1788,13 +1805,13 @@ fn select_exact_count_single_gap_bridges(
                     let frozen_matrix =
                         gap_context_matrix(&state.route, position, tracks, learned_matrix, config)
                             .map_err(PreviewError::Scoring)?;
-                    let evaluations = rank_for_evolving_route(
-                        &state.route,
+                    let evaluations = rank_for_evolving_route(EvolvingRouteRankingRequest {
+                        route: &state.route,
                         position,
-                        &gap.semantics.candidates,
-                        &gap.guidance_adjustments,
-                        &gap.guidance_target_weights,
-                        GapRankingContext {
+                        semantics: &gap.semantics.candidates,
+                        guidance_adjustments: &gap.guidance_adjustments,
+                        guidance_target_weights: &gap.guidance_target_weights,
+                        context: GapRankingContext {
                             scoring: ExactScoringContext {
                                 tracks,
                                 learned_matrix,
@@ -1803,9 +1820,9 @@ fn select_exact_count_single_gap_bridges(
                             },
                             frozen_matrix: frozen_matrix.as_ref(),
                         },
-                        selection_config.variation(),
-                        EvolvingAcceptance::FullBridge,
-                    )?;
+                        variation: selection_config.variation(),
+                        acceptance: EvolvingAcceptance::FullBridge,
+                    })?;
                     for evaluation in evaluations
                         .into_iter()
                         .filter(|candidate| candidate.accepted)

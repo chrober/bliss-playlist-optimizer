@@ -1,531 +1,71 @@
 # bliss-playlist-optimizer
 
-**bliss-playlist-optimizer** is the network-free Rust engine behind the Lyrion
-plugin [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss). It
-turns a frozen playlist request, Bliss feature database, repeat rules, the
-optional learned similarity matrix, and optional caller-resolved candidate
-guidance into an auditable proposed route. It can reorder fixed membership,
-analyze and select bridge tracks, preserve source anchors, extend a fixed source
-set to an exact target, build a destination-locked one-way route, or build a
-two-boundary excursion through a selected track or immutable ordered destination
-block and back to a locked queue rejoin.
+`bliss-playlist-optimizer` is the network-free Rust engine that turns a frozen
+Lyrion playlist or queue request into an auditable Bliss-first result. It is
+used by [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss).
 
-The native engine is needed because scoring tens of thousands of analyzed tracks
-and searching many contextual routes is computational work that does not belong
-in the Lyrion plugin's Perl process. It shares Bliss database and Adaptive
-similarity behavior with `bliss-mixer` through `bliss-mixer-core`, uses
-deterministic parallel Rust search where useful, and requires neither Python nor
-network access on the server.
+It exists because contextual scoring and route search across large analyzed
+libraries belong in a native process, not in the Lyrion plugin's Perl request
+path. It uses [`bliss-mixer-core`](https://github.com/chrober/bliss-mixer-core)
+for the same Bliss feature-distance behavior used by the mixer ecosystem.
 
-This program deliberately does not call Last.fm, modify `bliss.db`, write audio
-metadata, or create Lyrion playlists. Better Call Bliss owns provider access,
-provider-to-LMS identity resolution, user interaction, Preview, and playlist
-persistence; this repository owns the versioned native request/result contracts,
-validation, scoring, selection, routing, and diagnostic artifacts. The
-user-facing playlist modes and options are described in the plugin's
-[strategy guide](https://github.com/chrober/lms-better-call-bliss/blob/main/ALGORITHMS.md).
+## What it does
 
-Track-adding requests may also carry a `candidate_policy.genre` snapshot from
-BlissMixer. The optimizer applies that policy once at its shared
-eligible-library boundary, before any extension, gap, destination-route, or
-round-trip search can select generated tracks. Genre groups, glob patterns,
-match-all behavior, per-track genre matching, and the seasonal Christmas
-exclusion follow the shared `bliss-mixer-core` implementation. Source tracks and
-immutable recent listening history supply the acceptable genre groups, as seed
-and previous tracks do in BlissMixer. Existing source/history tracks, selected
-destination tracks or blocks, and locked queue-rejoin tracks remain valid
-anchors even when their genres would exclude them as newly generated candidates.
-The result records separate ordinary-genre and Christmas rejection counts.
+- Reorders a fixed set of local tracks.
+- Adds Bliss-qualified tracks to extend a playlist or satisfy repeat windows.
+- Builds one-way and round-trip routes to a selected track or album.
+- Finds and evaluates bridges for difficult playlist transitions.
+- Applies repeat, genre, virtual-library, membership, and route constraints.
+- Produces deterministic results for the same request, artifacts, and seed.
+- Emits a result artifact and optional progress/timing sidecars.
 
-The frozen local candidate inventory is an allowlist for **generated tracks**,
-not for immutable route input. A caller may therefore scope additions to a
-Lyrion virtual library while retaining source tracks, listening history,
-selected destination tracks or blocks, and queue-rejoin anchors that are outside
-that view. Those anchors must still resolve to usable Bliss rows, but they never
-become eligible additions merely because they participate in scoring. Candidate
-membership remains enforced at the one shared eligible-library boundary used by
-every track-adding mode. Callers can feature-detect this contract through the
-`candidate_library_scope` flag returned by `version --json`.
+It does **not** contact Last.fm, talk to LMS, change `bliss.db`, or persist a
+playlist or player queue. Those integration responsibilities belong to Better
+Call Bliss.
 
-The current read-only contract slice exposes:
+```mermaid
+flowchart LR
+    B[Better Call Bliss] -->|frozen request, local candidate inventory| O[bliss-playlist-optimizer]
+    O --> C[bliss-mixer-core\nBliss distance and matrices]
+    O <-->|bounded guidance SPI| L[Last.fm provider]
+    O <-->|bounded guidance SPI| P[Play-count provider]
+    O -->|result, progress, diagnostics| B
+```
+
+## Related repositories
+
+| Component | Responsibility |
+| --- | --- |
+| [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss) | Lyrion UI, request capture, LastMix acquisition, preview, reporting, and persistence. |
+| [Guidance SPI](https://github.com/chrober/bliss-playlist-guidance-spi) | Host-neutral JSONL contract for optional candidate guidance. |
+| [Last.fm guidance](https://github.com/chrober/bliss-guidance-lastfm) | Consumes Better Call Bliss's frozen, resolved Last.fm artifact. |
+| [Play-count guidance](https://github.com/chrober/bliss-guidance-playcounts) | Reads a trusted, read-only Lyrion `persist.db` snapshot. |
+| [bliss-mixer-core](https://github.com/chrober/bliss-mixer-core) | Shared Bliss scoring and matrix behavior. |
+
+Guidance is advisory: it can boost or de-boost a candidate only after the
+optimizer has admitted it acoustically and all hard constraints pass.
+
+## Common commands
 
 ```text
+cargo run -- version --json
 cargo run -- validate --request examples/reorder-only-request.json
-cargo run -- score --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- route --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-bridge-request.json
-cargo run -- bridge --request fixtures/synthetic/semantic-bridge-request.json
-cargo run -- bridge --request fixtures/synthetic/automatic-preview-request.json
-cargo run -- bridge --request fixtures/synthetic/exact-count-request.json
-cargo run -- bridge --request fixtures/synthetic/exact-count-infeasible-request.json
-cargo run -- bridge --request fixtures/synthetic/preserve-automatic-request.json
-cargo run -- bridge --request fixtures/synthetic/preserve-exact-count-request.json
-cargo run -- bridge --request fixtures/synthetic/preserve-multi-track-gap-request.json
-cargo run -- bridge --request fixtures/synthetic/preserve-endpoint-slots-request.json
 ```
 
-Production callers can request structured native stage timings, an
-identity-bound decoded-library cache, and a live status sidecar:
-
-```text
-bliss-playlist-optimizer bridge --request request.json --timings --cache-dir cache --progress progress.json
-```
-
-A caller that has already produced and validated the request through a trusted,
-version-matched integration can explicitly add `--trusted-request` to `route` or
-`bridge`. This skips repeated runtime JSON-Schema compilation and the
-O(library-size) inventory-to-database cross-check. It does **not** skip typed
-JSON decoding, declared artifact hashes, database/cache identity binding,
-source-track resolution, semantic-evidence validation, membership enforcement,
-or repeat constraints. The flag is intentionally unavailable to `validate` and
-must never be used for arbitrary user-supplied request files. Callers should
-feature-detect it through `version --json` rather than assume it exists.
-
-`--progress` atomically replaces a small JSON file while the command is running.
-It follows the same human-readable status-message idea as `bliss-analyser` and
-`bliss-learner`, but deliberately uses a local sidecar instead of LMS JSON-RPC
-push notifications.
-
-That difference is intentional. `bliss-analyser` and `bliss-learner` are
-long-running maintenance tools launched specifically by the LMS plugin; they can
-be told the LMS JSON-RPC port and periodically push `msg:` updates back to
-`lms-blissmixer`. `bliss-playlist-optimizer` is a stricter request/response
-engine: stdout is the machine-readable final artifact, stderr is reserved for a
-machine-readable failure, and the binary should stay useful outside Lyrion
-without knowing anything about LMS host names, ports, authentication, players,
-or plugin command names. If it pushed directly to LMS, the native engine would
-become coupled to one plugin deployment model and every offline, authenticated,
-or renamed-controller scenario would need extra native error handling.
-
-The sidecar keeps the same UX value with cleaner boundaries. Better Call Bliss
-owns LMS integration and polls the job-local file while the process is alive;
-other callers can do the same or ignore it entirely. The file contains `stage`,
-`msg`, elapsed seconds, and optional `current`/`total`/`percent` fields.
-Progress writes are best-effort and never fail the optimization, so status
-reporting cannot corrupt stdout, mask the real optimizer result, or turn a
-successful playlist preview into a failed one.
-
-The request's database artifact must include `cache_identity` for cache reuse.
-Lyrion supplies its `device:inode:size:mtime` identity and independently rejects
-a result if that identity changes while the job is running. A cold job streams
-the database SHA-256, runs `quick_check`, reads every usable track with one bulk
-query, and atomically replaces the versioned cache. A warm job reuses the hash,
-integrity result, and decoded library only when the path and identity match.
-Cache corruption, inconsistent metadata/feature vector counts, or an identity
-change is a safe miss.
-
-Cache format v2 stores compact metadata separately from the route features and
-artist/album repeat keys. Destination jobs borrow those decoded route tracks
-instead of cloning the complete library for every optimizer process. Optional
-candidate-guidance lookup is evidence-scoped. Current Better Call Bliss requests
-carry explicit `bliss-row-N` candidate identities resolved against the frozen
-LMS/Bliss inventory before launch, so the native engine does not interpret
-Last.fm names or MusicBrainz identifiers. The legacy unresolved-evidence form
-remains accepted by the v1 contract. In either form the optimizer scans
-candidates once but retains index entries only for identities actually named by
-the evidence bundle. Its retained memory is therefore proportional to evidence
-matches rather than the full library. A 200,000-candidate regression test
-protects this property. The remaining cold and warm setup passes are
-intentionally linear in library size; the benchmark command below should be used
-on representative hardware.
-
-Run a repeatable cold-then-warm benchmark with the server's Perl runtime:
-
-```text
-perl scripts/benchmark-request.pl --binary ./bliss-playlist-optimizer --command bridge --request request.json --iterations 3
-```
-
-Each JSON line reports external wall time, native total time, cache state, and
-the individual native stages. The temporary benchmark cache is removed when the
-script exits unless `--cache-dir` is supplied.
-
-`validate` checks both JSON schemas, declared artifact hashes, SQLite integrity
-and `TracksV2` compatibility, the learned matrix when supplied, semantic
-evidence, and exact usable Bliss identities for every source or immutable
-history track. Relative artifact paths are resolved against the process working
-directory; production callers should pass absolute paths.
-
-`score` emits a versioned contextual scoring artifact for the request's existing
-order. Adaptive behavior comes from the same shared core as the learned-matrix-
-enabled `bliss-mixer` fork: one-track contexts use the learned matrix when it is
-supplied, while two or more seed tracks dynamically blend the learned matrix
-with seed variance according to `learned_percent`. If no learned matrix is
-supplied, multi-track Adaptive contexts use variance alone and one-track
-contexts fall back to `scoring.feature_weights`. Explicit `static` scoring also
-uses `scoring.feature_weights` for every context by converting the 23 feature
-weights into a fixed diagonal matrix. The result is a sequence of contextual
-transition legs, not a static pairwise matrix.
-
-`route` performs fixed-set sequencing without writing a playlist. Every source
-track appears exactly once. Artist and album look-back windows are hard
-constraints; track repetition is impossible by unique membership. The primary
-objective is the transition sum plus twice the worst transition. Deterministic
-fixed starts and seeded greedy restarts are improved with reversal and
-relocation moves. A separately searched energy-arc candidate is selected only
-when its primary objective remains within 8% and its arc error improves by at
-least 10%. The JSON artifact records both candidates, the selected strategy,
-hashes, settings, repeat validation, and scoring provenance. Provenance
-identifies the context/seed policy, configured and effective learned shares,
-learned-matrix availability, base matrix hash, and fallback contract so callers
-do not have to infer the actual scoring setup from request fields alone.
-
-Requests may include the strategy-neutral `selection` block with
-`variation_percent`, `generation_seed`, `recording_guidance_percent`, and
-`artist_guidance_percent`, plus signed `playcount_influence` from -100 to 100.
-Variation zero preserves strict deterministic route, bridge, and fixed-source
-extension choices. Higher values seed route search, reorder a bounded pool of
-acoustically qualified bridge candidates, and let fixed-source extension perform
-reproducible weighted sampling inside a bounded top acoustic pool. The same seed
-and inputs reproduce membership across worker counts. Selection is downstream of
-scoring rather than nested under Adaptive, so Static and Forest can reuse it
-when those strategies are connected. The two provider-neutral values
-independently scale recording and artist guidance after local-inventory,
-acoustic, uniqueness, and repeat-capacity qualification. Zero ignores that
-guidance type. Better Call Bliss currently derives these hints from its own
-LastMix/Last.fm adapter, but the optimizer neither calls nor branches on that
-provider. Bridge ranking caps the combined guidance adjustment and the
-play-count adjustment at ten percentile points each. Deterministic fixed-source
-extension caps each guidance contribution at 20% of its bounded Bliss relevance
-pool; varied fixed-source extension uses bounded evidence multipliers. These are
-guidance strengths, not quotas, and even 100 cannot rescue an acoustically
-rejected candidate. The deprecated `lastfm_track_guidance_percent`,
-`lastfm_artist_guidance_percent`, and `lastfm_artist_probability` spellings
-remain input aliases. Omitting the block retains deterministic zero-guidance
-defaults.
-
-A non-zero play-count influence requires a checksum-protected
-`artifacts.play_counts` snapshot declaring `lms-play-counts-v1` and bound to the
-same database cache identity. Negative values prefer less-played generated
-tracks and positive values prefer frequently played generated tracks. Unknown
-counts remain distinguishable in the snapshot and rank with zero plays. This
-guidance changes only generated-track selection; it does not reorder existing
-membership or weaken acoustic, local-library, uniqueness, or repeat gates.
-
-## Optional guidance addons
-
-The optimizer owns a small process-based guidance SPI, shared by the
-[`bliss-playlist-guidance-spi`](https://github.com/chrober/bliss-playlist-guidance-spi)
-crate and independent addon repositories. The initial addon implementations are
-[`bliss-guidance-lastfm`](https://github.com/chrober/bliss-guidance-lastfm),
-which adapts the raw `semantic-evidence-v1` snapshot into contextual Last.fm
-guidance, and
-[`bliss-guidance-playcounts`](https://github.com/chrober/bliss-guidance-playcounts),
-which adapts the raw `lms-play-counts-v1` snapshot into global play-count
-guidance. “Evidence” names are retained for those existing raw artifact schemas;
-addon output is called guidance because it is advisory input to candidate
-reranking.
-
-An addon is a trusted executable speaking versioned JSONL over stdin/stdout. The
-optimizer discovers and prepares configured addons, batches candidate requests,
-bounds their signals, and treats a timeout or provider failure as neutral
-guidance. Provider acquisition, network access, and LMS integration remain
-outside the native engine. The `guidance_addons` request field is an initial
-host contract: it initializes configured add-ons and records bounded signals and
-diagnostics in the native artifact. A subsequent integration gate will apply
-those provider-neutral indexes consistently to each planner's candidate
-reranking policy. Existing request-level selection fields remain the active
-compatibility path until then.
-
-Adaptive transition scores are cached privately within each restart. Independent
-restarts run through indexed Rayon iteration and are reduced with stable
-tie-breaking, so results are byte-identical across worker counts. By default the
-executable leaves one logical CPU for Lyrion; set `RAYON_NUM_THREADS` to
-override that policy. SQLite access and validation remain sequential.
-
-The bridge command is a read-only analysis slice for automatic extension. It
-enumerates usable TracksV2 rows in stable row-id order and excludes curated and
-duplicate recording identities. Depending on the declared ordering policy, it
-either optimizes the original route or keeps the source order as immutable
-anchors. It then builds the frozen cross-context Adaptive reference distribution
-and rescores both sides of each candidate insertion with the bridge present in
-the outgoing context. A two-track source supplies only one self-referential
-observation, which would assign its sole transition percentile zero regardless
-of absolute distance. When fewer than two source observations exist, the
-optimizer instead freezes a deterministic reference population from the current
-local candidate inventory plus the source anchors. It emits opaque row IDs bound
-to the database hash, aggregate rejection counts, and a bounded list of accepted
-candidates per gap; it exposes no library paths. Independent candidates are
-ranked deterministically with Rayon. Adaptive automatic and exact gap requests
-may set `extension.gap_context_mode` to `rolling` (the compatibility default) or
-`frozen`. Rolling recalculates the Adaptive matrix after an inserted candidate
-enters the context. Frozen derives one matrix from the route prefix ending at
-the original gap's left anchor and reuses it for every leg inside that source
-gap, including native multi-track gap routes. The context mean and repeat checks
-still evolve as tracks are inserted; only the feature-weight matrix is frozen.
-The complete-route objective uses the same policy as candidate ranking, so a
-rolling objective cannot silently overturn a frozen-gap decision. Static
-requests already use one fixed matrix and therefore do not accept frozen mode.
-
-Large libraries may set `extension.shortlist_limit` to bound the candidates that
-enter strict contextual bridge scoring and exact-count search. The deterministic
-shortlist reuses the strict dynamic two-leg Adaptive ranker for the original
-gap, including accepted status, worst-leg percentile, and detour percentile. It
-only narrows the pool and never replaces final rescoring for evolving search
-states or any semantic, repeat, membership, and acoustic gate. Up to 32
-candidates carrying endpoint-local semantic evidence are reserved before the
-remaining shortlist is filled acoustically. Per-gap diagnostics report the
-shortlisted and excluded counts when narrowing occurred. Omitting the field
-preserves exhaustive evaluation; the LMS plugin currently uses a conservative
-limit of 256.
-
-The bridge command consumes a frozen provider-neutral evidence graph. Recording
-support for both or one endpoint precedes endpoint-local artist support. When
-any usable endpoint-local evidence exists, collection-artist evidence is not
-used for that gap; it is considered only when the local evidence set is empty.
-Candidates without a matching edge always remain in the Bliss pool. Provider
-states and every matched assertion retain provenance, rank or score, identity
-confidence, observation time, and cache state. Recording entities match by
-optimizer identity, shared MBID, or normalized artist and title. Disabled,
-unavailable, partial, or failed providers are non-fatal and may coexist with
-cached evidence. Final acceptance is always acoustic and repeat-safe; configured
-Last.fm guidance only applies the bounded post-qualification rank adjustment.
-Semantic candidate resolution and acoustic candidate evaluation both use
-deterministic parallel iteration.
-
-The same artifact now includes a read-only automatic selection preview. The
-request declares both the severe-gap percentile and maximum added-track budget.
-Original gaps are processed left-to-right so every Adaptive score includes all
-earlier proposed bridges and later proposals cannot alter earlier contexts. A
-bridge is selected only above the threshold, after all semantic, membership,
-repeat, and acoustic gates pass, and when its two contextual legs improve the
-local "sum plus twice the worst leg" objective over the direct transition. The
-preview reports the proposed final sequence and a selected, below-threshold,
-budget, eligibility, repeat, acoustic, or no-improvement reason for every gap.
-
-Exact-count requests use a deterministic bounded beam search over the original
-internal gaps. Search states are kept separately by addition count so a
-lower-count route cannot crowd the requested count out of the beam. Every
-tentative insertion is contextually rescored, unique, repeat-safe, and inside
-the same acoustic gates; completed states are ordered by the full
-bottleneck-then-sum route objective and stable route identity. Independent state
-and candidate evaluations use indexed Rayon iteration and reduce
-deterministically.
-
-A feasible exact preview contains exactly the requested number of bridges. An
-infeasible preview contains no final sequence and no partial decisions; it
-reports both the maximum count found and the structural upper bound. Only a
-request above that upper bound is labeled `EXACT_COUNT_INFEASIBLE`; failure
-inside the bound is honestly labeled
-`EXACT_COUNT_NOT_FOUND_WITHIN_SEARCH_BOUNDS`. Exact-count requests default to
-one bridge in each original internal gap. Preserve-order requests may opt into a
-larger, explicit `extension.max_tracks_per_gap` bound from 1 through 8. The
-search appends candidates before the right anchor, so candidate order forms a
-small route inside the gap. It retains separate global beams per total addition
-count and a bounded local frontier per gap depth. The structural upper bound is
-the smaller of the unique frozen candidate count and
-`internal gaps * max_tracks_per_gap`.
-
-Every tentative append passes the existing frozen semantic pool, membership,
-repeat, and two-sided acoustic gates and causes the complete route objective to
-be recomputed. Once a route is selected, each inserted bridge is removed and
-reinserted virtually so its published two-leg diagnostics reflect its final
-neighbors and Adaptive context. All tracks in a chained gap currently come from
-the semantic pool frozen for the original anchor endpoints.
-
-Destination-route requests use `extension.mode=destination_route` together with
-`route.ordering_policy=queue_destination`, `route.start_track_id`, and
-`route.destination_track_id`. The optional `route.destination_track_ids` turns
-that single destination into an immutable ordered block; its first entry must
-equal `destination_track_id`. `source_tracks` contains the locked start followed
-by the complete destination block and therefore remains unique route membership.
-Optional `history_tracks` is ordered, immutable listening history preceding the
-start; it may contain repeats or overlap route identities because it is never
-emitted as part of the result. It supplies acoustic and repeat context, while
-repeat windows constrain only newly generated intermediates. Without a rejoin
-anchor, only the boundary before the block is extended. The block's internal
-transitions are user-selected content and are neither rerouted nor included in
-bridge acceptance. `destination_mode=exact` requires exactly
-`additional_track_count` intermediates and remains all-or-nothing. Automatic
-accepts optional `min_added_tracks` and required `max_added_tracks` bounds from
-zero through eight; the minimum must not exceed the maximum. A minimum of zero
-permits the direct destination. Exact counts are also bounded from zero through
-eight.
-
-An optional `route.rejoin_track_id` turns the same request into a queue
-excursion: locked start, immutable destination block, and locked rejoin track
-must form the final `source_tracks` in that order. The total intermediate-track
-budget is shared across the block's entry and exit boundaries. The optimizer
-carries each retained outward path into the return search, so generated
-membership, artist/album/track repeat windows, and fixed destination membership
-constrain the complete `start -> destination block -> rejoin` route. It ranks
-complete routes by their worst adjacent transition and then their total
-distance; Automatic compares the full two-leg baseline and result against the
-same quality target and cautious-model consensus used by ordinary destination
-routing. The rejoin anchor remains in the result so a caller can verify it and
-omit it from a non-destructive queue insertion. Independent return searches for
-retained outward bridge-count allocations run in parallel, after which
-deterministic complete-route ranking selects one result per total bridge count.
-
-Destination routes use a dedicated fixed-matrix layered path search rather than
-the generic contextual gap-insertion search. Static requests govern that search
-with the diagonal matrix built from the captured BlissMixer feature weights. The
-bounded inner search is implemented as a shared, outer-planner-neutral
-anchored-path engine: callers provide left/right anchors, immutable history,
-unavailable route membership, candidate evidence, repeat windows, and an
-adjacent-distance function. It returns complete scored alternatives without
-mutating a playlist or queue. Destination-block workflows currently retain one
-alternative per intermediate count for compatibility; future multi-gap playlist
-planners can request several alternatives and choose a globally repeat-safe
-combination. Adaptive requests build one per-run context from the bounded suffix
-of analyzed `history_tracks` followed by the locked start track. The destination
-is never an Adaptive seed. The optimizer passes those features, the optional
-learned matrix, and `scoring.adaptive.learned_percent` to the same
-`bliss-mixer-core` selector used by BlissMixer: one seed plus learned uses
-learned; two or more seeds use variance and blend learned at the configured
-percentage; variance failure falls back to learned when available; and
-insufficient context without learned falls back to the captured Static matrix.
-
-The selected context matrix is frozen for candidate discovery and the complete
-layered search. This preserves comparable adjacent-edge costs and indexed
-large-library performance; candidate intermediates do not become new matrix
-seeds during the job.
-
-Automatic destination requests may set `direct_transition_caution` to `normal`
-or `cautious`; omission preserves the wire-level `normal` default. Normal uses
-the governing model for route scoring and accepts a direct transition when that
-model meets the target. Cautious additionally measures distinct available Static
-and learned-only views. A direct-edge disagreement of at least 25 percentile
-points between the governing matrix and any secondary view is a reason to
-search. Every candidate path is then measured under all distinct available
-views, and its worst model controls target acceptance and best-effort ranking.
-In every Cautious search where zero intermediates are permitted, the direct
-route remains the best-effort baseline: a bridge route that misses the target
-replaces it only when the cautious worst-model percentile improves by at least
-one percentage point. Otherwise the artifact retains the direct route and
-reports `best_effort_reason=no-beneficial-bridge-over-direct`. A positive
-minimum and exact-count routing remain explicit requests for intermediates.
-
-The search builds complete paths for the permitted intermediate counts and ranks
-them by worst adjacent Bliss distance, then adjacent-distance sum, semantic
-support, and deterministic identity. A lower bound based on the remaining
-endpoint distance keeps the beam focused without repeatedly rescoring the full
-library. Automatic returns the shortest permitted path whose measured adjacent
-percentiles meet `trigger_percentile`; if none qualifies, it returns the
-lowest-bottleneck repeat-safe best effort within the configured minimum and
-maximum, subject to the direct-baseline rule above. Exact uses the same path
-objective for precisely `additional_track_count` intermediates.
-
-`extension.search_effort` controls bounded search breadth independently from the
-quality target and bridge budget: `fast` uses a 128-track shortlist, six
-expansions per state, and beam width 32; `balanced` uses 256, eight, and 64; and
-`thorough` uses 512, sixteen, and 192. Older schema-v1 requests without this
-field retain `balanced` behavior. The distance index transforms every library
-feature vector once per evaluated acoustic view and reuses O(23) pair lookups,
-so comparing more bridge depths does not repeat O(23^2) matrix work. Destination
-setup also reuses that index for the source-relative reference population.
-Candidate discovery uses the governing view directly to retain tracks near the
-left endpoint, right endpoint, and acoustic midpoint. Fast, Balanced, and
-Thorough keep 128, 256, and 512 candidates respectively, bounding both memory
-and route-search work in large libraries without a conflicting contextual
-prefilter.
-
-Variation is applied only after complete routes have been ranked. It may choose
-reproducibly inside a narrow band of the deterministic winner (within 2% of its
-adjacent bottleneck and 5% of its adjacent sum), but it cannot alter graph
-reachability or relax repeat constraints. Candidate discovery still uses one
-bounded shortlist derived from the original destination gap; depth-specific
-full-library candidate expansion remains a possible later quality enhancement.
-
-Every feasible destination result publishes `selection_preview.route_quality`.
-It covers only the requested path from the captured start through generated
-intermediates to the destination and, when present, onward to the locked rejoin;
-it does not include unrelated earlier context edges. Each actual neighboring
-edge uses `fixed-matrix-adjacent-distance` and a matching
-`source-relative-local-library-percentile`; the artifact identifies the
-governing Adaptive-context or Static role and SHA-256, adjacent-distance sum,
-raw bottleneck, and worst adjacent percentile. `model_selection` records the
-effective Adaptive algorithm, seed track identities, seed limit, configured
-learned share, variance failure, fallback reason, each distinct direct-edge
-measurement, configured caution, disagreement magnitude, and whether
-disagreement triggered a search. After selection, the engine measures the
-unchanged final destination path under distinct non-governing Static and
-learned-only views and publishes them in `route_quality.secondary_models`. Under
-Normal caution these secondary measurements are advisory. Under Cautious they
-are part of whole-route acceptance and ranking, making the quality consequence
-of model agreement or disagreement both effective and observable to callers such
-as Better Call Bliss. Generated tracks remain unique and are checked against
-every track, artist, and album inside the configured repeat windows, including
-the explicit destination. The destination itself remains immutable user intent:
-a conflict already present solely between the captured queue context and
-destination does not make bridge insertion impossible. Variation and the frozen
-provider-neutral evidence graph cannot bypass generated-track membership or
-repeat constraints.
-
-Exact-count requests may independently opt into `extension.allow_opening_track`
-and `extension.allow_closing_track`. Each enabled endpoint has hard capacity
-one; endpoint tracks are never added unless the corresponding flag is explicitly
-true. An opening candidate has no invented incoming transition: it is scored
-only into the first source anchor, using the candidate as the one-track Adaptive
-context. A closing candidate is scored only from the complete preceding route
-into the candidate. Both must pass unique-membership, complete-route repeat, and
-max-leg percentile gates. The structural upper bound becomes the smaller of the
-unique candidate count and
-`internal gaps * max_tracks_per_gap + enabled endpoint slots`.
-
-Endpoint semantics are likewise one-sided. A recording edge from the real anchor
-yields `recording_one`, never fabricated `recording_both` support;
-endpoint-local artist evidence follows, then collection fallback, then
-Bliss-only operation. Opening evidence records the source anchor as the right
-endpoint and closing evidence records it as the left endpoint.
-
-Endpoint exact search is a deterministic bounded staged search, not a claim of
-joint global optimality. It enumerates the allowed opening/closing-use
-combinations, obtains the best bounded internal-gap route for the remaining
-count, enumerates retained endpoint candidates, and selects by the recomputed
-complete-route objective and stable route identity. Published internal bridge
-diagnostics are reconstructed against that complete route, including any opening
-shift. The artifact separately records the endpoint policy, each one-sided
-decision, and its evidence and percentile.
-
-With `route.ordering_policy = preserve_order`, both automatic and exact-count
-extension keep every source track in precisely its input position relative to
-the other source tracks. The artifact records the source IDs separately from the
-selected route IDs and tests their equality with the final original-track
-subsequence. Because source tracks are immutable in this mode, an input order
-that already violates an artist or album look-back window fails with
-`PRESERVED_ANCHOR_REPEAT_CONFLICT`; this slice does not misrepresent a bounded
-gap search as capable of repairing several interacting anchor conflicts.
-Automatic mode remains limited to one bridge per gap.
-
-This remains analysis-only by design. Better Call Bliss applies accepted
-previews and writes Lyrion playlists from the returned opaque track identities.
-
-Success is written as one JSON object to stdout. Validation or search failures
-are written as one JSON object to stderr and exit with status 1; invalid CLI
-usage exits with status 2. The schemas in `schemas/` are the versioned
-compatibility boundary.
-
-The Python one-shot implementation remains the behavioral oracle until every
-planned native mode has dedicated parity coverage.
-
-## Release artifacts
-
-The optimizer repository owns native binary builds and their test gate. The
-`.github/workflows/release.yml` workflow runs formatting, Clippy, and tests,
-then builds release binaries for the platform folders consumed by
-[Better Call Bliss](https://github.com/chrober/lms-better-call-bliss):
-
-- `bliss-playlist-optimizer-aarch64-linux`
-- `bliss-playlist-optimizer-armhf-linux`
-- `bliss-playlist-optimizer-x86_64-linux`
-- `bliss-playlist-optimizer-mac`
-- `bliss-playlist-optimizer-windows.exe`
-
-Each asset is published with a `.sha256` file. Normal plugin publishing should
-consume a pinned optimizer GitHub release instead of rebuilding optimizer source
-inside the LMS plugin workflow. Workflow artifacts are still produced for dry
-runs and development inspection.
+Production integrations use `route` or `bridge` with a request artifact and may
+add `--progress`, `--timings`, and a decoded-library `--cache-dir`. See the
+[architecture reference](docs/ARCHITECTURE.md) for the full contract, security
+boundary, modes, diagnostics, cache, parallelism, and release details.
 
 ## Development
 
-Rust is pinned by `rust-toolchain.toml`. Open the repository in a Dev Container
-for a self-contained Linux environment with Rust, SQLite tools, and Python, or
-use any local rustup installation; both paths run the same toolchain version.
-
 ```text
-cargo fmt --check
+cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-Licensed under GPL-3.0-only. See `LICENSE`.
+See [CONTRIBUTING.md](CONTRIBUTING.md), [error codes](docs/ERROR_CODES.md), and
+the [synthetic fixtures](fixtures/synthetic/README.md) for contributor detail.
