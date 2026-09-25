@@ -1,4 +1,6 @@
 /target/
 /.worktrees/
+/.work/
+/.tmp-test-output.txt
 
 /fixtures/synthetic/oracle-output/
