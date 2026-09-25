@@ -213,7 +213,7 @@ crate and independent addon repositories. The initial addon implementations are
 [`bliss-guidance-lastfm`](https://github.com/chrober/bliss-guidance-lastfm),
 which adapts the raw `semantic-evidence-v1` snapshot into contextual Last.fm
 guidance, and
-[`bliss-guidance-playcounts`](https://github.com/chrober/bliss-guidance-playcounts),
+[`bliss-guidance-library-signals`](https://github.com/chrober/bliss-guidance-library-signals),
 which adapts the raw `lms-play-counts-v1` snapshot into global play-count
 guidance. “Evidence” names are retained for those existing raw artifact schemas;
 addon output is called guidance because it is advisory input to candidate
