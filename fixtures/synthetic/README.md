@@ -11,6 +11,15 @@ Generated oracle output is ignored; the source fixture and reviewed expected
 snapshots are the versioned parity inputs. `generate_fixture.py` also writes
 `adaptive-scoring-request.json`.
 
+`guidance-parity-v1.json` is the frozen cross-component reference for the
+shared Rust guidance semantics. It keeps stable candidate IDs, a resolved
+Last.fm artist artifact, representative `tracks_persistent` rows, one frozen
+`as_of`, and both bounded-influence and target-share artist policies. The
+optimizer unit test proves that no-policy input remains Bliss-only, bounded
+artist support is finite, target share promotes only an already
+Bliss-qualified supported candidate, and never-played/newly-added time signals
+retain the Lab-compatible boundary values.
+
 From the repository root, run:
 
 ```text

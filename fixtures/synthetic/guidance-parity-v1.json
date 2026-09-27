@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "as_of_unix_seconds": 1704067200,
+  "last_played_horizon_days": 180,
+  "library_age_horizon_days": 365,
+  "candidate_ids": [
+    "candidate-bliss-only",
+    "candidate-artist",
+    "candidate-never-played",
+    "candidate-fresh-library"
+  ],
+  "lastfm_artifact": {
+    "schema_version": 1,
+    "edges": [
+      {
+        "source": { "kind": "artist", "id": "artist:seed", "mbid": "seed-mbid" },
+        "resolved_candidate_id": "candidate-artist",
+        "raw_score": 0.9,
+        "identity_confidence": 0.8
+      }
+    ]
+  },
+  "lyrion_tracks_persistent": [
+    { "urlmd5": "url-bliss-only", "playCount": 4, "lastPlayed": 1701388800, "added": 1609459200 },
+    { "urlmd5": "url-never-played", "playCount": 0, "lastPlayed": 0, "added": 1661990400 },
+    { "urlmd5": "url-fresh-library", "playCount": 1, "lastPlayed": 1704067200, "added": 1704067200 }
+  ],
+  "provider_signals": [
+    {
+      "provider_id": "lastfm-guidance",
+      "signal": {
+        "candidate_id": "candidate-artist",
+        "channel": "lastfm_artist",
+        "scope": "global",
+        "score": 0.9,
+        "confidence": 0.8,
+        "rationale": "fixture Last.fm artist match"
+      }
+    },
+    {
+      "provider_id": "library-signals-guidance",
+      "signal": {
+        "candidate_id": "candidate-never-played",
+        "channel": "last_played",
+        "scope": "global",
+        "score": -1.0,
+        "confidence": 1.0,
+        "rationale": "fixture never played"
+      }
+    },
+    {
+      "provider_id": "library-signals-guidance",
+      "signal": {
+        "candidate_id": "candidate-fresh-library",
+        "channel": "library_age",
+        "scope": "global",
+        "score": 1.0,
+        "confidence": 1.0,
+        "rationale": "fixture added at frozen as-of"
+      }
+    }
+  ],
+  "policies": {
+    "bounded_artist": [
+      {
+        "provider_id": "lastfm-guidance",
+        "channel": "lastfm_artist",
+        "weight": 0.25
+      }
+    ],
+    "target_artist": [
+      {
+        "provider_id": "lastfm-guidance",
+        "channel": "lastfm_artist",
+        "weight": 1.0,
+        "target_percent": 75
+      }
+    ]
+  }
+}

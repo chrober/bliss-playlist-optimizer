@@ -823,7 +823,110 @@ fn aggregate_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bliss_playlist_guidance_spi::policy::{GuidancePolicyEntry, HostPolicyKind};
+    use bliss_playlist_guidance_spi::policy::{
+        saturating_time_signal, GuidancePolicyEntry, HostPolicyKind,
+    };
+    use serde_json::Value;
+
+    #[test]
+    fn frozen_parity_fixture_covers_bliss_only_lastfm_modes_and_date_channels() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../fixtures/synthetic/guidance-parity-v1.json"
+        ))
+        .expect("parity fixture is valid JSON");
+
+        assert_eq!(fixture["schema_version"], Value::from(1));
+        assert_eq!(
+            fixture["as_of_unix_seconds"],
+            Value::from(1_704_067_200_i64)
+        );
+
+        assert!(fixture["lastfm_artifact"]["edges"].is_array());
+        assert!(fixture["lyrion_tracks_persistent"].is_array());
+
+        let candidate_ids = fixture["candidate_ids"]
+            .as_array()
+            .expect("candidate IDs are an array")
+            .iter()
+            .map(|value| value.as_str().expect("candidate ID is a string").to_owned())
+            .collect::<Vec<_>>();
+        let candidate_index = candidate_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let signals = fixture["provider_signals"]
+            .as_array()
+            .expect("provider signals are an array")
+            .iter()
+            .map(|entry| ProviderSignal {
+                provider_id: entry["provider_id"]
+                    .as_str()
+                    .expect("provider ID is a string")
+                    .to_owned(),
+                signal: serde_json::from_value(entry["signal"].clone())
+                    .expect("signal matches the SPI contract"),
+            })
+            .collect::<Vec<_>>();
+
+        let bliss_only = aggregate_batch(
+            signals.clone(),
+            &GuidanceWeights::default(),
+            &candidate_index,
+        );
+        assert!(bliss_only.adjustment_by_candidate.is_empty());
+
+        let bounded: Vec<GuidancePolicyEntry> =
+            serde_json::from_value(fixture["policies"]["bounded_artist"].clone())
+                .expect("bounded artist policy is valid");
+        let bounded = aggregate_batch(
+            signals.clone(),
+            &GuidanceWeights::from_policy(&bounded),
+            &candidate_index,
+        );
+        let artist = candidate_index["candidate-artist"];
+        assert!((bounded.adjustment_by_candidate[&artist] - 0.18).abs() < 1e-12);
+
+        let target: Vec<GuidancePolicyEntry> =
+            serde_json::from_value(fixture["policies"]["target_artist"].clone())
+                .expect("target-share artist policy is valid");
+        let target_weights = GuidanceWeights::from_policy(&target);
+        let target_batch = aggregate_batch(signals, &target_weights, &candidate_index);
+        let selection_weights = target_weights.target_share_weights(
+            &(0..candidate_ids.len()).collect::<Vec<_>>(),
+            &target_batch.contributions_by_candidate,
+        );
+        assert!(selection_weights[&artist] > 1.0);
+        assert_eq!(
+            selection_weights[&candidate_index["candidate-bliss-only"]],
+            1.0
+        );
+
+        let timestamps = fixture["lyrion_tracks_persistent"]
+            .as_array()
+            .expect("Lyrion rows are an array");
+        let as_of = fixture["as_of_unix_seconds"].as_i64().unwrap();
+        let last_played_horizon = fixture["last_played_horizon_days"].as_i64().unwrap() * 86_400;
+        let library_age_horizon = fixture["library_age_horizon_days"].as_i64().unwrap() * 86_400;
+        assert_eq!(
+            saturating_time_signal(
+                timestamps[1]["lastPlayed"].as_i64(),
+                as_of,
+                last_played_horizon,
+                true,
+            ),
+            Some(-1.0),
+        );
+        assert_eq!(
+            saturating_time_signal(
+                timestamps[2]["added"].as_i64(),
+                as_of,
+                library_age_horizon,
+                false,
+            ),
+            Some(1.0),
+        );
+    }
 
     #[test]
     fn shared_policy_entries_drive_weights_and_target_share() {
