@@ -29,15 +29,19 @@ pub struct AutomaticGap {
     pub direct_distance: f64,
     pub direct_percentile: f64,
     pub semantics: GapEvidence,
+    /// Bounded provider guidance prepared for this original source gap. The
+    /// map is intentionally keyed by an already-shortlisted library index,
+    /// so it can influence order but never candidate membership.
+    pub guidance_adjustments: BTreeMap<usize, f64>,
+    /// DSTM-style per-candidate target-share multipliers calculated from this
+    /// same Bliss-qualified pool. They cannot add new candidates.
+    pub guidance_target_weights: BTreeMap<usize, f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AutomaticSelectionConfig {
     pub max_added_tracks: usize,
     pub trigger_percentile: f64,
-    pub recording_guidance_percent: u8,
-    pub artist_guidance_percent: u8,
-    pub playcount_influence: i8,
     pub variation_percent: u8,
     pub generation_seed: u64,
 }
@@ -48,18 +52,8 @@ pub struct ExactSelectionConfig {
     pub candidate_limit: usize,
     pub beam_width: usize,
     pub max_tracks_per_gap: usize,
-    pub recording_guidance_percent: u8,
-    pub artist_guidance_percent: u8,
-    pub playcount_influence: i8,
     pub variation_percent: u8,
     pub generation_seed: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct GuidanceConfig {
-    track_percent: u8,
-    artist_percent: u8,
-    playcount_influence: i8,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -87,14 +81,6 @@ impl EvolvingAcceptance {
 }
 
 impl AutomaticSelectionConfig {
-    fn guidance(self) -> GuidanceConfig {
-        GuidanceConfig {
-            track_percent: self.recording_guidance_percent,
-            artist_percent: self.artist_guidance_percent,
-            playcount_influence: self.playcount_influence,
-        }
-    }
-
     fn variation(self) -> VariationConfig {
         VariationConfig {
             percent: self.variation_percent,
@@ -105,14 +91,6 @@ impl AutomaticSelectionConfig {
 }
 
 impl ExactSelectionConfig {
-    fn guidance(self) -> GuidanceConfig {
-        GuidanceConfig {
-            track_percent: self.recording_guidance_percent,
-            artist_percent: self.artist_guidance_percent,
-            playcount_influence: self.playcount_influence,
-        }
-    }
-
     fn variation(self) -> VariationConfig {
         VariationConfig {
             percent: self.variation_percent,
@@ -146,6 +124,20 @@ pub struct ExactScoringContext<'a> {
 struct GapRankingContext<'a> {
     scoring: ExactScoringContext<'a>,
     frozen_matrix: Option<&'a Array2<f32>>,
+}
+
+/// All inputs to one contextual bridge-ranking operation. Keeping these
+/// coupled prevents callers from accidentally applying guidance, acceptance,
+/// or variation to a different route/context than the one being scored.
+struct EvolvingRouteRankingRequest<'a> {
+    route: &'a [usize],
+    position: usize,
+    semantics: &'a [CandidateSemantics],
+    guidance_adjustments: &'a BTreeMap<usize, f64>,
+    guidance_target_weights: &'a BTreeMap<usize, f64>,
+    context: GapRankingContext<'a>,
+    variation: VariationConfig,
+    acceptance: EvolvingAcceptance,
 }
 
 #[derive(Clone, Copy)]
@@ -320,31 +312,89 @@ fn varied_pool_length(accepted: usize, variation: VariationConfig) -> usize {
     floor + (ceiling.saturating_sub(floor) * usize::from(variation.percent) / 100)
 }
 
-fn adjusted_candidate_percentile(
-    semantics: &CandidateSemantics,
-    acoustic_percentile: f64,
-    guidance: GuidanceConfig,
-    track: &RouteTrack,
-) -> f64 {
-    let semantic = semantics.adjusted_percentile(
-        acoustic_percentile,
-        guidance.track_percent,
-        guidance.artist_percent,
+/// Orders an already acoustic, constraint-valid shortlist using bounded
+/// provider guidance. Guidance never creates candidates: entries absent from
+/// `acoustic` remain absent from the result. A positive adjustment reduces the
+/// effective percentile by at most ten percentage points, matching the
+/// historical maximum semantic shift while keeping Bliss as the authority.
+fn rank_guided_shortlist(
+    acoustic: &[(usize, f64)],
+    adjustments: &BTreeMap<usize, f64>,
+    target_share_weights: &BTreeMap<usize, f64>,
+) -> Vec<usize> {
+    const MAX_GUIDANCE_SHIFT: f64 = 0.10;
+
+    let mut ranked = acoustic.to_vec();
+    ranked.sort_by(
+        |(left_candidate, left_percentile), (right_candidate, right_percentile)| {
+            let left_adjusted = (left_percentile
+                - MAX_GUIDANCE_SHIFT * adjustments.get(left_candidate).copied().unwrap_or(0.0))
+                / target_share_weights
+                    .get(left_candidate)
+                    .copied()
+                    .unwrap_or(1.0)
+                    .max(0.000_001);
+            let right_adjusted = (right_percentile
+                - MAX_GUIDANCE_SHIFT * adjustments.get(right_candidate).copied().unwrap_or(0.0))
+                / target_share_weights
+                    .get(right_candidate)
+                    .copied()
+                    .unwrap_or(1.0)
+                    .max(0.000_001);
+            left_adjusted
+                .total_cmp(&right_adjusted)
+                .then_with(|| left_percentile.total_cmp(right_percentile))
+                .then_with(|| left_candidate.cmp(right_candidate))
+        },
     );
-    let playcount_shift =
-        0.10 * (f64::from(guidance.playcount_influence) / 100.0) * track.play_count_percentile;
-    (semantic - playcount_shift).clamp(0.0, 1.0)
+    ranked.into_iter().map(|(candidate, _)| candidate).collect()
+}
+
+/// Applies the shared bounded provider order to bridge evaluations. This is
+/// intentionally independent of `CandidateSemantics`: semantic artifacts may
+/// explain a result, but only provider guidance may alter a Bliss-qualified
+/// candidate order.
+pub fn sort_guided_evaluations(
+    evaluations: &mut [BridgeCandidateEvaluation],
+    adjustments: &BTreeMap<usize, f64>,
+    target_share_weights: &BTreeMap<usize, f64>,
+) {
+    let guidance_rank = rank_guided_shortlist(
+        &evaluations
+            .iter()
+            .map(|evaluation| (evaluation.candidate, evaluation.max_percentile))
+            .collect::<Vec<_>>(),
+        adjustments,
+        target_share_weights,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(rank, candidate)| (candidate, rank))
+    .collect::<HashMap<_, _>>();
+    evaluations.sort_by(|left, right| {
+        right
+            .accepted
+            .cmp(&left.accepted)
+            .then_with(|| guidance_rank[&left.candidate].cmp(&guidance_rank[&right.candidate]))
+            .then_with(|| left.max_percentile.total_cmp(&right.max_percentile))
+            .then_with(|| left.detour_percentile.total_cmp(&right.detour_percentile))
+            .then_with(|| left.candidate.cmp(&right.candidate))
+    });
 }
 
 fn rank_for_evolving_route(
-    route: &[usize],
-    position: usize,
-    semantics: &[CandidateSemantics],
-    context: GapRankingContext<'_>,
-    guidance: GuidanceConfig,
-    variation: VariationConfig,
-    acceptance: EvolvingAcceptance,
+    request: EvolvingRouteRankingRequest<'_>,
 ) -> Result<Vec<BridgeCandidateEvaluation>, PreviewError> {
+    let EvolvingRouteRankingRequest {
+        route,
+        position,
+        semantics,
+        guidance_adjustments,
+        guidance_target_weights,
+        context,
+        variation,
+        acceptance,
+    } = request;
     let GapRankingContext {
         scoring:
             ExactScoringContext {
@@ -355,10 +405,6 @@ fn rank_for_evolving_route(
             },
         frozen_matrix,
     } = context;
-    let semantics_by_candidate = semantics
-        .iter()
-        .map(|candidate| (candidate.candidate, candidate))
-        .collect::<HashMap<_, _>>();
     let candidates = semantics
         .iter()
         .map(|candidate| candidate.candidate)
@@ -376,38 +422,23 @@ fn rank_for_evolving_route(
         },
     )
     .map_err(PreviewError::Scoring)?;
+    let guidance_order = rank_guided_shortlist(
+        &evaluations
+            .iter()
+            .map(|evaluation| (evaluation.candidate, evaluation.max_percentile))
+            .collect::<Vec<_>>(),
+        guidance_adjustments,
+        guidance_target_weights,
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(rank, candidate)| (candidate, rank))
+    .collect::<HashMap<_, _>>();
     evaluations.sort_by(|left, right| {
         acceptance
             .accepts(right, config)
             .cmp(&acceptance.accepts(left, config))
-            .then_with(|| {
-                adjusted_candidate_percentile(
-                    semantics_by_candidate[&left.candidate],
-                    left.max_percentile,
-                    guidance,
-                    &tracks[left.candidate],
-                )
-                .total_cmp(&adjusted_candidate_percentile(
-                    semantics_by_candidate[&right.candidate],
-                    right.max_percentile,
-                    guidance,
-                    &tracks[right.candidate],
-                ))
-            })
-            .then_with(|| {
-                adjusted_candidate_percentile(
-                    semantics_by_candidate[&left.candidate],
-                    left.detour_percentile,
-                    guidance,
-                    &tracks[left.candidate],
-                )
-                .total_cmp(&adjusted_candidate_percentile(
-                    semantics_by_candidate[&right.candidate],
-                    right.detour_percentile,
-                    guidance,
-                    &tracks[right.candidate],
-                ))
-            })
+            .then_with(|| guidance_order[&left.candidate].cmp(&guidance_order[&right.candidate]))
             .then_with(|| left.max_percentile.total_cmp(&right.max_percentile))
             .then_with(|| left.detour_percentile.total_cmp(&right.detour_percentile))
             .then_with(|| left.candidate.cmp(&right.candidate))
@@ -527,11 +558,13 @@ pub fn select_automatic_bridges(
             let frozen_matrix =
                 gap_context_matrix(&final_route, position, tracks, learned_matrix, config)
                     .map_err(PreviewError::Scoring)?;
-            let evaluations = rank_for_evolving_route(
-                &final_route,
+            let evaluations = rank_for_evolving_route(EvolvingRouteRankingRequest {
+                route: &final_route,
                 position,
-                &gap.semantics.candidates,
-                GapRankingContext {
+                semantics: &gap.semantics.candidates,
+                guidance_adjustments: &gap.guidance_adjustments,
+                guidance_target_weights: &gap.guidance_target_weights,
+                context: GapRankingContext {
                     scoring: ExactScoringContext {
                         tracks,
                         learned_matrix,
@@ -540,10 +573,9 @@ pub fn select_automatic_bridges(
                     },
                     frozen_matrix: frozen_matrix.as_ref(),
                 },
-                selection_config.guidance(),
-                selection_config.variation(),
-                EvolvingAcceptance::FullBridge,
-            )?;
+                variation: selection_config.variation(),
+                acceptance: EvolvingAcceptance::FullBridge,
+            })?;
             if let Some(evaluation) = evaluations.iter().find(|candidate| {
                 let inserted = local_objective(
                     candidate.left_distance + candidate.right_distance,
@@ -711,11 +743,13 @@ fn final_exact_decisions(
                 config,
             )
             .map_err(PreviewError::Scoring)?;
-            let evaluation = rank_for_evolving_route(
-                &route_without_candidate,
+            let evaluation = rank_for_evolving_route(EvolvingRouteRankingRequest {
+                route: &route_without_candidate,
                 position,
-                std::slice::from_ref(&semantics),
-                GapRankingContext {
+                semantics: std::slice::from_ref(&semantics),
+                guidance_adjustments: &gap.guidance_adjustments,
+                guidance_target_weights: &gap.guidance_target_weights,
+                context: GapRankingContext {
                     scoring: ExactScoringContext {
                         tracks,
                         learned_matrix,
@@ -724,10 +758,9 @@ fn final_exact_decisions(
                     },
                     frozen_matrix: frozen_matrix.as_ref(),
                 },
-                selection_config.guidance(),
-                selection_config.variation(),
-                EvolvingAcceptance::FullBridge,
-            )?
+                variation: selection_config.variation(),
+                acceptance: EvolvingAcceptance::FullBridge,
+            })?
             .into_iter()
             .next()
             .ok_or(PreviewError::FinalRouteInvalid(
@@ -829,11 +862,13 @@ fn select_exact_count_multi_gap_bridges(
                     for (variant, selected, _) in frontier {
                         let position = gap_right_position(&variant.route, gap)
                             .ok_or(PreviewError::InvalidOriginalGap(gap.original_position))?;
-                        let evaluations = rank_for_evolving_route(
-                            &variant.route,
+                        let evaluations = rank_for_evolving_route(EvolvingRouteRankingRequest {
+                            route: &variant.route,
                             position,
-                            &gap.semantics.candidates,
-                            GapRankingContext {
+                            semantics: &gap.semantics.candidates,
+                            guidance_adjustments: &gap.guidance_adjustments,
+                            guidance_target_weights: &gap.guidance_target_weights,
+                            context: GapRankingContext {
                                 scoring: ExactScoringContext {
                                     tracks,
                                     learned_matrix,
@@ -842,10 +877,9 @@ fn select_exact_count_multi_gap_bridges(
                                 },
                                 frozen_matrix: frozen_matrix.as_ref(),
                             },
-                            selection_config.guidance(),
-                            selection_config.variation(),
-                            EvolvingAcceptance::ReachableFromLeft,
-                        )?;
+                            variation: selection_config.variation(),
+                            acceptance: EvolvingAcceptance::ReachableFromLeft,
+                        })?;
                         for evaluation in evaluations
                             .into_iter()
                             .filter(|candidate| {
@@ -1005,10 +1039,18 @@ where
         .iter()
         .map(|candidate| AnchoredPathCandidate {
             track: candidate.candidate,
-            semantic_support: candidate.guidance_score(
-                selection_config.recording_guidance_percent,
-                selection_config.artist_guidance_percent,
-            ),
+            guidance_adjustment: gap
+                .guidance_adjustments
+                .get(&candidate.candidate)
+                .copied()
+                .unwrap_or(0.0)
+                + gap
+                    .guidance_target_weights
+                    .get(&candidate.candidate)
+                    .copied()
+                    .unwrap_or(1.0)
+                    .max(0.000_001)
+                    .ln(),
         })
         .collect::<Vec<_>>();
     let anchored_options = search_anchored_paths(
@@ -1371,7 +1413,6 @@ fn rank_endpoint_for_route(
     slot: EndpointSlot,
     endpoint: &ExactEndpointSlot,
     candidate_limit: usize,
-    guidance: GuidanceConfig,
     variation: VariationConfig,
     scoring: ExactScoringContext<'_>,
 ) -> Result<Vec<SelectedEndpoint>, PreviewError> {
@@ -1407,20 +1448,6 @@ fn rank_endpoint_for_route(
         right
             .accepted
             .cmp(&left.accepted)
-            .then_with(|| {
-                adjusted_candidate_percentile(
-                    semantics_by_candidate[&left.candidate],
-                    left.percentile,
-                    guidance,
-                    &tracks[left.candidate],
-                )
-                .total_cmp(&adjusted_candidate_percentile(
-                    semantics_by_candidate[&right.candidate],
-                    right.percentile,
-                    guidance,
-                    &tracks[right.candidate],
-                ))
-            })
             .then_with(|| left.percentile.total_cmp(&right.percentile))
             .then_with(|| left.candidate.cmp(&right.candidate))
     });
@@ -1534,7 +1561,6 @@ pub fn select_exact_count_bridges_with_endpoints(
                     EndpointSlot::Opening,
                     endpoints.opening.as_ref().expect("opening slot is enabled"),
                     selection_config.candidate_limit,
-                    selection_config.guidance(),
                     selection_config.variation(),
                     scoring,
                 )?
@@ -1570,7 +1596,6 @@ pub fn select_exact_count_bridges_with_endpoints(
                         EndpointSlot::Closing,
                         endpoints.closing.as_ref().expect("closing slot is enabled"),
                         selection_config.candidate_limit,
-                        selection_config.guidance(),
                         selection_config.variation(),
                         scoring,
                     )?
@@ -1780,11 +1805,13 @@ fn select_exact_count_single_gap_bridges(
                     let frozen_matrix =
                         gap_context_matrix(&state.route, position, tracks, learned_matrix, config)
                             .map_err(PreviewError::Scoring)?;
-                    let evaluations = rank_for_evolving_route(
-                        &state.route,
+                    let evaluations = rank_for_evolving_route(EvolvingRouteRankingRequest {
+                        route: &state.route,
                         position,
-                        &gap.semantics.candidates,
-                        GapRankingContext {
+                        semantics: &gap.semantics.candidates,
+                        guidance_adjustments: &gap.guidance_adjustments,
+                        guidance_target_weights: &gap.guidance_target_weights,
+                        context: GapRankingContext {
                             scoring: ExactScoringContext {
                                 tracks,
                                 learned_matrix,
@@ -1793,10 +1820,9 @@ fn select_exact_count_single_gap_bridges(
                             },
                             frozen_matrix: frozen_matrix.as_ref(),
                         },
-                        selection_config.guidance(),
-                        selection_config.variation(),
-                        EvolvingAcceptance::FullBridge,
-                    )?;
+                        variation: selection_config.variation(),
+                        acceptance: EvolvingAcceptance::FullBridge,
+                    })?;
                     for evaluation in evaluations
                         .into_iter()
                         .filter(|candidate| candidate.accepted)
@@ -1906,6 +1932,70 @@ fn select_exact_count_single_gap_bridges(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planner_guidance_adjustment_reorders_only_the_acoustic_shortlist() {
+        let acoustic = vec![(2_usize, 0.40_f64), (3_usize, 0.41_f64)];
+        let adjustments = BTreeMap::from([(3_usize, 0.20_f64), (99_usize, 1.0_f64)]);
+
+        let ranked = rank_guided_shortlist(&acoustic, &adjustments, &BTreeMap::new());
+
+        assert_eq!(ranked, vec![3, 2]);
+        assert!(!ranked.contains(&99));
+    }
+
+    #[test]
+    fn target_share_weight_reorders_only_the_acoustic_shortlist() {
+        let acoustic = vec![(2_usize, 0.40_f64), (3_usize, 0.41_f64)];
+        let target_weights = BTreeMap::from([(3_usize, 10.0), (99_usize, 1_000_000.0)]);
+
+        let ranked = rank_guided_shortlist(&acoustic, &BTreeMap::new(), &target_weights);
+
+        assert_eq!(ranked, vec![3, 2]);
+        assert!(!ranked.contains(&99));
+    }
+
+    #[test]
+    fn guided_evaluations_never_use_legacy_semantic_adjustments() {
+        let mut evaluations = vec![
+            BridgeCandidateEvaluation {
+                candidate: 2,
+                left_distance: 0.0,
+                right_distance: 0.0,
+                left_percentile: 0.40,
+                right_percentile: 0.40,
+                max_percentile: 0.40,
+                detour_percentile: 0.50,
+                repeat_safe: true,
+                accepted: true,
+            },
+            BridgeCandidateEvaluation {
+                candidate: 3,
+                left_distance: 0.0,
+                right_distance: 0.0,
+                left_percentile: 0.41,
+                right_percentile: 0.41,
+                max_percentile: 0.41,
+                detour_percentile: 0.51,
+                repeat_safe: true,
+                accepted: true,
+            },
+        ];
+
+        sort_guided_evaluations(
+            &mut evaluations,
+            &BTreeMap::from([(3_usize, 0.20_f64)]),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(
+            evaluations
+                .into_iter()
+                .map(|entry| entry.candidate)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+    }
     use crate::bridge::build_frozen_reference;
     use crate::semantic::SemanticTier;
 
@@ -1914,29 +2004,7 @@ mod tests {
             features: std::array::from_fn(|index| value + index as f32 / 100.0),
             artist_key: artist.to_owned(),
             album_key: format!("album-{artist}"),
-            play_count_percentile: 0.0,
         }
-    }
-
-    #[test]
-    fn signed_playcount_guidance_moves_candidate_percentiles_in_both_directions() {
-        let semantics = semantics(0);
-        let mut frequent = track(0.0, "frequent");
-        frequent.play_count_percentile = 1.0;
-        let positive = GuidanceConfig {
-            playcount_influence: 100,
-            ..GuidanceConfig::default()
-        };
-        let negative = GuidanceConfig {
-            playcount_influence: -100,
-            ..GuidanceConfig::default()
-        };
-        assert!(adjusted_candidate_percentile(&semantics, 0.5, positive, &frequent) < 0.5);
-        assert!(adjusted_candidate_percentile(&semantics, 0.5, negative, &frequent) > 0.5);
-        assert_eq!(
-            adjusted_candidate_percentile(&semantics, 0.5, GuidanceConfig::default(), &frequent,),
-            0.5,
-        );
     }
 
     fn semantics(candidate: usize) -> CandidateSemantics {
@@ -1958,6 +2026,8 @@ mod tests {
                 pool: SemanticPool::BlissOnly,
                 candidates: vec![semantics(candidate)],
             },
+            guidance_adjustments: BTreeMap::new(),
+            guidance_target_weights: BTreeMap::new(),
         }
     }
 
@@ -2015,9 +2085,6 @@ mod tests {
         let selection_config = AutomaticSelectionConfig {
             max_added_tracks: 1,
             trigger_percentile: 0.70,
-            recording_guidance_percent: 0,
-            artist_guidance_percent: 0,
-            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_721,
         };
@@ -2088,9 +2155,6 @@ mod tests {
         let selection_config = AutomaticSelectionConfig {
             max_added_tracks: 1,
             trigger_percentile: 0.70,
-            recording_guidance_percent: 0,
-            artist_guidance_percent: 0,
-            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_721,
         };
@@ -2135,9 +2199,6 @@ mod tests {
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 1,
-            recording_guidance_percent: 0,
-            artist_guidance_percent: 0,
-            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_721,
         };
@@ -2221,15 +2282,14 @@ mod tests {
                 pool: SemanticPool::BlissOnly,
                 candidates: vec![semantics(1), semantics(2)],
             },
+            guidance_adjustments: BTreeMap::new(),
+            guidance_target_weights: BTreeMap::new(),
         }];
         let selection_config = ExactSelectionConfig {
             requested_added_tracks: 2,
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 2,
-            recording_guidance_percent: 0,
-            artist_guidance_percent: 0,
-            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_721,
         };
@@ -2329,15 +2389,14 @@ mod tests {
                 pool: SemanticPool::BlissOnly,
                 candidates: vec![semantics(1), semantics(2)],
             },
+            guidance_adjustments: BTreeMap::new(),
+            guidance_target_weights: BTreeMap::new(),
         }];
         let exact = ExactSelectionConfig {
             requested_added_tracks: 1,
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 2,
-            recording_guidance_percent: 0,
-            artist_guidance_percent: 0,
-            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_811,
         };
@@ -2394,9 +2453,6 @@ mod tests {
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 2,
-            recording_guidance_percent: 0,
-            artist_guidance_percent: 0,
-            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_907,
         };
@@ -2461,9 +2517,6 @@ mod tests {
             candidate_limit: 1,
             beam_width: 8,
             max_tracks_per_gap: 1,
-            recording_guidance_percent: 0,
-            artist_guidance_percent: 0,
-            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_907,
         };
@@ -2526,9 +2579,6 @@ mod tests {
             candidate_limit: 2,
             beam_width: 16,
             max_tracks_per_gap: 1,
-            recording_guidance_percent: 0,
-            artist_guidance_percent: 0,
-            playcount_influence: 0,
             variation_percent: 0,
             generation_seed: 20_260_721,
         };

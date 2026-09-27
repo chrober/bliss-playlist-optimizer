@@ -1,6 +1,6 @@
 [package]
 name = "bliss-playlist-optimizer"
-version = "0.1.12"
+version = "0.2.2"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Deterministic playlist optimization built on bliss similarity"
@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 bliss-mixer-core = { git = "https://github.com/chrober/bliss-mixer-core.git", rev = "8022bc6" }
+bliss-playlist-guidance-spi = { git = "https://github.com/chrober/bliss-playlist-guidance-spi.git", rev = "6fa2d55" }
 bincode = "1.3"
 jsonschema = { version = "0.33", default-features = false }
 rayon = "1.11"

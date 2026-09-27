@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use bliss_playlist_optimizer::{bridge, preview, route, semantic};
+mod guidance;
 
 const PROGRAM: &str = "bliss-playlist-optimizer";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,10 +33,13 @@ const REQUEST_SCHEMA: &str = include_str!("../schemas/optimizer-request-v1.schem
 const SEMANTIC_SCHEMA: &str = include_str!("../schemas/semantic-evidence-v1.schema.json");
 const LOCAL_CANDIDATE_INVENTORY_SCHEMA: &str =
     include_str!("../schemas/lms-local-candidate-inventory-v1.schema.json");
-const PLAY_COUNTS_SCHEMA: &str = include_str!("../schemas/lms-play-counts-v1.schema.json");
 const DEFAULT_RETAINED_CANDIDATES: usize = 5;
 const EXACT_COUNT_BEAM_WIDTH: usize = 64;
-const SEMANTIC_SHORTLIST_RESERVE: usize = 32;
+// Mirrors BlissMixer's Last.fm candidate-pool multiplier while keeping the
+// discovery batch bounded for large libraries. The optimizer still ranks this
+// entire batch by Bliss relevance before optional guidance can influence it.
+const TARGET_GUIDANCE_DISCOVERY_MULTIPLIER: usize = 10;
+const MAX_TARGET_GUIDANCE_DISCOVERY_CANDIDATES: usize = 4_096;
 const LIBRARY_CACHE_VERSION: u8 = 4;
 const MAX_LIBRARY_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v4\n";
@@ -86,6 +90,41 @@ struct Request {
     repeat_windows: RepeatWindows,
     extension: ExtensionSettings,
     semantic_evidence: Artifact,
+    #[serde(default)]
+    guidance_addons: Vec<GuidanceAddonConfig>,
+    #[serde(default)]
+    guidance_policy: Vec<GuidancePolicyEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GuidancePolicyEntry {
+    provider_id: String,
+    channel: String,
+    weight: f64,
+    #[serde(default)]
+    target_percent: Option<u8>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GuidanceAddonConfig {
+    /// Stable provider identifier reported by the addon's manifest.
+    id: String,
+    /// Trusted executable path. Runtime integrations must not accept this
+    /// value from an untrusted request file.
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    options: Value,
+    /// Plugin-owned, hash-bound provider inputs. They are never populated
+    /// from user-facing job controls.
+    #[serde(default)]
+    artifacts: Vec<bliss_playlist_guidance_spi::ArtifactDescriptor>,
+    /// Plugin-owned read-only resources, such as Lyrion's persist.db.
+    #[serde(default)]
+    resources: Vec<bliss_playlist_guidance_spi::ResourceDescriptor>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -113,7 +152,7 @@ struct Artifacts {
     database: Artifact,
     learned_matrix: Option<Artifact>,
     local_candidate_inventory: Option<Artifact>,
-    play_counts: Option<Artifact>,
+    candidate_identities: Option<Artifact>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,16 +171,18 @@ struct LocalCandidateInventory {
 }
 
 #[derive(Debug, Deserialize)]
-struct PlayCountInventory {
+struct CandidateIdentityInventory {
     schema_identity: String,
     database_cache_identity: String,
-    tracks: Vec<PlayCountTrack>,
+    candidates: Vec<CandidateIdentity>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PlayCountTrack {
-    database_file: String,
-    play_count: Option<u64>,
+struct CandidateIdentity {
+    candidate_id: String,
+    row_id: u64,
+    #[serde(default)]
+    lms_urlmd5: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,16 +214,6 @@ struct AdaptiveSettings {
 struct SelectionSettings {
     variation_percent: u8,
     generation_seed: u64,
-    #[serde(default, alias = "lastfm_track_guidance_percent")]
-    recording_guidance_percent: u8,
-    #[serde(
-        default,
-        alias = "lastfm_artist_guidance_percent",
-        alias = "lastfm_artist_probability"
-    )]
-    artist_guidance_percent: u8,
-    #[serde(default)]
-    playcount_influence: i8,
 }
 
 impl Default for SelectionSettings {
@@ -190,9 +221,6 @@ impl Default for SelectionSettings {
         Self {
             variation_percent: 0,
             generation_seed: 20_260_721,
-            recording_guidance_percent: 0,
-            artist_guidance_percent: 0,
-            playcount_influence: 0,
         }
     }
 }
@@ -253,12 +281,18 @@ struct ValidationSummary {
     database_sha256: String,
     learned_matrix_sha256: Option<String>,
     local_candidate_inventory_sha256: Option<String>,
-    play_counts_sha256: Option<String>,
-    play_count_known_tracks: Option<usize>,
-    play_count_unknown_tracks: Option<usize>,
+    candidate_identities_sha256: Option<String>,
     local_candidate_track_count: Option<usize>,
     semantic_evidence_sha256: String,
     source_track_count: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    guidance_signal_count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    guidance_addon_diagnostics: Vec<guidance::AddonDiagnostic>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 fn aggregate_destination_option_stats(
@@ -566,6 +600,10 @@ struct RouteArtifact {
     database_sha256: String,
     learned_matrix_sha256: String,
     semantic_evidence_sha256: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    guidance_addon_diagnostics: Vec<guidance::AddonDiagnostic>,
+    #[serde(skip_serializing_if = "is_zero")]
+    guidance_signal_count: usize,
     algorithm_requested: String,
     learned_percent: u16,
     seed_limit: usize,
@@ -646,6 +684,10 @@ struct BridgeAnalysisArtifact {
     retained_candidate_limit: usize,
     semantic_mode: String,
     provider_states: Vec<semantic::ProviderState>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    guidance_addon_diagnostics: Vec<guidance::AddonDiagnostic>,
+    #[serde(skip_serializing_if = "is_zero")]
+    guidance_signal_count: usize,
     gaps: Vec<BridgeGapArtifact>,
     selection_preview: SelectionPreviewArtifact,
     scoring_provenance: ScoringProvenanceArtifact,
@@ -839,6 +881,8 @@ struct BridgeCandidateArtifact {
     candidate_id: String,
     semantic_tier: semantic::SemanticTier,
     semantic_evidence: Vec<semantic::MatchedEvidence>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    guidance_contributions: Vec<guidance::AppliedGuidanceContribution>,
     left_distance: f64,
     right_distance: f64,
     left_percentile: f64,
@@ -880,6 +924,8 @@ struct FixedSourceExtensionSelectionArtifact {
     relevance_reference_track_count: usize,
     relevance_summary: FixedSourceExtensionRelevanceSummaryArtifact,
     route_summary: FixedSourceExtensionRouteSummaryArtifact,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guidance_candidate_pool: Option<FixedSourceGuidanceCandidatePoolArtifact>,
     acceptance_proofs: FixedSourceExtensionAcceptanceProofsArtifact,
     final_sequence: Vec<PreviewSequenceEntryArtifact>,
     selected_additions: Vec<FixedSourceExtensionAdditionArtifact>,
@@ -919,6 +965,8 @@ struct FixedSourceExtensionAdditionArtifact {
     semantic_pool: semantic::SemanticPool,
     semantic_tier: semantic::SemanticTier,
     semantic_evidence: Vec<semantic::MatchedEvidence>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    guidance_contributions: Vec<guidance::AppliedGuidanceContribution>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -926,6 +974,7 @@ struct FixedSourceExtensionAddition {
     candidate: usize,
     relevance_distance: f64,
     semantics: semantic::CandidateSemantics,
+    guidance_contributions: Vec<guidance::AppliedGuidanceContribution>,
 }
 
 struct FixedSourceExtensionResult {
@@ -933,19 +982,120 @@ struct FixedSourceExtensionResult {
     additions: Vec<FixedSourceExtensionAddition>,
     selected_strategy: &'static str,
     route_metrics: route::RouteMetrics,
+    guidance_candidate_pool: Option<FixedSourceGuidanceCandidatePoolArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct FixedSourceGuidanceCandidatePoolArtifact {
+    bliss_ranked_candidate_count: usize,
+    baseline_candidate_pool_count: usize,
+    provider_scored_candidate_count: usize,
+    selected_candidate_pool_count: usize,
+    expanded_for_target_support: bool,
+    target_channels: Vec<guidance::TargetShareDiagnostic>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FixedSourceGuidancePoolPlan {
+    baseline_limit: usize,
+    provider_scored_limit: usize,
+    selection_limit: usize,
+    expanded_for_target_support: bool,
+}
+
+fn fixed_source_guidance_pool_plan(
+    maximum_requested: usize,
+    shortlist_limit: usize,
+    variation_percent: u8,
+    weights: &guidance::GuidanceWeights,
+    candidates: &[usize],
+    contributions: &BTreeMap<usize, Vec<guidance::AppliedGuidanceContribution>>,
+) -> FixedSourceGuidancePoolPlan {
+    let guidance_enabled = weights.is_enabled();
+    let mut baseline_limit = if variation_percent == 0 && !guidance_enabled {
+        maximum_requested
+    } else {
+        maximum_requested.saturating_mul(TARGET_GUIDANCE_DISCOVERY_MULTIPLIER)
+    }
+    .min(shortlist_limit)
+    .min(candidates.len());
+
+    if !weights.has_target_shares() {
+        return FixedSourceGuidancePoolPlan {
+            baseline_limit,
+            provider_scored_limit: baseline_limit,
+            selection_limit: baseline_limit,
+            expanded_for_target_support: false,
+        };
+    }
+
+    // The caller-facing shortlist is the normal acoustic working set. Last.fm
+    // target shares need a wider, but still finite, Bliss-ranked discovery
+    // batch: otherwise an empty first 256 candidates makes a target inert.
+    baseline_limit = baseline_limit
+        .max(maximum_requested.saturating_mul(TARGET_GUIDANCE_DISCOVERY_MULTIPLIER))
+        .min(candidates.len());
+    let provider_scored_limit = baseline_limit
+        .max(
+            shortlist_limit
+                .saturating_mul(TARGET_GUIDANCE_DISCOVERY_MULTIPLIER)
+                .min(MAX_TARGET_GUIDANCE_DISCOVERY_CANDIDATES),
+        )
+        .min(candidates.len());
+    let selection_limit = weights.target_share_minimum_pool_limit(
+        &candidates[..provider_scored_limit],
+        contributions,
+        maximum_requested,
+        baseline_limit,
+    );
+    FixedSourceGuidancePoolPlan {
+        baseline_limit,
+        provider_scored_limit,
+        selection_limit,
+        expanded_for_target_support: selection_limit > baseline_limit,
+    }
+}
+
+/// Returns the relative draw weight for a varied fixed-source addition.
+///
+/// Target-share multipliers are derived from BlissMixer's DSTM-style rank
+/// curve (top of the bounded Bliss pool is 1.0, bottom is 0.1). The varied
+/// path must use that same curve. Using an absolute-rank exponential here
+/// would make a supported candidate discovered hundreds of positions down the
+/// intentionally expanded pool practically impossible to draw.
+fn fixed_source_variation_candidate_weight(
+    rank: usize,
+    pool_size: usize,
+    target_share_weight: f64,
+    provider_adjustment: f64,
+) -> f64 {
+    let rank_fraction = if pool_size > 1 {
+        rank as f64 / (pool_size - 1) as f64
+    } else {
+        0.0
+    };
+    let acoustic_weight = (-std::f64::consts::LN_10 * rank_fraction).exp();
+    let provider_weight = (2.0 * provider_adjustment).exp();
+    (acoustic_weight * provider_weight * target_share_weight).max(1e-12)
 }
 
 struct FixedSourceExtensionContext<'a> {
-    semantic_candidate_lookup: &'a semantic::CandidateLookup,
-    semantic_candidate_count: usize,
-    source_semantic_identities: &'a [semantic::TrackIdentity],
-    semantic_bundle: &'a semantic::EvidenceBundle,
     tracks: &'a [route::RouteTrack],
     learned_matrix: &'a Array2<f32>,
     route_config: &'a route::SearchConfig,
     selection: SelectionSettings,
     shortlist_limit: usize,
+    guidance: Option<FixedSourceGuidance<'a>>,
     progress: &'a mut ProgressReporter,
+}
+
+struct FixedSourceGuidance<'a> {
+    host: &'a mut guidance::GuidanceHost,
+    job_id: &'a str,
+    source_anchor_ids: Vec<String>,
+    library: &'a Library,
+    candidate_urlmd5: &'a HashMap<usize, String>,
+    weights: &'a guidance::GuidanceWeights,
 }
 
 fn place_fixed_source_extension_additions_preserving_source_order(
@@ -1377,14 +1527,11 @@ struct ValidatedRequest {
     semantic_bundle: semantic::EvidenceBundle,
     library: Option<Library>,
     local_candidate_rows: Option<HashSet<u64>>,
+    candidate_urlmd5: HashMap<usize, String>,
     database_cache: &'static str,
+    guidance_host: guidance::GuidanceHost,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct PlayCountStats {
-    known: usize,
-    unknown: usize,
-}
 #[derive(Debug, Serialize)]
 struct CommandFailure {
     schema_version: u8,
@@ -1481,6 +1628,12 @@ fn effective_adaptive_matrix(
 }
 fn usage() -> &'static str {
     "Usage:\n  bliss-playlist-optimizer version [--json]\n  bliss-playlist-optimizer validate --request <request.json>\n  bliss-playlist-optimizer score --request <request.json>\n  bliss-playlist-optimizer route --request <request.json> [--timings] [--cache-dir <directory>] [--progress <progress.json>] [--trusted-request]\n  bliss-playlist-optimizer bridge --request <request.json> [--timings] [--cache-dir <directory>] [--progress <progress.json>] [--trusted-request]"
+}
+
+fn version_metadata_json() -> String {
+    format!(
+        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"guidance_spi_v2\":true}}"
+    )
 }
 
 fn parse_request_command(args: &[String]) -> Option<(&str, &Path, RuntimeOptions)> {
@@ -1741,89 +1894,97 @@ fn load_local_candidate_inventory(
     Ok((rows, hash))
 }
 
-fn load_play_counts(
+fn load_candidate_identities(
     artifact: &Artifact,
     database_artifact: &Artifact,
-    library: &mut Library,
-    validate_contracts: bool,
-) -> Result<(String, PlayCountStats), CommandFailure> {
-    if artifact.schema_identity.as_deref() != Some("lms-play-counts-v1") {
+    library: &Library,
+    allowed_rows: &HashSet<u64>,
+) -> Result<(HashMap<usize, String>, String), CommandFailure> {
+    if artifact.schema_identity.as_deref() != Some("eligible-candidate-identities-v1") {
         return Err(CommandFailure::new(
-            "PLAY_COUNTS_SCHEMA_MISMATCH",
-            "artifacts.play_counts must declare lms-play-counts-v1",
+            "CANDIDATE_IDENTITIES_SCHEMA_MISMATCH",
+            "artifacts.candidate_identities must declare eligible-candidate-identities-v1",
         ));
     }
     let database_identity = database_artifact.cache_identity.as_deref().ok_or_else(|| {
         CommandFailure::new(
-            "PLAY_COUNTS_DATABASE_IDENTITY_REQUIRED",
-            "the database cache identity is required when play counts are supplied",
+            "CANDIDATE_IDENTITIES_DATABASE_IDENTITY_REQUIRED",
+            "the database cache identity is required when candidate identities are supplied",
         )
     })?;
-    let (bytes, hash) = read_artifact(artifact, "play counts")?;
-    let value = parse_json(&bytes, "play counts")?;
-    if validate_contracts {
-        validate_json(&value, PLAY_COUNTS_SCHEMA, "play counts")?;
-    }
-    let inventory: PlayCountInventory = serde_json::from_value(value).map_err(|error| {
-        CommandFailure::new(
-            "PLAY_COUNTS_INVALID",
-            format!("failed to decode play counts: {error}"),
-        )
-    })?;
-    if inventory.schema_identity != "lms-play-counts-v1" {
+    let (bytes, hash) = read_artifact(artifact, "candidate identities")?;
+    let inventory: CandidateIdentityInventory =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            CommandFailure::new(
+                "CANDIDATE_IDENTITIES_INVALID",
+                format!("failed to decode candidate identities: {error}"),
+            )
+        })?;
+    if inventory.schema_identity != "eligible-candidate-identities-v1" {
         return Err(CommandFailure::new(
-            "PLAY_COUNTS_SCHEMA_MISMATCH",
-            "the play-count payload has an unsupported schema identity",
+            "CANDIDATE_IDENTITIES_SCHEMA_MISMATCH",
+            "the candidate-identity payload has an unsupported schema identity",
         ));
     }
     if inventory.database_cache_identity != database_identity {
         return Err(CommandFailure::new(
-            "PLAY_COUNTS_DATABASE_MISMATCH",
-            "the play-count snapshot was generated for a different bliss.db identity",
+            "CANDIDATE_IDENTITIES_DATABASE_MISMATCH",
+            "candidate identities were generated for a different bliss.db identity",
         ));
     }
-
-    let mut by_file = HashMap::new();
-    for track in inventory.tracks {
-        if by_file
-            .insert(track.database_file.clone(), track.play_count)
-            .is_some()
+    let row_to_index = library
+        .metadata
+        .iter()
+        .enumerate()
+        .map(|(index, metadata)| (metadata.row_id, index))
+        .collect::<HashMap<_, _>>();
+    let mut identities = HashMap::new();
+    let mut candidate_ids = HashSet::new();
+    let mut row_ids = HashSet::new();
+    for identity in inventory.candidates {
+        if !candidate_ids.insert(identity.candidate_id.clone()) || !row_ids.insert(identity.row_id)
         {
             return Err(CommandFailure::new(
-                "PLAY_COUNTS_INVALID",
-                format!("duplicate play-count identity '{}'", track.database_file),
+                "CANDIDATE_IDENTITIES_DUPLICATE",
+                "candidate identities contain a duplicate candidate or Bliss row ID",
             ));
         }
+        if identity.candidate_id != bridge_candidate_id(identity.row_id) {
+            return Err(CommandFailure::new(
+                "CANDIDATE_IDENTITIES_ROW_MISMATCH",
+                "candidate identity does not match its Bliss row ID",
+            ));
+        }
+        if !allowed_rows.contains(&identity.row_id) {
+            return Err(CommandFailure::new(
+                "CANDIDATE_IDENTITIES_NONLOCAL_ROW",
+                "candidate identities contain a row outside the selected local candidate library",
+            ));
+        }
+        let index = row_to_index.get(&identity.row_id).copied().ok_or_else(|| {
+            CommandFailure::new(
+                "CANDIDATE_IDENTITIES_UNKNOWN_ROW",
+                "candidate identities contain an unknown or unusable Bliss row",
+            )
+        })?;
+        let urlmd5 = identity
+            .lms_urlmd5
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                CommandFailure::new(
+                    "CANDIDATE_IDENTITIES_URLMD5_REQUIRED",
+                    "candidate identities require an LMS URLMD5 for every eligible row",
+                )
+            })?;
+        identities.insert(index, urlmd5);
     }
-    let values = by_file.values().copied().collect::<Vec<_>>();
-    let known = values.iter().filter(|value| value.is_some()).count();
-    let unknown = values.len().saturating_sub(known);
-    let counts = values
-        .iter()
-        .map(|value| value.unwrap_or(0))
-        .collect::<Vec<_>>();
-    let mut sorted = counts.clone();
-    sorted.sort_unstable();
-    let denominator = sorted.len().saturating_sub(1) as f64;
-    let mut percentile_by_count = HashMap::new();
-    for count in counts {
-        let percentile = if denominator == 0.0 {
-            0.0
-        } else {
-            let first = sorted.partition_point(|value| *value < count);
-            let after = sorted.partition_point(|value| *value <= count);
-            let average_rank = (first + after.saturating_sub(1)) as f64 / 2.0;
-            2.0 * (average_rank / denominator) - 1.0
-        };
-        percentile_by_count.insert(count, percentile);
+    if identities.len() != allowed_rows.len() {
+        return Err(CommandFailure::new(
+            "CANDIDATE_IDENTITIES_INCOMPLETE",
+            "candidate identities do not cover every selected local candidate row",
+        ));
     }
-    for (index, metadata) in library.metadata.iter().enumerate() {
-        let Some(value) = by_file.get(&metadata.file) else {
-            continue;
-        };
-        library.tracks[index].play_count_percentile = percentile_by_count[&value.unwrap_or(0)];
-    }
-    Ok((hash, PlayCountStats { known, unknown }))
+    Ok((identities, hash))
 }
 
 fn validate_json(
@@ -1927,7 +2088,7 @@ fn prepare_runtime_request(
         .and_then(|cache_dir| load_library_cache(cache_dir, &request.artifacts.database));
     timings.record("database_cache_read", started.elapsed());
 
-    let (database_sha256, mut library, database_cache) = if let Some(cache) = cached {
+    let (database_sha256, library, database_cache) = if let Some(cache) = cached {
         (cache.database_sha256, Some(cache.library), "hit")
     } else {
         progress.update("database_hash", "Hashing Bliss database", None, None);
@@ -2009,29 +2170,34 @@ fn prepare_runtime_request(
         };
     timings.record("local_candidate_inventory_load", started.elapsed());
 
-    let (play_counts_sha256, play_count_stats) =
-        if let Some(play_counts) = &request.artifacts.play_counts {
-            progress.update("play_counts_load", "Loading LMS play counts", None, None);
-            let started = Instant::now();
-            let (hash, stats) = load_play_counts(
-                play_counts,
+    progress.update(
+        "candidate_identities_load",
+        "Loading provider candidate identities",
+        None,
+        None,
+    );
+    let started = Instant::now();
+    let (candidate_urlmd5, candidate_identities_sha256) =
+        if let Some(identities) = &request.artifacts.candidate_identities {
+            let allowed_rows = local_candidate_rows.as_ref().ok_or_else(|| {
+                CommandFailure::new(
+                    "CANDIDATE_IDENTITIES_LOCAL_INVENTORY_REQUIRED",
+                    "candidate identities require artifacts.local_candidate_inventory",
+                )
+            })?;
+            let (identities, hash) = load_candidate_identities(
+                identities,
                 &request.artifacts.database,
                 library
-                    .as_mut()
+                    .as_ref()
                     .expect("runtime preparation always loads the library"),
-                options.validate_contracts,
+                allowed_rows,
             )?;
-            timings.record("play_counts_load", started.elapsed());
-            (Some(hash), Some(stats))
+            (identities, Some(hash))
         } else {
-            if request.selection.playcount_influence != 0 {
-                return Err(CommandFailure::new(
-                    "PLAY_COUNTS_REQUIRED",
-                    "non-zero selection.playcount_influence requires artifacts.play_counts",
-                ));
-            }
-            (None, None)
+            (HashMap::new(), None)
         };
+    timings.record("candidate_identities_load", started.elapsed());
 
     progress.update("learned_matrix_load", "Loading scoring matrix", None, None);
     let started = Instant::now();
@@ -2158,6 +2324,33 @@ fn prepare_runtime_request(
     }
     timings.record("source_resolution", started.elapsed());
 
+    // Start optional guidance providers only after the request, database, and
+    // Source identities have passed validation. Providers receive only stable
+    // route anchors at preparation time; the planners later send their bounded
+    // acoustic shortlists at their shared ranking boundary.
+    let guidance_anchors = request
+        .source_tracks
+        .iter()
+        .chain(request.history_tracks.iter())
+        .map(|track| bliss_playlist_guidance_spi::Anchor {
+            anchor_id: track.id.clone(),
+            track: bliss_playlist_guidance_spi::Candidate {
+                candidate_id: track.id.clone(),
+                lms_urlmd5: None,
+                database_file: track.database_file.clone(),
+                title: track.title.clone(),
+                artist: track.artist.clone(),
+                album: track.album.clone(),
+                recording_mbid: track.recording_mbid.clone(),
+                artist_mbids: track.artist_mbids.clone(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut guidance_host = guidance::GuidanceHost::start(&request.guidance_addons);
+    guidance_host.prepare(&request.job_id, guidance_anchors);
+    let guidance_signal_count = 0;
+    let guidance_addon_diagnostics = guidance_host.diagnostics.clone();
+
     let summary = ValidationSummary {
         schema_version: 1,
         program: PROGRAM,
@@ -2169,12 +2362,12 @@ fn prepare_runtime_request(
         database_sha256,
         learned_matrix_sha256,
         local_candidate_inventory_sha256,
-        play_counts_sha256,
-        play_count_known_tracks: play_count_stats.map(|stats| stats.known),
-        play_count_unknown_tracks: play_count_stats.map(|stats| stats.unknown),
+        candidate_identities_sha256,
         local_candidate_track_count: local_candidate_rows.as_ref().map(HashSet::len),
         semantic_evidence_sha256,
         source_track_count: request.source_tracks.len(),
+        guidance_addon_diagnostics: guidance_addon_diagnostics.clone(),
+        guidance_signal_count,
     };
     Ok(ValidatedRequest {
         summary,
@@ -2183,7 +2376,9 @@ fn prepare_runtime_request(
         semantic_bundle,
         library: Some(library),
         local_candidate_rows,
+        candidate_urlmd5,
         database_cache,
+        guidance_host,
     })
 }
 
@@ -2212,9 +2407,7 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         .quick_check()
         .map_err(|error| CommandFailure::new("DATABASE_INTEGRITY_FAILED", error.to_string()))?;
 
-    let mut validation_library = if request.artifacts.local_candidate_inventory.is_some()
-        || request.artifacts.play_counts.is_some()
-    {
+    let validation_library = if request.artifacts.local_candidate_inventory.is_some() {
         Some(load_usable_library(&database)?)
     } else {
         None
@@ -2233,27 +2426,6 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         } else {
             (None, None)
         };
-    let (play_counts_sha256, play_count_stats) =
-        if let Some(play_counts) = &request.artifacts.play_counts {
-            let (hash, stats) = load_play_counts(
-                play_counts,
-                &request.artifacts.database,
-                validation_library
-                    .as_mut()
-                    .expect("validation library loaded"),
-                true,
-            )?;
-            (Some(hash), Some(stats))
-        } else {
-            if request.selection.playcount_influence != 0 {
-                return Err(CommandFailure::new(
-                    "PLAY_COUNTS_REQUIRED",
-                    "non-zero selection.playcount_influence requires artifacts.play_counts",
-                ));
-            }
-            (None, None)
-        };
-
     let learned_matrix_sha256 = if let Some(matrix) = &request.artifacts.learned_matrix {
         let (_, hash) = read_artifact(matrix, "learned matrix")?;
         bliss_mixer_core::matrix::load_learned_matrix(&matrix.path)
@@ -2351,12 +2523,12 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         database_sha256,
         learned_matrix_sha256,
         local_candidate_inventory_sha256,
-        play_counts_sha256,
-        play_count_known_tracks: play_count_stats.map(|stats| stats.known),
-        play_count_unknown_tracks: play_count_stats.map(|stats| stats.unknown),
+        candidate_identities_sha256: None,
         local_candidate_track_count: local_candidate_rows.as_ref().map(HashSet::len),
         semantic_evidence_sha256,
         source_track_count: request.source_tracks.len(),
+        guidance_addon_diagnostics: Vec::new(),
+        guidance_signal_count: 0,
     })
 }
 
@@ -2513,7 +2685,6 @@ fn load_usable_library(database: &BlissDatabase) -> Result<Library, CommandFailu
             features,
             artist_key,
             album_key,
-            play_count_percentile: 0.0,
         });
     }
     Ok(Library {
@@ -2524,6 +2695,83 @@ fn load_usable_library(database: &BlissDatabase) -> Result<Library, CommandFailu
 
 fn bridge_candidate_id(row_id: u64) -> String {
     format!("bliss-row-{row_id}")
+}
+
+/// Requests optional provider guidance for one already membership-checked,
+/// acoustically short-listed source gap.  The provider receives no candidate
+/// outside that shortlist; an unavailable identity simply leaves the
+/// candidate without provider-specific metadata.
+struct GuidanceRuntime<'a> {
+    host: &'a mut guidance::GuidanceHost,
+    library: &'a Library,
+    candidate_urlmd5: &'a HashMap<usize, String>,
+    weights: &'a guidance::GuidanceWeights,
+}
+
+fn score_guidance_for_gap(
+    runtime: &mut GuidanceRuntime<'_>,
+    job_id: &str,
+    left_anchor_id: &str,
+    right_anchor_id: &str,
+    candidates: &[usize],
+) -> guidance::GuidanceBatch {
+    score_guidance(
+        runtime.host,
+        &format!("{job_id}:gap:{left_anchor_id}:{right_anchor_id}"),
+        bliss_playlist_guidance_spi::ScoreContext {
+            scope: bliss_playlist_guidance_spi::GuidanceScope::Edge,
+            left_anchor_id: Some(left_anchor_id.to_owned()),
+            right_anchor_id: Some(right_anchor_id.to_owned()),
+            context_track_ids: vec![left_anchor_id.to_owned(), right_anchor_id.to_owned()],
+        },
+        candidates,
+        runtime.library,
+        runtime.candidate_urlmd5,
+        runtime.weights,
+    )
+}
+
+fn score_guidance(
+    host: &mut guidance::GuidanceHost,
+    request_id: &str,
+    context: bliss_playlist_guidance_spi::ScoreContext,
+    candidates: &[usize],
+    library: &Library,
+    candidate_urlmd5: &HashMap<usize, String>,
+    weights: &guidance::GuidanceWeights,
+) -> guidance::GuidanceBatch {
+    let mut ordered = candidates.to_vec();
+    ordered.sort_by_key(|candidate| library.metadata(*candidate).row_id);
+    ordered.dedup();
+    let candidate_index = ordered
+        .iter()
+        .map(|candidate| {
+            (
+                bridge_candidate_id(library.metadata(*candidate).row_id),
+                *candidate,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let provider_candidates = ordered
+        .iter()
+        .map(|candidate| bliss_playlist_guidance_spi::Candidate {
+            candidate_id: bridge_candidate_id(library.metadata(*candidate).row_id),
+            lms_urlmd5: candidate_urlmd5.get(candidate).cloned(),
+            database_file: None,
+            title: None,
+            artist: None,
+            album: None,
+            recording_mbid: None,
+            artist_mbids: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    host.score(
+        request_id,
+        context,
+        provider_candidates,
+        weights,
+        &candidate_index,
+    )
 }
 
 fn source_semantic_identity(
@@ -2574,12 +2822,14 @@ fn candidate_semantic_identity(
 fn bridge_candidate_artifact(
     evaluation: &bridge::BridgeCandidateEvaluation,
     semantics: &semantic::CandidateSemantics,
+    guidance_contributions: Vec<guidance::AppliedGuidanceContribution>,
     library: &Library,
 ) -> BridgeCandidateArtifact {
     BridgeCandidateArtifact {
         candidate_id: bridge_candidate_id(library.metadata(evaluation.candidate).row_id),
         semantic_tier: semantics.tier,
         semantic_evidence: semantics.evidence.clone(),
+        guidance_contributions,
         left_distance: evaluation.left_distance,
         right_distance: evaluation.right_distance,
         left_percentile: evaluation.left_percentile,
@@ -2612,15 +2862,12 @@ fn select_fixed_source_extension(
     context: FixedSourceExtensionContext<'_>,
 ) -> Result<FixedSourceExtensionResult, CommandFailure> {
     let FixedSourceExtensionContext {
-        semantic_candidate_lookup,
-        semantic_candidate_count,
-        source_semantic_identities,
-        semantic_bundle,
         tracks,
         learned_matrix,
         route_config,
         selection,
         shortlist_limit,
+        mut guidance,
         progress,
     } = context;
     if target_track_count <= source_library_indices.len() {
@@ -2725,75 +2972,99 @@ fn select_fixed_source_extension(
             .then_with(|| left.0.cmp(&right.0))
     });
 
-    // Variation is deliberately downstream of the scoring strategy. Any
-    // current or future strategy only needs to provide a scalar relevance
-    // ordering; this selector owns reproducible membership diversity.
-    progress.update(
-        "extension_semantic_guidance",
-        format!(
-            "Applying caller-resolved candidate guidance to {} addition candidates and {} evidence edges",
-            semantic_candidate_count,
-            semantic_bundle.edges.len()
-        ),
-        None,
-        None,
+    // Variation is deliberately downstream of Bliss relevance. Optional
+    // providers only reorder a bounded, quality-controlled pool. A target
+    // share receives a wider Bliss-ranked discovery batch first, then narrows
+    // back to the smallest prefix that contains enough supported candidates.
+    let guidance_weights = guidance
+        .as_ref()
+        .map(|guidance| guidance.weights.clone())
+        .unwrap_or_default();
+    let guidance_enabled = guidance_weights.is_enabled();
+    let ranked_candidate_ids = ranked.iter().map(|entry| entry.0).collect::<Vec<_>>();
+    let no_contributions = BTreeMap::new();
+    let discovery_plan = fixed_source_guidance_pool_plan(
+        maximum_requested,
+        shortlist_limit,
+        selection.variation_percent,
+        &guidance_weights,
+        &ranked_candidate_ids,
+        &no_contributions,
     );
-    let semantic_candidate_matches = semantic::select_seed_candidate_matches(
-        semantic_bundle,
-        source_semantic_identities,
-        semantic_candidate_lookup,
-    );
-    let recording_supported = semantic_candidate_matches
-        .iter()
-        .filter(|candidate| {
-            candidate
-                .evidence
-                .iter()
-                .any(|evidence| evidence.kind == semantic::EntityKind::Recording)
-        })
-        .count();
-    let artist_supported = semantic_candidate_matches
-        .iter()
-        .filter(|candidate| {
-            candidate
-                .evidence
-                .iter()
-                .any(|evidence| evidence.kind == semantic::EntityKind::Artist)
-        })
-        .count();
-    progress.update(
-        "extension_semantic_guidance",
-        format!(
-            "Matched caller guidance: {recording_supported} candidate tracks supported by recording similarity, {artist_supported} candidate tracks supported by artist similarity"
-        ),
-        Some(semantic_candidate_count),
-        Some(semantic_candidate_count),
-    );
-    let semantic_candidates_by_id = semantic_candidate_matches
-        .into_iter()
-        .map(|candidate| (candidate.candidate, candidate))
-        .collect::<HashMap<_, _>>();
-
-    let guidance_enabled = selection.recording_guidance_percent > 0
-        || selection.artist_guidance_percent > 0
-        || selection.playcount_influence != 0;
-    let pool_limit = if selection.variation_percent == 0 && !guidance_enabled {
-        maximum_requested
-    } else {
-        maximum_requested.saturating_mul(10).max(maximum_requested)
-    }
-    .min(shortlist_limit)
-    .min(ranked.len());
     progress.update(
         "extension_selection_pool",
         format!(
-            "Preparing quality-controlled addition pool: {pool_limit}/{} candidates",
-            ranked.len()
+            "Preparing Bliss-ranked guidance discovery pool: {}/{} candidates",
+            discovery_plan.provider_scored_limit,
+            ranked.len(),
         ),
-        Some(pool_limit),
+        Some(discovery_plan.provider_scored_limit),
         Some(ranked.len()),
     );
+    let provider_guidance = guidance
+        .as_mut()
+        .map(|guidance| {
+            score_guidance(
+                guidance.host,
+                &format!("{}:fixed-source", guidance.job_id),
+                bliss_playlist_guidance_spi::ScoreContext {
+                    scope: bliss_playlist_guidance_spi::GuidanceScope::Global,
+                    left_anchor_id: None,
+                    right_anchor_id: None,
+                    context_track_ids: guidance.source_anchor_ids.clone(),
+                },
+                &ranked[..discovery_plan.provider_scored_limit]
+                    .iter()
+                    .map(|entry| entry.0)
+                    .collect::<Vec<_>>(),
+                guidance.library,
+                guidance.candidate_urlmd5,
+                guidance.weights,
+            )
+        })
+        .unwrap_or_default();
+    let provider_adjustments = provider_guidance.adjustment_by_candidate;
+    let provider_contributions = provider_guidance.contributions_by_candidate;
+    let selection_plan = fixed_source_guidance_pool_plan(
+        maximum_requested,
+        shortlist_limit,
+        selection.variation_percent,
+        &guidance_weights,
+        &ranked_candidate_ids,
+        &provider_contributions,
+    );
+    let pool_limit = selection_plan.selection_limit;
+    if selection_plan.expanded_for_target_support {
+        progress.update(
+            "extension_selection_pool",
+            format!(
+                "Expanded Bliss-qualified addition pool to {pool_limit} candidates so configured guidance targets have supported alternatives"
+            ),
+            Some(pool_limit),
+            Some(discovery_plan.provider_scored_limit),
+        );
+    }
+    let guidance_candidate_pool =
+        guidance_enabled.then(|| FixedSourceGuidanceCandidatePoolArtifact {
+            bliss_ranked_candidate_count: ranked.len(),
+            baseline_candidate_pool_count: selection_plan.baseline_limit,
+            provider_scored_candidate_count: discovery_plan.provider_scored_limit,
+            selected_candidate_pool_count: pool_limit,
+            expanded_for_target_support: selection_plan.expanded_for_target_support,
+            target_channels: guidance_weights.target_share_diagnostics(
+                &ranked_candidate_ids[..pool_limit],
+                &provider_contributions,
+            ),
+        });
     let mut selection_order = ranked[..pool_limit].to_vec();
+    let target_share_weights = guidance_weights.target_share_weights(
+        &selection_order
+            .iter()
+            .map(|entry| entry.0)
+            .collect::<Vec<_>>(),
+        &provider_contributions,
+    );
+    let has_target_shares = guidance_weights.has_target_shares();
     if selection.variation_percent > 0 {
         progress.update(
             "extension_selection_pool",
@@ -2804,29 +3075,26 @@ fn select_fixed_source_extension(
             Some(pool_limit),
         );
         let variation = f64::from(selection.variation_percent) / 100.0;
-        let temperature = (maximum_requested.max(1) as f64 * (0.25 + 9.75 * variation)).max(1.0);
         let mut rng = StdRng::seed_from_u64(selection.generation_seed);
+        let pool_size = selection_order.len();
         let mut sampled = selection_order
             .into_iter()
             .enumerate()
             .map(|(rank, entry)| {
-                let acoustic_weight = (-(rank as f64) / temperature).exp().max(1e-12);
-                let guidance = semantic_candidates_by_id
-                    .get(&entry.0)
-                    .map(|candidate| {
-                        candidate.seed_guidance_score(
-                            selection.recording_guidance_percent,
-                            selection.artist_guidance_percent,
-                        )
-                    })
-                    .unwrap_or(0.0);
-                let semantic_weight = (2.0 * guidance).exp();
-                let playcount_weight = (std::f64::consts::LN_10
-                    * (f64::from(selection.playcount_influence) / 100.0)
-                    * tracks[entry.0].play_count_percentile)
-                    .exp();
+                let target_share_weight =
+                    target_share_weights.get(&entry.0).copied().unwrap_or(1.0);
+                let guidance_weight = fixed_source_variation_candidate_weight(
+                    rank,
+                    pool_size,
+                    target_share_weight,
+                    provider_adjustments.get(&entry.0).copied().unwrap_or(0.0),
+                );
                 let uniform = rng.gen::<f64>().max(f64::MIN_POSITIVE);
-                let key = -uniform.ln() / (acoustic_weight * semantic_weight * playcount_weight);
+                // Variation changes the random draw, not the target-share
+                // calculation. Its small temperature exponent keeps greater
+                // variation from collapsing the candidate choice back to the
+                // very top of the Bliss-ranked pool.
+                let key = -uniform.ln() / guidance_weight.powf(1.0 - variation * 0.5);
                 (key, rank, entry)
             })
             .collect::<Vec<_>>();
@@ -2845,27 +3113,34 @@ fn select_fixed_source_extension(
             Some(0),
             Some(pool_limit),
         );
-        // With zero Variation the result stays deterministic. Guidance may
-        // move an endorsed track up by at most 20% of this Bliss-qualified
-        // pool; it cannot import or rescue a candidate outside the pool.
-        let maximum_shift = selection_order.len() as f64 * 0.20;
+        // With zero Variation the result remains deterministic. Target-share
+        // multipliers mirror DSTM's acoustic base curve inside the same
+        // Bliss-qualified pool; unconfigured channels retain the historical
+        // bounded provider adjustment.
+        let pool_size = selection_order.len();
+        let maximum_shift = pool_size as f64 * 0.20;
         let mut guided = selection_order
             .into_iter()
             .enumerate()
             .map(|(rank, entry)| {
-                let guidance = semantic_candidates_by_id
-                    .get(&entry.0)
-                    .map(|candidate| {
-                        candidate.seed_guidance_score(
-                            selection.recording_guidance_percent,
-                            selection.artist_guidance_percent,
-                        )
-                    })
-                    .unwrap_or(0.0);
-                let playcount_preference = (f64::from(selection.playcount_influence) / 100.0)
-                    * tracks[entry.0].play_count_percentile;
+                let provider_guidance = provider_adjustments.get(&entry.0).copied().unwrap_or(0.0);
+                let historical_rank = rank as f64 - maximum_shift * provider_guidance;
+                let rank_fraction = if pool_size > 1 {
+                    rank as f64 / (pool_size - 1) as f64
+                } else {
+                    0.0
+                };
+                let acoustic_weight = (-std::f64::consts::LN_10 * rank_fraction).exp();
+                let target_share_weight =
+                    target_share_weights.get(&entry.0).copied().unwrap_or(1.0);
+                let target_rank =
+                    -(acoustic_weight * target_share_weight).ln() - 2.0 * provider_guidance;
                 (
-                    rank as f64 - maximum_shift * (guidance + playcount_preference),
+                    if has_target_shares {
+                        target_rank
+                    } else {
+                        historical_rank
+                    },
                     rank,
                     entry,
                 )
@@ -2974,14 +3249,15 @@ fn select_fixed_source_extension(
             additions.push(FixedSourceExtensionAddition {
                 candidate,
                 relevance_distance: distance,
-                semantics: semantic_candidates_by_id
+                semantics: semantic::CandidateSemantics {
+                    candidate,
+                    tier: semantic::SemanticTier::BlissOnly,
+                    evidence: Vec::new(),
+                },
+                guidance_contributions: provider_contributions
                     .get(&candidate)
                     .cloned()
-                    .unwrap_or_else(|| semantic::CandidateSemantics {
-                        candidate,
-                        tier: semantic::SemanticTier::BlissOnly,
-                        evidence: Vec::new(),
-                    }),
+                    .unwrap_or_default(),
             });
             *artist_counts.entry(artist).or_default() += 1;
             *album_counts.entry(album).or_default() += 1;
@@ -3130,6 +3406,7 @@ fn select_fixed_source_extension(
             additions,
             selected_strategy,
             route_metrics,
+            guidance_candidate_pool,
         });
     }
     Err(last_failure)
@@ -3156,7 +3433,9 @@ fn optimize_route_request_with_options(
         semantic_bundle: _,
         library,
         local_candidate_rows: _,
+        candidate_urlmd5: _,
         database_cache,
+        guidance_host: _,
     } = validated;
     if !matches!(request.scoring.algorithm.as_str(), "adaptive" | "static") {
         return Err(CommandFailure::new(
@@ -3262,7 +3541,6 @@ fn optimize_route_request_with_options(
             features: route_track.features,
             artist_key: repeat_key(&artist),
             album_key: repeat_key(&album),
-            play_count_percentile: route_track.play_count_percentile,
         });
     }
     timings.record("source_track_materialization", started.elapsed());
@@ -3371,6 +3649,8 @@ fn optimize_route_request_with_options(
         database_sha256: validation.database_sha256,
         learned_matrix_sha256: scoring_matrix_sha256,
         semantic_evidence_sha256: validation.semantic_evidence_sha256,
+        guidance_addon_diagnostics: validation.guidance_addon_diagnostics.clone(),
+        guidance_signal_count: validation.guidance_signal_count,
         algorithm_requested: request.scoring.algorithm,
         learned_percent,
         seed_limit,
@@ -3405,9 +3685,12 @@ fn analyze_bridge_validated(
     learned_percent: u16,
     library: Library,
     local_candidate_rows: Option<HashSet<u64>>,
+    candidate_urlmd5: HashMap<usize, String>,
+    guidance_host: &mut guidance::GuidanceHost,
     timings: &mut StageTimings,
     progress: &mut ProgressReporter,
 ) -> Result<BridgeAnalysisArtifact, CommandFailure> {
+    let guidance_weights = guidance::GuidanceWeights::from_policy(&request.guidance_policy);
     let adaptive = request.scoring.adaptive.as_ref().ok_or_else(|| {
         CommandFailure::new(
             "ADAPTIVE_SETTINGS_REQUIRED",
@@ -3559,7 +3842,6 @@ fn analyze_bridge_validated(
             features: route_track.features,
             artist_key,
             album_key,
-            play_count_percentile: route_track.play_count_percentile,
         });
     }
     let mut history_library_indices = Vec::with_capacity(request.history_tracks.len());
@@ -4120,6 +4402,9 @@ fn analyze_bridge_validated(
     let mut gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut preview_gaps = Vec::with_capacity(selected_library_route.len() - 1);
     let mut semantic_assisted = false;
+    let mut guidance_signal_count = 0_usize;
+    let mut guidance_contributions_by_gap =
+        HashMap::<usize, BTreeMap<usize, Vec<guidance::AppliedGuidanceContribution>>>::new();
     let gap_positions = if request.extension.mode == "fixed_source_extension" {
         Vec::new()
     } else if destination_route {
@@ -4177,39 +4462,32 @@ fn analyze_bridge_validated(
         semantic_assisted |= gap_semantics.pool != semantic::SemanticPool::BlissOnly;
         let semantic_candidate_count = eligible_candidates.len();
         let shortlist_started = Instant::now();
+        let mut acoustic_candidate_order = Vec::new();
         if !eligible_candidates.is_empty() {
-            let mut reserved = gap_semantics.candidates.iter().collect::<Vec<_>>();
-            reserved.sort_by(|left, right| {
-                left.compare_priority(right)
-                    .then_with(|| left.candidate.cmp(&right.candidate))
-            });
-            reserved.truncate(SEMANTIC_SHORTLIST_RESERVE.min(shortlist_limit));
-            let mut selected = reserved
-                .iter()
-                .map(|candidate| candidate.candidate)
-                .collect::<HashSet<_>>();
-            let remaining = eligible_candidates
-                .iter()
-                .copied()
-                .filter(|candidate| !selected.contains(candidate))
-                .collect::<Vec<_>>();
-            let acoustic_limit = if eligible_candidates.len() > shortlist_limit {
-                shortlist_limit.saturating_sub(selected.len())
+            let baseline_acoustic_limit = eligible_candidates.len().min(shortlist_limit);
+            // Last.fm target shares use the same minimum 10x Bliss-derived
+            // candidate opportunity as DSTM.  A caller's larger acoustic
+            // shortlist remains intact; guidance still cannot admit a track
+            // outside this Bliss-selected population.
+            let target_acoustic_limit = retained_candidate_limit.saturating_mul(10);
+            let acoustic_limit = if guidance_weights.has_target_shares() {
+                baseline_acoustic_limit.max(target_acoustic_limit)
             } else {
-                remaining.len()
-            };
+                baseline_acoustic_limit
+            }
+            .min(eligible_candidates.len());
             let acoustic = if let Some(distance_index) = distance_index.as_ref() {
                 distance_index.destination_prefilter(
                     selected_library_route[position - 1],
                     selected_library_route[position],
-                    &remaining,
+                    &eligible_candidates,
                     acoustic_limit,
                 )
             } else {
                 bridge::shortlist_candidates(
                     &selected_library_route,
                     position,
-                    &remaining,
+                    &eligible_candidates,
                     acoustic_limit,
                     bridge::ShortlistScoringContext {
                         tracks: bridge_tracks,
@@ -4222,7 +4500,11 @@ fn analyze_bridge_validated(
                     CommandFailure::new("BRIDGE_SHORTLIST_FAILED", error.to_string())
                 })?
             };
-            selected.extend(acoustic);
+            acoustic_candidate_order = acoustic;
+            let selected = acoustic_candidate_order
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
             gap_semantics
                 .candidates
                 .retain(|candidate| selected.contains(&candidate.candidate));
@@ -4243,6 +4525,33 @@ fn analyze_bridge_validated(
         }
         shortlist_elapsed += shortlist_started.elapsed();
         let shortlisted_candidate_count = gap_semantics.candidates.len();
+        if acoustic_candidate_order.is_empty() {
+            acoustic_candidate_order = gap_semantics
+                .candidates
+                .iter()
+                .map(|candidate| candidate.candidate)
+                .collect();
+            acoustic_candidate_order.sort_unstable();
+        }
+        let mut guidance_runtime = GuidanceRuntime {
+            host: guidance_host,
+            library: &library,
+            candidate_urlmd5: &candidate_urlmd5,
+            weights: &guidance_weights,
+        };
+        let guidance_batch = score_guidance_for_gap(
+            &mut guidance_runtime,
+            &request.job_id,
+            &request.source_tracks[left_source_index].id,
+            &request.source_tracks[right_source_index].id,
+            &acoustic_candidate_order,
+        );
+        guidance_signal_count += guidance_batch.observed as usize;
+        let guidance_adjustments = guidance_batch.adjustment_by_candidate;
+        let guidance_contributions = guidance_batch.contributions_by_candidate;
+        let guidance_target_weights = guidance_weights
+            .target_share_weights(&acoustic_candidate_order, &guidance_contributions);
+        guidance_contributions_by_gap.insert(position, guidance_contributions.clone());
         preview_gaps.push(preview::AutomaticGap {
             original_position: position,
             left: selected_library_route[position - 1],
@@ -4250,6 +4559,8 @@ fn analyze_bridge_validated(
             direct_distance,
             direct_percentile,
             semantics: gap_semantics.clone(),
+            guidance_adjustments: guidance_adjustments.clone(),
+            guidance_target_weights: guidance_target_weights.clone(),
         });
         let semantics_by_candidate = gap_semantics
             .candidates
@@ -4273,44 +4584,11 @@ fn analyze_bridge_validated(
         )
         .map_err(|error| CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string()))?;
         strict_scoring_elapsed += scoring_started.elapsed();
-        evaluations.sort_by(|left, right| {
-            right
-                .accepted
-                .cmp(&left.accepted)
-                .then_with(|| {
-                    semantics_by_candidate[&left.candidate]
-                        .adjusted_percentile(
-                            left.max_percentile,
-                            request.selection.recording_guidance_percent,
-                            request.selection.artist_guidance_percent,
-                        )
-                        .total_cmp(
-                            &semantics_by_candidate[&right.candidate].adjusted_percentile(
-                                right.max_percentile,
-                                request.selection.recording_guidance_percent,
-                                request.selection.artist_guidance_percent,
-                            ),
-                        )
-                })
-                .then_with(|| {
-                    semantics_by_candidate[&left.candidate]
-                        .adjusted_percentile(
-                            left.detour_percentile,
-                            request.selection.recording_guidance_percent,
-                            request.selection.artist_guidance_percent,
-                        )
-                        .total_cmp(
-                            &semantics_by_candidate[&right.candidate].adjusted_percentile(
-                                right.detour_percentile,
-                                request.selection.recording_guidance_percent,
-                                request.selection.artist_guidance_percent,
-                            ),
-                        )
-                })
-                .then_with(|| left.max_percentile.total_cmp(&right.max_percentile))
-                .then_with(|| left.detour_percentile.total_cmp(&right.detour_percentile))
-                .then_with(|| left.candidate.cmp(&right.candidate))
-        });
+        preview::sort_guided_evaluations(
+            &mut evaluations,
+            &guidance_adjustments,
+            &guidance_target_weights,
+        );
         let accepted_candidate_count = evaluations
             .iter()
             .filter(|candidate| candidate.accepted)
@@ -4329,6 +4607,10 @@ fn analyze_bridge_validated(
                 bridge_candidate_artifact(
                     candidate,
                     semantics_by_candidate[&candidate.candidate],
+                    guidance_contributions
+                        .get(&candidate.candidate)
+                        .cloned()
+                        .unwrap_or_default(),
                     &library,
                 )
             })
@@ -4424,9 +4706,6 @@ fn analyze_bridge_validated(
                 &preview::AutomaticSelectionConfig {
                     max_added_tracks,
                     trigger_percentile,
-                    recording_guidance_percent: request.selection.recording_guidance_percent,
-                    artist_guidance_percent: request.selection.artist_guidance_percent,
-                    playcount_influence: request.selection.playcount_influence,
                     variation_percent: request.selection.variation_percent,
                     generation_seed: request.selection.generation_seed,
                 },
@@ -4453,6 +4732,13 @@ fn analyze_bridge_validated(
                         bridge_candidate_artifact(
                             &selected.evaluation,
                             &selected.semantics,
+                            guidance_contributions_by_gap
+                                .get(&decision.original_position)
+                                .and_then(|candidates| {
+                                    candidates.get(&selected.evaluation.candidate)
+                                })
+                                .cloned()
+                                .unwrap_or_default(),
                             &library,
                         )
                     }),
@@ -4544,9 +4830,6 @@ fn analyze_bridge_validated(
                         candidate_limit: retained_candidate_limit,
                         beam_width: EXACT_COUNT_BEAM_WIDTH,
                         max_tracks_per_gap,
-                        recording_guidance_percent: request.selection.recording_guidance_percent,
-                        artist_guidance_percent: request.selection.artist_guidance_percent,
-                        playcount_influence: request.selection.playcount_influence,
                         variation_percent: request.selection.variation_percent,
                         generation_seed: request.selection.generation_seed,
                     },
@@ -4651,9 +4934,6 @@ fn analyze_bridge_validated(
                 candidate_limit: retained_candidate_limit,
                 beam_width: destination_beam_width,
                 max_tracks_per_gap: count.max(1),
-                recording_guidance_percent: request.selection.recording_guidance_percent,
-                artist_guidance_percent: request.selection.artist_guidance_percent,
-                playcount_influence: request.selection.playcount_influence,
                 variation_percent: request.selection.variation_percent,
                 generation_seed: request.selection.generation_seed,
             };
@@ -5019,6 +5299,13 @@ fn analyze_bridge_validated(
                         bridge_candidate_artifact(
                             &selected.evaluation,
                             &selected.semantics,
+                            guidance_contributions_by_gap
+                                .get(&decision.original_position)
+                                .and_then(|candidates| {
+                                    candidates.get(&selected.evaluation.candidate)
+                                })
+                                .cloned()
+                                .unwrap_or_default(),
                             &library,
                         )
                     }),
@@ -5149,15 +5436,23 @@ fn analyze_bridge_validated(
                 &eligible_candidates,
                 request.route.ordering_policy == "preserve_order",
                 FixedSourceExtensionContext {
-                    semantic_candidate_lookup: &semantic_candidate_lookup,
-                    semantic_candidate_count: eligible_candidates.len(),
-                    source_semantic_identities: &source_semantic_identities,
-                    semantic_bundle: &semantic_bundle,
                     tracks: bridge_tracks,
                     learned_matrix: &learned_matrix,
                     route_config: &route_config,
                     selection: request.selection,
                     shortlist_limit,
+                    guidance: Some(FixedSourceGuidance {
+                        host: guidance_host,
+                        job_id: &request.job_id,
+                        source_anchor_ids: request
+                            .source_tracks
+                            .iter()
+                            .map(|track| track.id.clone())
+                            .collect(),
+                        library: &library,
+                        candidate_urlmd5: &candidate_urlmd5,
+                        weights: &guidance_weights,
+                    }),
                     progress,
                 },
             )?;
@@ -5244,6 +5539,7 @@ fn analyze_bridge_validated(
                     objective: extension_result.route_metrics.objective,
                     arc_error: extension_result.route_metrics.arc_error,
                 },
+                guidance_candidate_pool: extension_result.guidance_candidate_pool,
                 acceptance_proofs: FixedSourceExtensionAcceptanceProofsArtifact {
                     exact_target_satisfied: extension_result.final_route.len()
                         == target_track_count,
@@ -5274,6 +5570,7 @@ fn analyze_bridge_validated(
                         },
                         semantic_tier: addition.semantics.tier,
                         semantic_evidence: addition.semantics.evidence,
+                        guidance_contributions: addition.guidance_contributions,
                     })
                     .collect(),
             })
@@ -5385,6 +5682,10 @@ fn analyze_bridge_validated(
             "bliss-only-no-usable-edges".to_owned()
         },
         provider_states: semantic_bundle.providers,
+        guidance_addon_diagnostics: guidance_host.diagnostics.clone(),
+        guidance_signal_count: guidance_host
+            .accepted_signal_count()
+            .max(guidance_signal_count),
         gaps,
         selection_preview,
         scoring_provenance,
@@ -5413,7 +5714,9 @@ fn analyze_bridge_request_with_options(
         semantic_bundle,
         library,
         local_candidate_rows,
+        candidate_urlmd5,
         database_cache,
+        mut guidance_host,
     } = validated;
     if !matches!(request.scoring.algorithm.as_str(), "adaptive" | "static") {
         return Err(CommandFailure::new(
@@ -5698,6 +6001,8 @@ fn analyze_bridge_request_with_options(
         learned_percent,
         library.expect("runtime validation always provides a decoded library"),
         local_candidate_rows,
+        candidate_urlmd5,
+        &mut guidance_host,
         &mut timings,
         &mut progress,
     )?;
@@ -5991,9 +6296,7 @@ fn main() {
     match args.as_slice() {
         [command] if command == "version" => println!("{PROGRAM} {VERSION}"),
         [command, format] if command == "version" && format == "--json" => {
-            println!(
-                "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"play_count_guidance\":true,\"resolved_candidate_guidance\":true}}"
-            );
+            println!("{}", version_metadata_json());
         }
         _ => {
             eprintln!("{}", usage());
@@ -6218,6 +6521,11 @@ mod tests {
     }
 
     #[test]
+    fn version_metadata_advertises_guidance_spi_v2() {
+        assert!(version_metadata_json().contains("\"guidance_spi_v2\":true"));
+    }
+
+    #[test]
     fn route_command_writes_progress_sidecar() {
         let progress_path = std::env::temp_dir().join(format!(
             "bliss-playlist-optimizer-progress-{}-route.json",
@@ -6254,7 +6562,6 @@ mod tests {
                 }),
                 artist_key: format!("artist-{track}"),
                 album_key: format!("album-{track}"),
-                play_count_percentile: 0.0,
             })
             .collect::<Vec<_>>();
         let mut matrix = Array2::<f32>::zeros((FEATURE_COUNT, FEATURE_COUNT));
@@ -6294,7 +6601,6 @@ mod tests {
                 ),
                 artist_key: format!("artist-{position}"),
                 album_key: format!("album-{position}"),
-                play_count_percentile: 0.0,
             })
             .collect::<Vec<_>>();
         let matrix = Array2::<f32>::eye(FEATURE_COUNT);
@@ -6328,9 +6634,7 @@ mod tests {
         });
         request["selection"] = serde_json::json!({
             "variation_percent": 75,
-            "generation_seed": 1234,
-            "recording_guidance_percent": 0,
-            "artist_guidance_percent": 0
+            "generation_seed": 1234
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6412,9 +6716,7 @@ mod tests {
         });
         request["selection"] = serde_json::json!({
             "variation_percent": 0,
-            "generation_seed": 1234,
-            "recording_guidance_percent": 0,
-            "artist_guidance_percent": 0
+            "generation_seed": 1234
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6501,9 +6803,7 @@ mod tests {
             });
             request["selection"] = serde_json::json!({
                 "variation_percent": 25,
-                "generation_seed": 1234,
-                "recording_guidance_percent": 0,
-                "artist_guidance_percent": 0
+                "generation_seed": 1234
             });
 
             let temporary = std::env::temp_dir().join(format!(
@@ -6567,9 +6867,7 @@ mod tests {
         });
         request["selection"] = serde_json::json!({
             "variation_percent": 0,
-            "generation_seed": 1234,
-            "recording_guidance_percent": 0,
-            "artist_guidance_percent": 0
+            "generation_seed": 1234
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6703,9 +7001,7 @@ mod tests {
         });
         request["selection"] = serde_json::json!({
             "variation_percent": 0,
-            "generation_seed": 1234,
-            "recording_guidance_percent": 0,
-            "artist_guidance_percent": 0
+            "generation_seed": 1234
         });
 
         let temporary = std::env::temp_dir().join(format!(
@@ -6773,7 +7069,6 @@ mod tests {
                 }),
                 artist_key: format!("artist-{index}"),
                 album_key: format!("album-{index}"),
-                play_count_percentile: 0.0,
             })
             .collect::<Vec<_>>();
         let config = route::SearchConfig {
@@ -6785,44 +7080,6 @@ mod tests {
             album_window: 10,
         };
         let candidates = (2..tracks.len()).collect::<Vec<_>>();
-        let source_semantic_identities = [
-            semantic::TrackIdentity {
-                recording_id: "seed-0".to_owned(),
-                recording_mbid: None,
-                title_name: "seed-0".to_owned(),
-                artist_ids: vec![semantic::canonical_artist_id("artist-0")],
-                artist_name: "artist-0".to_owned(),
-            },
-            semantic::TrackIdentity {
-                recording_id: "seed-1".to_owned(),
-                recording_mbid: None,
-                title_name: "seed-1".to_owned(),
-                artist_ids: vec![semantic::canonical_artist_id("artist-1")],
-                artist_name: "artist-1".to_owned(),
-            },
-        ];
-        let semantic_candidates = candidates
-            .iter()
-            .map(|candidate| semantic::CandidateIdentity {
-                candidate: *candidate,
-                track: semantic::TrackIdentity {
-                    recording_id: format!("candidate-{candidate}"),
-                    recording_mbid: None,
-                    title_name: format!("candidate-{candidate}"),
-                    artist_ids: vec![semantic::canonical_artist_id(&format!(
-                        "artist-{candidate}"
-                    ))],
-                    artist_name: format!("artist-{candidate}"),
-                },
-            })
-            .collect::<Vec<_>>();
-        let semantic_candidate_lookup = semantic::CandidateLookup::new(&semantic_candidates);
-        let semantic_bundle = semantic::EvidenceBundle {
-            schema_version: 1,
-            frozen_at: "1970-01-01T00:00:00Z".to_owned(),
-            providers: Vec::new(),
-            edges: Vec::new(),
-        };
         let mut progress = ProgressReporter::disabled();
         let extension_result = select_fixed_source_extension(
             25,
@@ -6832,15 +7089,12 @@ mod tests {
             &candidates,
             false,
             FixedSourceExtensionContext {
-                semantic_candidate_lookup: &semantic_candidate_lookup,
-                semantic_candidate_count: semantic_candidates.len(),
-                source_semantic_identities: &source_semantic_identities,
-                semantic_bundle: &semantic_bundle,
                 tracks: &tracks,
                 learned_matrix: &Array2::eye(23),
                 route_config: &config,
                 selection: SelectionSettings::default(),
                 shortlist_limit: 256,
+                guidance: None,
                 progress: &mut progress,
             },
         )
@@ -6877,15 +7131,12 @@ mod tests {
             &candidates,
             true,
             FixedSourceExtensionContext {
-                semantic_candidate_lookup: &semantic_candidate_lookup,
-                semantic_candidate_count: semantic_candidates.len(),
-                source_semantic_identities: &source_semantic_identities,
-                semantic_bundle: &semantic_bundle,
                 tracks: &tracks,
                 learned_matrix: &Array2::eye(23),
                 route_config: &config,
                 selection: SelectionSettings::default(),
                 shortlist_limit: 256,
+                guidance: None,
                 progress: &mut progress,
             },
         )
@@ -6906,95 +7157,6 @@ mod tests {
         );
         assert!(route::repeat_violations(&preserved.final_route, &tracks, &config).is_empty());
 
-        let guided_bundle = semantic::EvidenceBundle {
-            schema_version: 1,
-            frozen_at: "1970-01-01T00:00:00Z".to_owned(),
-            providers: vec![semantic::ProviderState {
-                provider: "fixture-provider".to_owned(),
-                dataset_or_algorithm: Some("recording-similarity".to_owned()),
-                state: semantic::ProviderStatus::Fresh,
-                request_count: Some(1),
-                failure_count: Some(0),
-                error_codes: Vec::new(),
-            }],
-            edges: vec![semantic::EvidenceEdge {
-                provider: "fixture-provider".to_owned(),
-                dataset_or_algorithm: Some("recording-similarity".to_owned()),
-                source: semantic::Entity {
-                    kind: semantic::EntityKind::Recording,
-                    id: "seed-0".to_owned(),
-                    mbid: None,
-                    name: None,
-                    title: None,
-                },
-                candidate: semantic::Entity {
-                    kind: semantic::EntityKind::Recording,
-                    id: "provider-result".to_owned(),
-                    mbid: None,
-                    name: None,
-                    title: None,
-                },
-                resolved_candidate_id: Some("bliss-row-3".to_owned()),
-                scope: semantic::EvidenceScope::EndpointLocal,
-                raw_rank: Some(1),
-                raw_score: Some(1.0),
-                identity_confidence: 1.0,
-                observed_at: None,
-                cache_state: Some(semantic::CacheState::Fresh),
-            }],
-        };
-        let guided_lookup = semantic::CandidateLookup::from_library_candidates(
-            &guided_bundle,
-            candidates.iter().map(|candidate| {
-                (
-                    *candidate,
-                    *candidate as u64,
-                    semantic_candidates[*candidate - 2]
-                        .track
-                        .title_name
-                        .as_str(),
-                    semantic_candidates[*candidate - 2]
-                        .track
-                        .artist_name
-                        .as_str(),
-                )
-            }),
-        );
-        let mut progress = ProgressReporter::disabled();
-        let guided = select_fixed_source_extension(
-            3,
-            None,
-            &[0, 1],
-            &[0, 1],
-            &candidates,
-            false,
-            FixedSourceExtensionContext {
-                semantic_candidate_lookup: &guided_lookup,
-                semantic_candidate_count: semantic_candidates.len(),
-                source_semantic_identities: &source_semantic_identities,
-                semantic_bundle: &guided_bundle,
-                tracks: &tracks,
-                learned_matrix: &Array2::eye(23),
-                route_config: &config,
-                selection: SelectionSettings {
-                    variation_percent: 0,
-                    generation_seed: 1234,
-                    recording_guidance_percent: 100,
-                    artist_guidance_percent: 0,
-                    playcount_influence: 0,
-                },
-                shortlist_limit: 256,
-                progress: &mut progress,
-            },
-        )
-        .unwrap();
-        assert_eq!(guided.additions[0].candidate, 3);
-        assert_eq!(
-            guided.additions[0].semantics.tier,
-            semantic::SemanticTier::RecordingOne
-        );
-        assert_eq!(guided.additions[0].semantics.evidence.len(), 1);
-
         let varied = |seed| {
             let mut progress = ProgressReporter::disabled();
             select_fixed_source_extension(
@@ -7005,20 +7167,14 @@ mod tests {
                 &candidates,
                 false,
                 FixedSourceExtensionContext {
-                    semantic_candidate_lookup: &semantic_candidate_lookup,
-                    semantic_candidate_count: semantic_candidates.len(),
-                    source_semantic_identities: &source_semantic_identities,
-                    semantic_bundle: &semantic_bundle,
                     tracks: &tracks,
                     learned_matrix: &Array2::eye(23),
                     route_config: &config,
                     selection: SelectionSettings {
                         variation_percent: 100,
                         generation_seed: seed,
-                        recording_guidance_percent: 0,
-                        artist_guidance_percent: 0,
-                        playcount_influence: 0,
                     },
+                    guidance: None,
                     shortlist_limit: 256,
                     progress: &mut progress,
                 },
@@ -7036,6 +7192,60 @@ mod tests {
                 .iter()
                 .map(|entry| entry.candidate)
                 .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn fixed_source_lastfm_target_expands_the_bliss_pool_until_supported_candidates_are_reachable()
+    {
+        let weights = guidance::GuidanceWeights::from_policy(&[GuidancePolicyEntry {
+            provider_id: "lastfm-guidance".to_owned(),
+            channel: "lastfm_artist".to_owned(),
+            weight: 1.0,
+            target_percent: Some(75),
+        }]);
+        let candidates = (0..3_000).collect::<Vec<_>>();
+        let contributions = (500..527)
+            .map(|candidate| {
+                (
+                    candidate,
+                    vec![guidance::AppliedGuidanceContribution {
+                        provider_id: "lastfm-guidance".to_owned(),
+                        channel: "lastfm_artist".to_owned(),
+                        scope: bliss_playlist_guidance_spi::GuidanceScope::Global,
+                        signal_score: 1.0,
+                        confidence: 1.0,
+                        policy_weight: 1.0,
+                        contribution: 1.0,
+                        rationale: None,
+                    }],
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let plan =
+            fixed_source_guidance_pool_plan(35, 256, 0, &weights, &candidates, &contributions);
+
+        assert_eq!(plan.baseline_limit, 350);
+        assert_eq!(plan.provider_scored_limit, 2_560);
+        assert_eq!(plan.selection_limit, 527);
+        assert!(plan.expanded_for_target_support);
+    }
+
+    #[test]
+    fn variation_target_share_keeps_a_deep_lastfm_supported_candidate_selectable() {
+        // This mirrors the Pi failure: the eligible Bliss-ranked pool had
+        // 2,560 tracks, but the available Last.fm evidence first appeared
+        // hundreds of places below the acoustic top. A DSTM-style target
+        // multiplier must still make that candidate competitive when
+        // Variation is enabled; absolute-rank exponential decay reduced its
+        // weight to virtually zero.
+        let supported = fixed_source_variation_candidate_weight(500, 2_560, 460.0, 0.0);
+        let top_bliss_only = fixed_source_variation_candidate_weight(0, 2_560, 1.0, 0.0);
+
+        assert!(
+            supported > top_bliss_only,
+            "target support must remain selectable inside the expanded Bliss pool"
         );
     }
 
@@ -7144,12 +7354,12 @@ mod tests {
     }
 
     #[test]
-    fn play_count_snapshot_is_hash_and_database_bound_and_assigns_tied_percentiles() {
+    fn candidate_identity_inventory_is_hash_bound_and_limited_to_allowed_rows() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
         let original = std::env::current_dir().unwrap();
         std::env::set_current_dir(repository).unwrap();
         let temporary_root = std::env::temp_dir().join(format!(
-            "bliss-playlist-optimizer-playcount-test-{}",
+            "bliss-playlist-optimizer-identities-test-{}",
             std::process::id()
         ));
         fs::create_dir_all(&temporary_root).unwrap();
@@ -7157,41 +7367,56 @@ mod tests {
             "fixtures/synthetic/automatic-bridge-request.json",
         ))
         .unwrap();
-        request.artifacts.database.cache_identity = Some("playcount-fixture-v1".to_owned());
+        request.artifacts.database.cache_identity = Some("identities-fixture-v1".to_owned());
         let database = BlissDatabase::open_read_only(&request.artifacts.database.path).unwrap();
-        let mut library = load_usable_library(&database).unwrap();
-        let inventory_path = temporary_root.join("play-counts.json");
-        let inventory = serde_json::json!({
+        let library = load_usable_library(&database).unwrap();
+        let allowed_rows = HashSet::from([library.metadata(0).row_id]);
+        let path = temporary_root.join("identities.json");
+        let payload = serde_json::json!({
             "schema_version": 1,
-            "schema_identity": "lms-play-counts-v1",
-            "generated_at": 1,
-            "database_cache_identity": "playcount-fixture-v1",
-            "tracks": [
-                {"database_file": library.metadata(0).file, "play_count": 0},
-                {"database_file": library.metadata(1).file, "play_count": 10},
-                {"database_file": library.metadata(2).file, "play_count": null}
-            ]
+            "schema_identity": "eligible-candidate-identities-v1",
+            "database_cache_identity": "identities-fixture-v1",
+            "candidates": [{
+                "candidate_id": format!("bliss-row-{}", library.metadata(0).row_id),
+                "row_id": library.metadata(0).row_id,
+                "lms_urlmd5": "url-0"
+            }]
         });
-        let bytes = serde_json::to_vec(&inventory).unwrap();
-        fs::write(&inventory_path, &bytes).unwrap();
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        fs::write(&path, &bytes).unwrap();
         let artifact = Artifact {
-            path: inventory_path.to_string_lossy().into_owned(),
+            path: path.to_string_lossy().into_owned(),
             sha256: Some(format!("{:x}", Sha256::digest(&bytes))),
-            schema_identity: Some("lms-play-counts-v1".to_owned()),
+            schema_identity: Some("eligible-candidate-identities-v1".to_owned()),
             cache_identity: None,
         };
 
-        let (_, stats) =
-            load_play_counts(&artifact, &request.artifacts.database, &mut library, true).unwrap();
-        assert_eq!(stats.known, 2);
-        assert_eq!(stats.unknown, 1);
-        assert!(library.track(1).play_count_percentile > library.track(0).play_count_percentile);
+        let (identities, _) = load_candidate_identities(
+            &artifact,
+            &request.artifacts.database,
+            &library,
+            &allowed_rows,
+        )
+        .unwrap();
+        assert_eq!(identities[&0], "url-0");
 
-        request.artifacts.database.cache_identity = Some("changed".to_owned());
-        let failure = load_play_counts(&artifact, &request.artifacts.database, &mut library, true)
-            .unwrap_err();
-        assert_eq!(failure.code, "PLAY_COUNTS_DATABASE_MISMATCH");
-
+        let mut disallowed = payload;
+        disallowed["candidates"][0]["row_id"] = serde_json::json!(library.metadata(1).row_id);
+        disallowed["candidates"][0]["candidate_id"] =
+            serde_json::json!(format!("bliss-row-{}", library.metadata(1).row_id));
+        let disallowed_bytes = serde_json::to_vec(&disallowed).unwrap();
+        fs::write(&path, &disallowed_bytes).unwrap();
+        let failure = load_candidate_identities(
+            &Artifact {
+                sha256: Some(format!("{:x}", Sha256::digest(&disallowed_bytes))),
+                ..artifact
+            },
+            &request.artifacts.database,
+            &library,
+            &allowed_rows,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "CANDIDATE_IDENTITIES_NONLOCAL_ROW");
         let _ = fs::remove_dir_all(temporary_root);
         std::env::set_current_dir(original).unwrap();
     }
@@ -7468,7 +7693,7 @@ mod tests {
         let conflict_path = Path::new("fixtures/synthetic/preserve-automatic-request.json");
         let mut conflict_timings = StageTimings::default();
         let mut conflict_progress = ProgressReporter::disabled();
-        let conflict = prepare_runtime_request(
+        let mut conflict = prepare_runtime_request(
             conflict_path,
             &RuntimeOptions::disabled(),
             &mut conflict_timings,
@@ -7498,6 +7723,8 @@ mod tests {
             conflict_learned_percent,
             conflict.library.unwrap(),
             conflict.local_candidate_rows,
+            conflict.candidate_urlmd5,
+            &mut conflict.guidance_host,
             &mut conflict_timings,
             &mut conflict_progress,
         )
