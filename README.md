@@ -44,6 +44,10 @@ flowchart LR
 
 Guidance is advisory: it can boost or de-boost a candidate only after the
 optimizer has admitted it acoustically and all hard constraints pass.
+`bounded_influence` gives one candidate a signed, limited adjustment, while
+`target_share` calibrates supported candidates inside the same acoustic pool.
+Providers declare which policy each channel supports; an incompatible request
+neutralizes that provider session rather than silently changing its strategy.
 
 ## Common commands
 

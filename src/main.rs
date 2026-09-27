@@ -17,6 +17,7 @@ use bliss_mixer_core::scoring::{
     score_adaptive_sequence, select_adaptive_matrix, AdaptiveAlgorithm,
 };
 use bliss_mixer_core::{FeatureVector, FEATURE_COUNT};
+use bliss_playlist_guidance_spi::policy::GuidancePolicyEntry;
 use ndarray::Array2;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -94,15 +95,6 @@ struct Request {
     guidance_addons: Vec<GuidanceAddonConfig>,
     #[serde(default)]
     guidance_policy: Vec<GuidancePolicyEntry>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct GuidancePolicyEntry {
-    provider_id: String,
-    channel: String,
-    weight: f64,
-    #[serde(default)]
-    target_percent: Option<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2347,7 +2339,7 @@ fn prepare_runtime_request(
         })
         .collect::<Vec<_>>();
     let mut guidance_host = guidance::GuidanceHost::start(&request.guidance_addons);
-    guidance_host.prepare(&request.job_id, guidance_anchors);
+    guidance_host.prepare(&request.job_id, guidance_anchors, &request.guidance_policy);
     let guidance_signal_count = 0;
     let guidance_addon_diagnostics = guidance_host.diagnostics.clone();
 

@@ -6,11 +6,14 @@
 //! Bliss route search independent of network clients, LMS APIs, and provider
 //! implementation details.
 
+use bliss_playlist_guidance_spi::policy::{target_share_multiplier, GuidancePolicyEntry};
 use bliss_playlist_guidance_spi::{
     encode, Anchor, ArtifactDescriptor, Candidate, GuidanceRequest, GuidanceResponse,
     GuidanceScope, GuidanceSignal, Manifest, ResourceDescriptor, ScoreContext, PROTOCOL_NAME,
     SPI_VERSION,
 };
+#[cfg(test)]
+use bliss_playlist_guidance_spi::{Capability, ChannelDescriptor};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -81,14 +84,14 @@ fn has_positive_support(
 }
 
 impl GuidanceWeights {
-    pub(crate) fn from_policy(policy: &[super::GuidancePolicyEntry]) -> Self {
+    pub(crate) fn from_policy(policy: &[GuidancePolicyEntry]) -> Self {
         Self {
             by_provider_channel: policy
                 .iter()
                 .map(|entry| {
                     (
                         (entry.provider_id.clone(), entry.channel.clone()),
-                        entry.weight.clamp(-1.0, 1.0),
+                        entry.bounded_weight(),
                     )
                 })
                 .collect(),
@@ -203,17 +206,11 @@ impl GuidanceWeights {
                         other_base_weight += base_weight;
                     }
                 }
-                let multiplier = if supported.is_empty() || other_base_weight <= 0.0 {
-                    1.0
-                } else {
-                    let target = f64::from(*target_percent) / 100.0;
-                    if target >= 1.0 {
-                        1_000_000.0
-                    } else {
-                        ((target * other_base_weight) / ((1.0 - target) * supported_base_weight))
-                            .max(0.000_001)
-                    }
-                };
+                let multiplier = target_share_multiplier(
+                    *target_percent,
+                    supported_base_weight,
+                    other_base_weight,
+                );
                 TargetShareDetails {
                     provider_id: provider_id.clone(),
                     channel: channel.clone(),
@@ -549,7 +546,12 @@ impl GuidanceHost {
         host
     }
 
-    pub(crate) fn prepare(&mut self, job_id: &str, anchors: Vec<Anchor>) {
+    pub(crate) fn prepare(
+        &mut self,
+        job_id: &str,
+        anchors: Vec<Anchor>,
+        policy: &[GuidancePolicyEntry],
+    ) {
         for session in &mut self.sessions {
             if session.disabled {
                 continue;
@@ -572,6 +574,11 @@ impl GuidanceHost {
                         manifest.provider_id, session.configured_id
                     ),
                 );
+                continue;
+            }
+            if let Err(message) = validate_manifest_policy(&manifest, policy) {
+                session.disable();
+                host_failure(&mut self.diagnostics, session, message);
                 continue;
             }
             match session.prepare(job_id, anchors.clone()) {
@@ -724,6 +731,39 @@ fn validate_manifest_signals(
     Ok(())
 }
 
+/// Ensures that a host never silently changes the requested policy type for a
+/// provider-local channel. Unsupported optional guidance is neutralized by
+/// disabling only that provider session during preparation.
+fn validate_manifest_policy(
+    manifest: &Manifest,
+    policy: &[GuidancePolicyEntry],
+) -> Result<(), String> {
+    for entry in policy
+        .iter()
+        .filter(|entry| entry.provider_id == manifest.provider_id)
+        .filter(|entry| entry.bounded_weight() != 0.0 || entry.target_percent.unwrap_or(0) > 0)
+    {
+        let channel = manifest
+            .channels
+            .iter()
+            .find(|channel| channel.channel == entry.channel)
+            .ok_or_else(|| {
+                format!(
+                    "guidance provider '{}' does not declare channel '{}'",
+                    manifest.provider_id, entry.channel
+                )
+            })?;
+        let requested = entry.policy_kind();
+        if !channel.supported_host_policies.contains(&requested) {
+            return Err(format!(
+                "guidance provider '{}' channel '{}' does not support host policy {:?}",
+                manifest.provider_id, entry.channel, requested
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(dead_code)] // Called by GuidanceHost::score at the planner boundary.
 fn aggregate_batch(
     mut signals: Vec<ProviderSignal>,
@@ -783,6 +823,46 @@ fn aggregate_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bliss_playlist_guidance_spi::policy::{GuidancePolicyEntry, HostPolicyKind};
+
+    #[test]
+    fn shared_policy_entries_drive_weights_and_target_share() {
+        let weights = GuidanceWeights::from_policy(&[GuidancePolicyEntry {
+            provider_id: "lastfm-guidance".to_owned(),
+            channel: "lastfm_artist".to_owned(),
+            weight: 0.8,
+            target_percent: Some(75),
+        }]);
+
+        assert_eq!(weights.weight("lastfm-guidance", "lastfm_artist"), 0.8);
+        assert!(weights.has_target_shares());
+    }
+
+    #[test]
+    fn manifest_rejects_a_requested_policy_not_declared_by_the_provider() {
+        let manifest = Manifest {
+            spi_version: SPI_VERSION,
+            provider_id: "lastfm-guidance".to_owned(),
+            provider_version: "test".to_owned(),
+            protocol: PROTOCOL_NAME.to_owned(),
+            capabilities: vec![Capability::GlobalCandidateGuidance],
+            channels: vec![ChannelDescriptor {
+                channel: "lastfm_artist".to_owned(),
+                scopes: vec![GuidanceScope::Global],
+                supported_host_policies: vec![HostPolicyKind::BoundedInfluence],
+            }],
+            required_context: vec![],
+            configuration_schema: None,
+        };
+        let policy = GuidancePolicyEntry {
+            provider_id: "lastfm-guidance".to_owned(),
+            channel: "lastfm_artist".to_owned(),
+            weight: 0.0,
+            target_percent: Some(75),
+        };
+
+        assert!(validate_manifest_policy(&manifest, &[policy]).is_err());
+    }
 
     #[test]
     fn disabled_host_is_neutral() {
