@@ -23,12 +23,23 @@ It does **not** contact Last.fm, talk to LMS, change `bliss.db`, or persist a
 playlist or player queue. Those integration responsibilities belong to Better
 Call Bliss.
 
+## Current guidance status
+
+- The current optimizer release is 0.2.0. Library Signals and Last.fm
+  artifact-mode providers are integrated through
+  SPI v2 and are optional, Bliss-first reranking inputs.
+- The Last.fm provider consumes the hash-bound artifact prepared by Better Call
+  Bliss/LastMix; the optimizer never performs Last.fm HTTP requests.
+- The Last.fm provider's API Key setting is not an operational direct-acquisition
+  path yet. Direct provider-owned HTTP, cache, timeout, and offline handling is
+  remaining work.
+
 ```mermaid
 flowchart LR
     B[Better Call Bliss] -->|frozen request, local candidate inventory| O[bliss-playlist-optimizer]
     O --> C[bliss-mixer-core\nBliss distance and matrices]
-    O <-->|bounded guidance SPI| L[Last.fm provider]
-    O <-->|bounded guidance SPI| P[Play-count provider]
+    O <-->|SPI v2: resolved artifact| L[Last.fm provider]
+    O <-->|SPI v2: read-only persist.db| P[Library Signals provider]
     O -->|result, progress, diagnostics| B
 ```
 
