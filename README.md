@@ -48,10 +48,10 @@ flowchart LR
 | Component | Responsibility |
 | --- | --- |
 | [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss) | Lyrion UI, request capture, LastMix acquisition, preview, reporting, and persistence. |
-| [Guidance SPI](https://github.com/chrober/bliss-playlist-guidance-spi) | Host-neutral JSONL contract for optional candidate guidance. |
-| [Last.fm guidance](https://github.com/chrober/bliss-guidance-lastfm) | Consumes Better Call Bliss's frozen, resolved Last.fm artifact. |
-| [Local library-signals guidance](https://github.com/chrober/bliss-guidance-library-signals) | Reads a trusted, read-only Lyrion `persist.db` snapshot for play count, last played, and library age. |
-| [bliss-mixer-core](https://github.com/chrober/bliss-mixer-core) | Shared Bliss scoring and matrix behavior. |
+| [`bliss-playlist-guidance-spi`](https://github.com/chrober/bliss-playlist-guidance-spi) | Host-neutral JSONL contract for optional candidate guidance. |
+| [`bliss-guidance-lastfm`](https://github.com/chrober/bliss-guidance-lastfm) | Consumes Better Call Bliss's frozen, resolved Last.fm artifact. |
+| [`bliss-guidance-library-signals`](https://github.com/chrober/bliss-guidance-library-signals) | Reads a trusted, read-only Lyrion `persist.db` snapshot for play count, last played, and library age. |
+| [`bliss-mixer-core`](https://github.com/chrober/bliss-mixer-core) | Shared Bliss scoring and matrix behavior. |
 
 Guidance is advisory: it can boost or de-boost a candidate only after the
 optimizer has admitted it acoustically and all hard constraints pass.
