@@ -25,14 +25,11 @@ Call Bliss.
 
 ## Current guidance status
 
-- The current optimizer release is 0.2.0. Library Signals and Last.fm
-  artifact-mode providers are integrated through
-  SPI v2 and are optional, Bliss-first reranking inputs.
-- The Last.fm provider consumes the hash-bound artifact prepared by Better Call
-  Bliss/LastMix; the optimizer never performs Last.fm HTTP requests.
-- The Last.fm provider's API Key setting is not an operational direct-acquisition
-  path yet. Direct provider-owned HTTP, cache, timeout, and offline handling is
-  remaining work.
+Library Signals and Last.fm providers are integrated through SPI v2 as
+optional, Bliss-first reranking inputs. The optimizer itself never performs
+Last.fm HTTP requests: acquisition belongs to the provider, either from a
+hash-bound LastMix artifact or during the provider's direct-mode `prepare`.
+Provider scoring remains network-free.
 
 ```mermaid
 flowchart LR
@@ -59,6 +56,10 @@ optimizer has admitted it acoustically and all hard constraints pass.
 `target_share` calibrates supported candidates inside the same acoustic pool.
 Providers declare which policy each channel supports; an incompatible request
 neutralizes that provider session rather than silently changing its strategy.
+Prepare and score diagnostics are retained in
+`guidance_addon_diagnostics.log_events_v1` in original order so the Lyrion host
+can return them to the owning provider plugin. The optimizer does not render
+or rewrite provider log text.
 
 ## Common commands
 
