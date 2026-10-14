@@ -8,7 +8,7 @@
 
 use bliss_playlist_guidance_spi::policy::{target_share_multiplier, GuidancePolicyEntry};
 use bliss_playlist_guidance_spi::{
-    encode, Anchor, ArtifactDescriptor, Candidate, GuidanceRequest, GuidanceResponse,
+    encode, Anchor, ArtifactDescriptor, Candidate, Diagnostics, GuidanceRequest, GuidanceResponse,
     GuidanceScope, GuidanceSignal, Manifest, ResourceDescriptor, ScoreContext, PROTOCOL_NAME,
     SPI_VERSION,
 };
@@ -25,6 +25,10 @@ use std::time::Duration;
 use super::GuidanceAddonConfig;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+const LOG_EVENTS_KEY: &str = "log_events_v1";
+const LOG_EVENT_VERSION: &str = "guidance_log_event_v1";
+const MAX_LOG_EVENTS: usize = 64;
+const MAX_LOG_EVENT_BYTES: usize = 16 * 1024;
 #[allow(dead_code)] // Used by the Task 5 shared planner boundary.
 const GUIDANCE_CAP: f64 = 0.75;
 
@@ -38,6 +42,8 @@ pub(crate) struct AddonDiagnostic {
     pub score_batches: u64,
     pub returned_signals: u64,
     pub accepted_signals: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub log_events_v1: Vec<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -311,6 +317,7 @@ struct Session {
     score_batches: u64,
     returned_signals: u64,
     accepted_signals: u64,
+    log_events_v1: Vec<Value>,
     disabled: bool,
 }
 
@@ -371,6 +378,7 @@ impl Session {
             score_batches: 0,
             returned_signals: 0,
             accepted_signals: 0,
+            log_events_v1: Vec::new(),
             disabled: false,
         })
     }
@@ -455,7 +463,8 @@ impl Session {
             anchors: preparation.anchors,
         })?;
         match response {
-            GuidanceResponse::Prepared { .. } => {
+            GuidanceResponse::Prepared { diagnostics, .. } => {
+                retain_log_events(&mut self.log_events_v1, &diagnostics);
                 self.prepared = true;
                 Ok(())
             }
@@ -484,7 +493,12 @@ impl Session {
             candidates,
         })?;
         match response {
-            GuidanceResponse::Scores { signals, .. } => {
+            GuidanceResponse::Scores {
+                signals,
+                diagnostics,
+                ..
+            } => {
+                retain_log_events(&mut self.log_events_v1, &diagnostics);
                 let accepted = validate_batch_signals(&candidate_ids, signals)?;
                 let manifest = self.manifest.as_ref().ok_or_else(|| {
                     "guidance addon was scored before manifest negotiation".to_owned()
@@ -540,6 +554,7 @@ impl GuidanceHost {
                     score_batches: 0,
                     returned_signals: 0,
                     accepted_signals: 0,
+                    log_events_v1: Vec::new(),
                 }),
             }
         }
@@ -591,6 +606,7 @@ impl GuidanceHost {
                     score_batches: session.score_batches,
                     returned_signals: session.returned_signals,
                     accepted_signals: session.accepted_signals,
+                    log_events_v1: session.log_events_v1.clone(),
                 }),
                 Err(message) => {
                     session.disable();
@@ -629,6 +645,7 @@ impl GuidanceHost {
                         session.score_batches,
                         session.returned_signals,
                         session.accepted_signals,
+                        &session.log_events_v1,
                     );
                     signals.append(&mut values);
                 }
@@ -650,6 +667,7 @@ fn refresh_prepared_diagnostic(
     score_batches: u64,
     returned_signals: u64,
     accepted_signals: u64,
+    log_events_v1: &[Value],
 ) {
     if let Some(diagnostic) = diagnostics.iter_mut().rev().find(|diagnostic| {
         diagnostic.configured_id == configured_id && diagnostic.state == "prepared"
@@ -657,6 +675,7 @@ fn refresh_prepared_diagnostic(
         diagnostic.score_batches = score_batches;
         diagnostic.returned_signals = returned_signals;
         diagnostic.accepted_signals = accepted_signals;
+        diagnostic.log_events_v1 = log_events_v1.to_vec();
     }
 }
 
@@ -673,7 +692,31 @@ fn host_failure(diagnostics: &mut Vec<AddonDiagnostic>, session: &Session, messa
         score_batches: session.score_batches,
         returned_signals: session.returned_signals,
         accepted_signals: session.accepted_signals,
+        log_events_v1: session.log_events_v1.clone(),
     });
+}
+
+fn retain_log_events(retained: &mut Vec<Value>, diagnostics: &Diagnostics) {
+    let Some(events) = diagnostics
+        .details
+        .as_ref()
+        .and_then(|details| details.get(LOG_EVENTS_KEY))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for event in events {
+        if retained.len() >= MAX_LOG_EVENTS {
+            break;
+        }
+        let valid = event.get("event_version").and_then(Value::as_str) == Some(LOG_EVENT_VERSION)
+            && serde_json::to_vec(event)
+                .map(|bytes| bytes.len() <= MAX_LOG_EVENT_BYTES)
+                .unwrap_or(false);
+        if valid {
+            retained.push(event.clone());
+        }
+    }
 }
 
 #[allow(dead_code)] // Called by GuidanceHost::score once a planner requests guidance.
@@ -827,6 +870,49 @@ mod tests {
         saturating_time_signal, GuidancePolicyEntry, HostPolicyKind,
     };
     use serde_json::Value;
+
+    #[test]
+    fn provider_log_events_are_preserved_in_prepare_then_score_order() {
+        let mut retained = Vec::new();
+        retain_log_events(
+            &mut retained,
+            &bliss_playlist_guidance_spi::Diagnostics {
+                details: Some(serde_json::json!({
+                    "log_events_v1": [{
+                        "event_version": "guidance_log_event_v1",
+                        "level": "info",
+                        "phase": "prepare",
+                        "event": "library_signals_prepared",
+                        "provider_id": "library-signals-guidance"
+                    }]
+                })),
+                ..Default::default()
+            },
+        );
+        retain_log_events(
+            &mut retained,
+            &bliss_playlist_guidance_spi::Diagnostics {
+                details: Some(serde_json::json!({
+                    "log_events_v1": [{
+                        "event_version": "guidance_log_event_v1",
+                        "level": "debug",
+                        "phase": "score",
+                        "event": "library_signals_scored",
+                        "provider_id": "library-signals-guidance"
+                    }]
+                })),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            retained
+                .iter()
+                .map(|event| event["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["library_signals_prepared", "library_signals_scored"],
+        );
+    }
 
     #[test]
     fn frozen_parity_fixture_covers_bliss_only_lastfm_modes_and_date_channels() {
@@ -1192,9 +1278,10 @@ mod tests {
             score_batches: 0,
             returned_signals: 0,
             accepted_signals: 0,
+            log_events_v1: Vec::new(),
         }];
 
-        refresh_prepared_diagnostic(&mut diagnostics, "lastfm-guidance", 3, 12, 10);
+        refresh_prepared_diagnostic(&mut diagnostics, "lastfm-guidance", 3, 12, 10, &[]);
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].score_batches, 3);
