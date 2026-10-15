@@ -169,12 +169,24 @@ struct CandidateIdentityInventory {
     candidates: Vec<CandidateIdentity>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct CandidateIdentity {
     candidate_id: String,
     row_id: u64,
     #[serde(default)]
     lms_urlmd5: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    artist: Option<String>,
+    #[serde(default)]
+    album: Option<String>,
+    #[serde(default)]
+    recording_mbid: Option<String>,
+    #[serde(default)]
+    artist_mbid: Option<String>,
+    #[serde(default)]
+    artist_mbids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1086,7 +1098,7 @@ struct FixedSourceGuidance<'a> {
     job_id: &'a str,
     source_anchor_ids: Vec<String>,
     library: &'a Library,
-    candidate_urlmd5: &'a HashMap<usize, String>,
+    candidate_identities: &'a HashMap<usize, CandidateIdentity>,
     weights: &'a guidance::GuidanceWeights,
 }
 
@@ -1519,7 +1531,7 @@ struct ValidatedRequest {
     semantic_bundle: semantic::EvidenceBundle,
     library: Option<Library>,
     local_candidate_rows: Option<HashSet<u64>>,
-    candidate_urlmd5: HashMap<usize, String>,
+    candidate_identities: HashMap<usize, CandidateIdentity>,
     database_cache: &'static str,
     guidance_host: guidance::GuidanceHost,
 }
@@ -1891,7 +1903,7 @@ fn load_candidate_identities(
     database_artifact: &Artifact,
     library: &Library,
     allowed_rows: &HashSet<u64>,
-) -> Result<(HashMap<usize, String>, String), CommandFailure> {
+) -> Result<(HashMap<usize, CandidateIdentity>, String), CommandFailure> {
     if artifact.schema_identity.as_deref() != Some("eligible-candidate-identities-v1") {
         return Err(CommandFailure::new(
             "CANDIDATE_IDENTITIES_SCHEMA_MISMATCH",
@@ -1959,16 +1971,17 @@ fn load_candidate_identities(
                 "candidate identities contain an unknown or unusable Bliss row",
             )
         })?;
-        let urlmd5 = identity
+        if identity
             .lms_urlmd5
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                CommandFailure::new(
-                    "CANDIDATE_IDENTITIES_URLMD5_REQUIRED",
-                    "candidate identities require an LMS URLMD5 for every eligible row",
-                )
-            })?;
-        identities.insert(index, urlmd5);
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(CommandFailure::new(
+                "CANDIDATE_IDENTITIES_URLMD5_REQUIRED",
+                "candidate identities require an LMS URLMD5 for every eligible row",
+            ));
+        }
+        identities.insert(index, identity);
     }
     if identities.len() != allowed_rows.len() {
         return Err(CommandFailure::new(
@@ -2169,7 +2182,7 @@ fn prepare_runtime_request(
         None,
     );
     let started = Instant::now();
-    let (candidate_urlmd5, candidate_identities_sha256) =
+    let (candidate_identities, candidate_identities_sha256) =
         if let Some(identities) = &request.artifacts.candidate_identities {
             let allowed_rows = local_candidate_rows.as_ref().ok_or_else(|| {
                 CommandFailure::new(
@@ -2368,7 +2381,7 @@ fn prepare_runtime_request(
         semantic_bundle,
         library: Some(library),
         local_candidate_rows,
-        candidate_urlmd5,
+        candidate_identities,
         database_cache,
         guidance_host,
     })
@@ -2696,7 +2709,7 @@ fn bridge_candidate_id(row_id: u64) -> String {
 struct GuidanceRuntime<'a> {
     host: &'a mut guidance::GuidanceHost,
     library: &'a Library,
-    candidate_urlmd5: &'a HashMap<usize, String>,
+    candidate_identities: &'a HashMap<usize, CandidateIdentity>,
     weights: &'a guidance::GuidanceWeights,
 }
 
@@ -2718,7 +2731,7 @@ fn score_guidance_for_gap(
         },
         candidates,
         runtime.library,
-        runtime.candidate_urlmd5,
+        runtime.candidate_identities,
         runtime.weights,
     )
 }
@@ -2729,7 +2742,7 @@ fn score_guidance(
     context: bliss_playlist_guidance_spi::ScoreContext,
     candidates: &[usize],
     library: &Library,
-    candidate_urlmd5: &HashMap<usize, String>,
+    candidate_identities: &HashMap<usize, CandidateIdentity>,
     weights: &guidance::GuidanceWeights,
 ) -> guidance::GuidanceBatch {
     let mut ordered = candidates.to_vec();
@@ -2746,16 +2759,7 @@ fn score_guidance(
         .collect::<BTreeMap<_, _>>();
     let provider_candidates = ordered
         .iter()
-        .map(|candidate| bliss_playlist_guidance_spi::Candidate {
-            candidate_id: bridge_candidate_id(library.metadata(*candidate).row_id),
-            lms_urlmd5: candidate_urlmd5.get(candidate).cloned(),
-            database_file: None,
-            title: None,
-            artist: None,
-            album: None,
-            recording_mbid: None,
-            artist_mbids: Vec::new(),
-        })
+        .map(|candidate| provider_candidate(*candidate, library, candidate_identities))
         .collect::<Vec<_>>();
     host.score(
         request_id,
@@ -2764,6 +2768,42 @@ fn score_guidance(
         weights,
         &candidate_index,
     )
+}
+
+fn provider_candidate(
+    library_index: usize,
+    library: &Library,
+    identities: &HashMap<usize, CandidateIdentity>,
+) -> bliss_playlist_guidance_spi::Candidate {
+    fn present(value: Option<&String>) -> Option<String> {
+        value.filter(|value| !value.trim().is_empty()).cloned()
+    }
+
+    let metadata = library.metadata(library_index);
+    let identity = identities.get(&library_index);
+    let mut artist_mbids = identity
+        .map(|identity| identity.artist_mbids.clone())
+        .unwrap_or_default();
+    if let Some(artist_mbid) = identity.and_then(|identity| present(identity.artist_mbid.as_ref()))
+    {
+        artist_mbids.push(artist_mbid);
+    }
+    artist_mbids.retain(|value| !value.trim().is_empty());
+    artist_mbids.sort();
+    artist_mbids.dedup();
+
+    bliss_playlist_guidance_spi::Candidate {
+        candidate_id: identity
+            .map(|identity| identity.candidate_id.clone())
+            .unwrap_or_else(|| bridge_candidate_id(metadata.row_id)),
+        lms_urlmd5: identity.and_then(|identity| present(identity.lms_urlmd5.as_ref())),
+        database_file: Some(metadata.file.clone()),
+        title: identity.and_then(|identity| present(identity.title.as_ref())),
+        artist: identity.and_then(|identity| present(identity.artist.as_ref())),
+        album: identity.and_then(|identity| present(identity.album.as_ref())),
+        recording_mbid: identity.and_then(|identity| present(identity.recording_mbid.as_ref())),
+        artist_mbids,
+    }
 }
 
 fn source_semantic_identity(
@@ -3010,7 +3050,7 @@ fn select_fixed_source_extension(
                     .map(|entry| entry.0)
                     .collect::<Vec<_>>(),
                 guidance.library,
-                guidance.candidate_urlmd5,
+                guidance.candidate_identities,
                 guidance.weights,
             )
         })
@@ -3425,7 +3465,7 @@ fn optimize_route_request_with_options(
         semantic_bundle: _,
         library,
         local_candidate_rows: _,
-        candidate_urlmd5: _,
+        candidate_identities: _,
         database_cache,
         guidance_host: _,
     } = validated;
@@ -3677,7 +3717,7 @@ fn analyze_bridge_validated(
     learned_percent: u16,
     library: Library,
     local_candidate_rows: Option<HashSet<u64>>,
-    candidate_urlmd5: HashMap<usize, String>,
+    candidate_identities: HashMap<usize, CandidateIdentity>,
     guidance_host: &mut guidance::GuidanceHost,
     timings: &mut StageTimings,
     progress: &mut ProgressReporter,
@@ -4528,7 +4568,7 @@ fn analyze_bridge_validated(
         let mut guidance_runtime = GuidanceRuntime {
             host: guidance_host,
             library: &library,
-            candidate_urlmd5: &candidate_urlmd5,
+            candidate_identities: &candidate_identities,
             weights: &guidance_weights,
         };
         let guidance_batch = score_guidance_for_gap(
@@ -5442,7 +5482,7 @@ fn analyze_bridge_validated(
                             .map(|track| track.id.clone())
                             .collect(),
                         library: &library,
-                        candidate_urlmd5: &candidate_urlmd5,
+                        candidate_identities: &candidate_identities,
                         weights: &guidance_weights,
                     }),
                     progress,
@@ -5706,7 +5746,7 @@ fn analyze_bridge_request_with_options(
         semantic_bundle,
         library,
         local_candidate_rows,
-        candidate_urlmd5,
+        candidate_identities,
         database_cache,
         mut guidance_host,
     } = validated;
@@ -5993,7 +6033,7 @@ fn analyze_bridge_request_with_options(
         learned_percent,
         library.expect("runtime validation always provides a decoded library"),
         local_candidate_rows,
-        candidate_urlmd5,
+        candidate_identities,
         &mut guidance_host,
         &mut timings,
         &mut progress,
@@ -7371,7 +7411,12 @@ mod tests {
             "candidates": [{
                 "candidate_id": format!("bliss-row-{}", library.metadata(0).row_id),
                 "row_id": library.metadata(0).row_id,
-                "lms_urlmd5": "url-0"
+                "lms_urlmd5": "url-0",
+                "title": "Candidate title",
+                "artist": "Candidate artist",
+                "album": "Candidate album",
+                "recording_mbid": "11111111-1111-1111-1111-111111111111",
+                "artist_mbid": "22222222-2222-2222-2222-222222222222"
             }]
         });
         let bytes = serde_json::to_vec(&payload).unwrap();
@@ -7390,7 +7435,26 @@ mod tests {
             &allowed_rows,
         )
         .unwrap();
-        assert_eq!(identities[&0], "url-0");
+        let provider_candidate = provider_candidate(0, &library, &identities);
+        assert_eq!(provider_candidate.lms_urlmd5.as_deref(), Some("url-0"));
+        assert_eq!(provider_candidate.title.as_deref(), Some("Candidate title"));
+        assert_eq!(
+            provider_candidate.artist.as_deref(),
+            Some("Candidate artist")
+        );
+        assert_eq!(provider_candidate.album.as_deref(), Some("Candidate album"));
+        assert_eq!(
+            provider_candidate.recording_mbid.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(
+            provider_candidate.artist_mbids,
+            vec!["22222222-2222-2222-2222-222222222222"]
+        );
+        assert_eq!(
+            provider_candidate.database_file.as_deref(),
+            Some(library.metadata(0).file.as_str())
+        );
 
         let mut disallowed = payload;
         disallowed["candidates"][0]["row_id"] = serde_json::json!(library.metadata(1).row_id);
@@ -7715,7 +7779,7 @@ mod tests {
             conflict_learned_percent,
             conflict.library.unwrap(),
             conflict.local_candidate_rows,
-            conflict.candidate_urlmd5,
+            conflict.candidate_identities,
             &mut conflict.guidance_host,
             &mut conflict_timings,
             &mut conflict_progress,
