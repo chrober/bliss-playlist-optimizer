@@ -10,7 +10,7 @@ use crate::contextual::{
     adaptive_distance_from_seeds, adaptive_distance_with_matrix, prepare_adaptive_context,
     ContextualError, PreparedAdaptiveContext,
 };
-use crate::route::RouteTrack;
+use crate::route::{artists_repeat, RouteTrack};
 
 pub const DEFAULT_MAX_LEG_PERCENTILE: f64 = 0.70;
 pub const DEFAULT_MAX_DETOUR_PERCENTILE: f64 = 1.30;
@@ -348,11 +348,7 @@ pub(crate) fn repeat_windows_safe_at(
         }
         let distance = position.abs_diff(inserted_position);
         let other = &tracks[*track_index];
-        if artist_window > 0
-            && distance <= artist_window
-            && !inserted.artist_key.is_empty()
-            && inserted.artist_key == other.artist_key
-        {
+        if artist_window > 0 && distance <= artist_window && artists_repeat(inserted, other) {
             return false;
         }
         if album_window > 0
@@ -656,6 +652,7 @@ mod tests {
         RouteTrack {
             features: std::array::from_fn(|index| value + index as f32 / 100.0),
             artist_key: artist.to_owned(),
+            artist_repeat_keys: Vec::new(),
             album_key: album.to_owned(),
         }
     }
@@ -921,6 +918,7 @@ mod tests {
                     x.sin() + (x * 0.37).cos() * 0.4 + track_index as f32 / 4096.0
                 }),
                 artist_key: format!("artist-{track_index}"),
+                artist_repeat_keys: Vec::new(),
                 album_key: format!("album-{track_index}"),
             })
             .collect::<Vec<_>>();

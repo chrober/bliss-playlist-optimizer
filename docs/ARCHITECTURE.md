@@ -120,8 +120,14 @@ integrity result, and decoded library only when the path and identity match.
 Cache corruption, inconsistent metadata/feature vector counts, or an identity
 change is a safe miss.
 
-Cache format v2 stores compact metadata separately from the route features and
-artist/album repeat keys. Destination jobs borrow those decoded route tracks
+The decoded cache stores compact metadata separately from route features and
+artist/album repeat keys. An optional, hash-bound
+`lyrion-track-identities-v1` artifact projects each artist repeat key from a
+MusicBrainz artist ID, then a snapshot-local Lyrion contributor ID, then a
+normalized name. The request chooses shared credited artists, primary artist,
+or exact Bliss credit. Missing rows fall back per track; an unavailable,
+mismatched, or invalid artifact records a fallback state and leaves the job on
+exact Bliss credits instead of aborting it. Destination jobs borrow those decoded route tracks
 instead of cloning the complete library for every optimizer process. Optional
 candidate-guidance lookup is evidence-scoped. Current Better Call Bliss
 requests carry explicit `bliss-row-N` candidate identities resolved against the

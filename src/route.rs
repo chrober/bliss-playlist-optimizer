@@ -32,7 +32,36 @@ struct LocalSearchKey {
 pub struct RouteTrack {
     pub features: FeatureVector,
     pub artist_key: String,
+    #[serde(default)]
+    pub artist_repeat_keys: Vec<String>,
     pub album_key: String,
+}
+
+pub(crate) fn artists_repeat(left: &RouteTrack, right: &RouteTrack) -> bool {
+    if left.artist_repeat_keys.is_empty() || right.artist_repeat_keys.is_empty() {
+        if left.artist_key == "various artists" || right.artist_key == "various artists" {
+            return false;
+        }
+        return !left.artist_key.is_empty() && left.artist_key == right.artist_key;
+    }
+    left.artist_repeat_keys
+        .iter()
+        .any(|key| right.artist_repeat_keys.contains(key))
+}
+
+pub fn artist_repeat_capacity_keys(track: &RouteTrack) -> Vec<&str> {
+    if !track.artist_repeat_keys.is_empty() {
+        return track
+            .artist_repeat_keys
+            .iter()
+            .map(String::as_str)
+            .collect();
+    }
+    if track.artist_key.is_empty() || track.artist_key == "various artists" {
+        Vec::new()
+    } else {
+        vec![track.artist_key.as_str()]
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -598,9 +627,11 @@ fn is_feasible_append(
 ) -> bool {
     let item = &tracks[candidate];
     let artist_ok = config.artist_window == 0
-        || !route.iter().rev().take(config.artist_window).any(|index| {
-            !item.artist_key.is_empty() && tracks[*index].artist_key == item.artist_key
-        });
+        || !route
+            .iter()
+            .rev()
+            .take(config.artist_window)
+            .any(|index| artists_repeat(item, &tracks[*index]));
     let album_ok =
         config.album_window == 0
             || !route.iter().rev().take(config.album_window).any(|index| {
@@ -622,8 +653,7 @@ pub fn repeat_violations(
             let right_track = &tracks[route[right]];
             if config.artist_window > 0
                 && distance <= config.artist_window
-                && !right_track.artist_key.is_empty()
-                && left_track.artist_key == right_track.artist_key
+                && artists_repeat(left_track, right_track)
             {
                 violations.push(RepeatViolation {
                     kind: "artist",
@@ -703,8 +733,55 @@ mod tests {
         RouteTrack {
             features: std::array::from_fn(|index| value * (index + 1) as f32 / 10.0),
             artist_key: artist.to_owned(),
+            artist_repeat_keys: Vec::new(),
             album_key: format!("album-{value}"),
         }
+    }
+
+    #[test]
+    fn repeat_windows_detect_shared_artist_identity_across_different_credits() {
+        let mut collaboration = track(0.1, "queen & david bowie");
+        collaboration.artist_repeat_keys = vec![
+            "artist-mbid:queen".to_owned(),
+            "artist-mbid:bowie".to_owned(),
+        ];
+        let mut queen = track(0.2, "queen");
+        queen.artist_repeat_keys = vec!["artist-mbid:queen".to_owned()];
+        let mut route_config = config();
+        route_config.artist_window = 2;
+
+        assert_eq!(
+            repeat_violations(&[0, 1], &[collaboration, queen], &route_config),
+            vec![RepeatViolation {
+                kind: "artist",
+                positions: [0, 1],
+            }]
+        );
+    }
+
+    #[test]
+    fn various_artists_is_not_a_shared_artist_repeat_identity() {
+        let compilation_a = track(0.1, "various artists");
+        let compilation_b = track(0.2, "various artists");
+        let mut route_config = config();
+        route_config.artist_window = 2;
+
+        assert!(
+            repeat_violations(&[0, 1], &[compilation_a, compilation_b], &route_config,).is_empty()
+        );
+    }
+
+    #[test]
+    fn capacity_keys_include_every_shared_artist() {
+        let mut collaboration = track(0.1, "queen & david bowie");
+        collaboration.artist_repeat_keys = vec![
+            "artist-mbid:queen".to_owned(),
+            "artist-mbid:bowie".to_owned(),
+        ];
+        assert_eq!(
+            artist_repeat_capacity_keys(&collaboration),
+            vec!["artist-mbid:queen", "artist-mbid:bowie"],
+        );
     }
 
     fn config() -> SearchConfig {

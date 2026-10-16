@@ -27,7 +27,8 @@
         "database": { "$ref": "#/$defs/artifact" },
         "learned_matrix": { "$ref": "#/$defs/artifact" },
         "local_candidate_inventory": { "$ref": "#/$defs/artifact" },
-        "candidate_identities": { "$ref": "#/$defs/artifact" }
+        "candidate_identities": { "$ref": "#/$defs/artifact" },
+        "track_identities": { "$ref": "#/$defs/artifact" }
       }
     },
     "source_tracks": {
@@ -167,7 +168,11 @@
       "properties": {
         "artist": { "type": "integer", "minimum": 0 },
         "album": { "type": "integer", "minimum": 0 },
-        "track": { "type": "integer", "minimum": 0 }
+        "track": { "type": "integer", "minimum": 0 },
+        "artist_identity_mode": {
+          "enum": ["shared_artist", "primary_artist", "exact_bliss_credit"],
+          "default": "exact_bliss_credit"
+        }
       }
     },
     "extension": {
@@ -428,6 +433,15 @@
           "type": "array",
           "uniqueItems": true,
           "items": { "type": "string", "format": "uuid" }
+        },
+        "artist_identity_keys": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "primary_artist_identity_key": {
+          "type": "string",
+          "minLength": 1
         }
       }
     }

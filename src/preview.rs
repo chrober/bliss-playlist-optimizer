@@ -2003,6 +2003,7 @@ mod tests {
         RouteTrack {
             features: std::array::from_fn(|index| value + index as f32 / 100.0),
             artist_key: artist.to_owned(),
+            artist_repeat_keys: Vec::new(),
             album_key: format!("album-{artist}"),
         }
     }

@@ -14,7 +14,7 @@ use std::fmt;
 use rayon::prelude::*;
 
 use crate::bridge::repeat_windows_safe_at;
-use crate::route::RouteTrack;
+use crate::route::{artists_repeat, RouteTrack};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnchoredPathCandidate {
@@ -311,8 +311,7 @@ where
                             let destination_track = &request.tracks[request.right_anchor];
                             let conflicts_with_destination = (request.config.artist_window > 0
                                 && distance_to_destination <= request.config.artist_window
-                                && !candidate_track.artist_key.is_empty()
-                                && candidate_track.artist_key == destination_track.artist_key)
+                                && artists_repeat(candidate_track, destination_track))
                                 || (request.config.album_window > 0
                                     && distance_to_destination <= request.config.album_window
                                     && !candidate_track.album_key.is_empty()
@@ -460,6 +459,7 @@ mod tests {
         RouteTrack {
             features: std::array::from_fn(|index| value + index as f32 / 100.0),
             artist_key: artist.to_owned(),
+            artist_repeat_keys: Vec::new(),
             album_key: album.to_owned(),
         }
     }

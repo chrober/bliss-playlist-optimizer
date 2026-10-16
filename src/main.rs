@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 use bincode::Options;
 use bliss_mixer_core::database::{BlissDatabase, SUPPORTED_SCHEMA_IDENTITY};
+use bliss_mixer_core::repeat_identity::{
+    artist_repeat_keys, ArtistIdentitySet, ArtistRepeatMode, TrackIdentitySnapshot,
+};
 #[cfg(test)]
 use bliss_mixer_core::scoring::adaptive_distance;
 use bliss_mixer_core::scoring::{
@@ -41,9 +44,9 @@ const EXACT_COUNT_BEAM_WIDTH: usize = 64;
 // entire batch by Bliss relevance before optional guidance can influence it.
 const TARGET_GUIDANCE_DISCOVERY_MULTIPLIER: usize = 10;
 const MAX_TARGET_GUIDANCE_DISCOVERY_CANDIDATES: usize = 4_096;
-const LIBRARY_CACHE_VERSION: u8 = 4;
+const LIBRARY_CACHE_VERSION: u8 = 5;
 const MAX_LIBRARY_CACHE_BYTES: u64 = 512 * 1024 * 1024;
-const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v4\n";
+const LIBRARY_CACHE_MAGIC: &[u8] = b"bliss-playlist-optimizer-library-cache-v5\n";
 #[derive(Clone, Copy)]
 struct DestinationSearchEffort {
     name: &'static str,
@@ -145,6 +148,7 @@ struct Artifacts {
     learned_matrix: Option<Artifact>,
     local_candidate_inventory: Option<Artifact>,
     candidate_identities: Option<Artifact>,
+    track_identities: Option<Artifact>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +203,10 @@ struct SourceTrack {
     recording_mbid: Option<String>,
     #[serde(default)]
     artist_mbids: Vec<String>,
+    #[serde(default)]
+    artist_identity_keys: Vec<String>,
+    #[serde(default)]
+    primary_artist_identity_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +261,8 @@ struct RepeatWindows {
     artist: usize,
     album: usize,
     track: usize,
+    #[serde(default)]
+    artist_identity_mode: ArtistRepeatMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,6 +294,8 @@ struct ValidationSummary {
     database_schema: &'static str,
     database_sha256: String,
     learned_matrix_sha256: Option<String>,
+    track_identities_sha256: Option<String>,
+    track_identities_state: &'static str,
     local_candidate_inventory_sha256: Option<String>,
     candidate_identities_sha256: Option<String>,
     local_candidate_track_count: Option<usize>,
@@ -293,6 +305,12 @@ struct ValidationSummary {
     guidance_signal_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     guidance_addon_diagnostics: Vec<guidance::AddonDiagnostic>,
+}
+
+struct TrackIdentityLoad {
+    snapshot: Option<TrackIdentitySnapshot>,
+    sha256: Option<String>,
+    state: &'static str,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -2093,7 +2111,7 @@ fn prepare_runtime_request(
         .and_then(|cache_dir| load_library_cache(cache_dir, &request.artifacts.database));
     timings.record("database_cache_read", started.elapsed());
 
-    let (database_sha256, library, database_cache) = if let Some(cache) = cached {
+    let (database_sha256, mut library, database_cache) = if let Some(cache) = cached {
         (cache.database_sha256, Some(cache.library), "hit")
     } else {
         progress.update("database_hash", "Hashing Bliss database", None, None);
@@ -2151,6 +2169,27 @@ fn prepare_runtime_request(
             };
         (database_sha256, Some(library), cache_state)
     };
+
+    progress.update(
+        "track_identities_load",
+        "Loading stable artist repeat identities",
+        None,
+        None,
+    );
+    let started = Instant::now();
+    let track_identity_load =
+        load_optional_track_identity_snapshot(request.artifacts.track_identities.as_ref());
+    let track_identity_snapshot = track_identity_load.snapshot;
+    let track_identities_sha256 = track_identity_load.sha256;
+    let track_identities_state = track_identity_load.state;
+    if let Some(library) = library.as_mut() {
+        apply_track_identities(
+            library,
+            track_identity_snapshot.as_ref(),
+            request.repeat_windows.artist_identity_mode,
+        );
+    }
+    timings.record("track_identities_load", started.elapsed());
 
     progress.update(
         "local_candidate_inventory_load",
@@ -2366,6 +2405,8 @@ fn prepare_runtime_request(
         database_schema: SUPPORTED_SCHEMA_IDENTITY,
         database_sha256,
         learned_matrix_sha256,
+        track_identities_sha256,
+        track_identities_state,
         local_candidate_inventory_sha256,
         candidate_identities_sha256,
         local_candidate_track_count: local_candidate_rows.as_ref().map(HashSet::len),
@@ -2412,11 +2453,23 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         .quick_check()
         .map_err(|error| CommandFailure::new("DATABASE_INTEGRITY_FAILED", error.to_string()))?;
 
-    let validation_library = if request.artifacts.local_candidate_inventory.is_some() {
+    let track_identity_load =
+        load_optional_track_identity_snapshot(request.artifacts.track_identities.as_ref());
+    let track_identity_snapshot = track_identity_load.snapshot;
+    let track_identities_sha256 = track_identity_load.sha256;
+    let track_identities_state = track_identity_load.state;
+    let mut validation_library = if request.artifacts.local_candidate_inventory.is_some() {
         Some(load_usable_library(&database)?)
     } else {
         None
     };
+    if let Some(library) = validation_library.as_mut() {
+        apply_track_identities(
+            library,
+            track_identity_snapshot.as_ref(),
+            request.repeat_windows.artist_identity_mode,
+        );
+    }
     let (local_candidate_rows, local_candidate_inventory_sha256) =
         if let Some(inventory) = &request.artifacts.local_candidate_inventory {
             let (rows, hash) = load_local_candidate_inventory(
@@ -2527,6 +2580,8 @@ fn validate_request(path: &Path) -> Result<ValidationSummary, CommandFailure> {
         database_schema: SUPPORTED_SCHEMA_IDENTITY,
         database_sha256,
         learned_matrix_sha256,
+        track_identities_sha256,
+        track_identities_state,
         local_candidate_inventory_sha256,
         candidate_identities_sha256: None,
         local_candidate_track_count: local_candidate_rows.as_ref().map(HashSet::len),
@@ -2688,6 +2743,10 @@ fn load_usable_library(database: &BlissDatabase) -> Result<Library, CommandFailu
         });
         route_tracks.push(route::RouteTrack {
             features,
+            artist_repeat_keys: artist_repeat_keys(
+                &ArtistIdentitySet::legacy(&artist_key),
+                ArtistRepeatMode::ExactBlissCredit,
+            ),
             artist_key,
             album_key,
         });
@@ -2696,6 +2755,72 @@ fn load_usable_library(database: &BlissDatabase) -> Result<Library, CommandFailu
         metadata: metadata_rows,
         tracks: route_tracks,
     })
+}
+
+fn load_optional_track_identity_snapshot(artifact: Option<&Artifact>) -> TrackIdentityLoad {
+    let Some(artifact) = artifact else {
+        return TrackIdentityLoad {
+            snapshot: None,
+            sha256: None,
+            state: "not_supplied",
+        };
+    };
+    if artifact.schema_identity.as_deref() != Some("lyrion-track-identities-v1") {
+        eprintln!(
+            "{PROGRAM}: artist repeat identity snapshot declares an unsupported schema; using exact Bliss artist credits"
+        );
+        return TrackIdentityLoad {
+            snapshot: None,
+            sha256: None,
+            state: "fallback_schema_mismatch",
+        };
+    }
+    let hash = match hash_artifact(artifact, "track identities") {
+        Ok(hash) => hash,
+        Err(error) => {
+            eprintln!(
+                "{PROGRAM}: artist repeat identity snapshot is unavailable or does not match its declaration ({}); using exact Bliss artist credits",
+                error.message
+            );
+            return TrackIdentityLoad {
+                snapshot: None,
+                sha256: None,
+                state: "fallback_artifact_invalid",
+            };
+        }
+    };
+    match TrackIdentitySnapshot::open_read_only(&artifact.path) {
+        Ok(snapshot) => TrackIdentityLoad {
+            snapshot: Some(snapshot),
+            sha256: Some(hash),
+            state: "loaded",
+        },
+        Err(error) => {
+            eprintln!(
+                "{PROGRAM}: artist repeat identity snapshot is invalid ({error}); using exact Bliss artist credits"
+            );
+            TrackIdentityLoad {
+                snapshot: None,
+                sha256: Some(hash),
+                state: "fallback_snapshot_invalid",
+            }
+        }
+    }
+}
+
+fn apply_track_identities(
+    library: &mut Library,
+    snapshot: Option<&TrackIdentitySnapshot>,
+    mode: ArtistRepeatMode,
+) {
+    for (metadata, track) in library.metadata.iter().zip(library.tracks.iter_mut()) {
+        let identity = snapshot
+            .and_then(|snapshot| snapshot.get(&metadata.file))
+            .cloned()
+            .unwrap_or_else(|| ArtistIdentitySet::legacy(&track.artist_key))
+            .with_legacy_credit(&track.artist_key);
+        track.artist_repeat_keys = artist_repeat_keys(&identity, mode);
+    }
 }
 
 fn bridge_candidate_id(row_id: u64) -> String {
@@ -2831,6 +2956,22 @@ fn source_semantic_identity(
         artist_ids,
         artist_name,
     }
+}
+
+fn source_artist_repeat_keys(
+    source: &SourceTrack,
+    library_track: &route::RouteTrack,
+    mode: ArtistRepeatMode,
+) -> Vec<String> {
+    if source.artist_identity_keys.is_empty() && source.primary_artist_identity_key.is_none() {
+        return library_track.artist_repeat_keys.clone();
+    }
+    let identity = ArtistIdentitySet {
+        shared_keys: source.artist_identity_keys.clone(),
+        primary_key: source.primary_artist_identity_key.clone(),
+        legacy_credit: source.artist.clone().unwrap_or_default(),
+    };
+    artist_repeat_keys(&identity, mode)
 }
 
 fn candidate_semantic_identity(
@@ -3238,7 +3379,9 @@ fn select_fixed_source_extension(
         let mut artist_counts = HashMap::<&str, usize>::new();
         let mut album_counts = HashMap::<&str, usize>::new();
         for index in source_library_indices {
-            *artist_counts.entry(&tracks[*index].artist_key).or_default() += 1;
+            for artist in route::artist_repeat_capacity_keys(&tracks[*index]) {
+                *artist_counts.entry(artist).or_default() += 1;
+            }
             *album_counts.entry(&tracks[*index].album_key).or_default() += 1;
         }
         if artist_counts.values().any(|count| *count > artist_capacity)
@@ -3258,9 +3401,11 @@ fn select_fixed_source_extension(
         let mut considered = 0usize;
         for (candidate, distance) in selection_order.iter().copied() {
             considered += 1;
-            let artist = tracks[candidate].artist_key.as_str();
+            let artists = route::artist_repeat_capacity_keys(&tracks[candidate]);
             let album = tracks[candidate].album_key.as_str();
-            if artist_counts.get(artist).copied().unwrap_or(0) >= artist_capacity
+            if artists
+                .iter()
+                .any(|artist| artist_counts.get(artist).copied().unwrap_or(0) >= artist_capacity)
                 || album_counts.get(album).copied().unwrap_or(0) >= album_capacity
             {
                 if considered.is_multiple_of(EXTENSION_PROGRESS_CHUNK) {
@@ -3291,7 +3436,9 @@ fn select_fixed_source_extension(
                     .cloned()
                     .unwrap_or_default(),
             });
-            *artist_counts.entry(artist).or_default() += 1;
+            for artist in artists {
+                *artist_counts.entry(artist).or_default() += 1;
+            }
             *album_counts.entry(album).or_default() += 1;
             progress.update(
                 "extension_membership_selection",
@@ -3572,6 +3719,11 @@ fn optimize_route_request_with_options(
         tracks.push(route::RouteTrack {
             features: route_track.features,
             artist_key: repeat_key(&artist),
+            artist_repeat_keys: source_artist_repeat_keys(
+                source,
+                route_track,
+                request.repeat_windows.artist_identity_mode,
+            ),
             album_key: repeat_key(&album),
         });
     }
@@ -3873,6 +4025,11 @@ fn analyze_bridge_validated(
         source_route_tracks.push(route::RouteTrack {
             features: route_track.features,
             artist_key,
+            artist_repeat_keys: source_artist_repeat_keys(
+                source,
+                route_track,
+                request.repeat_windows.artist_identity_mode,
+            ),
             album_key,
         });
     }
@@ -6533,6 +6690,54 @@ mod tests {
     }
 
     #[test]
+    fn invalid_track_identity_artifacts_fall_back_without_disabling_the_request() {
+        let absent = load_optional_track_identity_snapshot(None);
+        assert_eq!(absent.state, "not_supplied");
+        assert!(absent.snapshot.is_none());
+
+        let schema_mismatch = Artifact {
+            path: "unused.sqlite".to_owned(),
+            sha256: None,
+            schema_identity: Some("unknown-identities-v1".to_owned()),
+            cache_identity: None,
+        };
+        let fallback = load_optional_track_identity_snapshot(Some(&schema_mismatch));
+        assert_eq!(fallback.state, "fallback_schema_mismatch");
+        assert!(fallback.snapshot.is_none());
+
+        let missing_path = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-missing-identities-{}.sqlite",
+            std::process::id()
+        ));
+        let missing = Artifact {
+            path: missing_path.to_string_lossy().into_owned(),
+            sha256: None,
+            schema_identity: Some("lyrion-track-identities-v1".to_owned()),
+            cache_identity: None,
+        };
+        let fallback = load_optional_track_identity_snapshot(Some(&missing));
+        assert_eq!(fallback.state, "fallback_artifact_invalid");
+        assert!(fallback.snapshot.is_none());
+
+        let invalid_path = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-invalid-identities-{}.sqlite",
+            std::process::id()
+        ));
+        fs::write(&invalid_path, b"not a SQLite snapshot").unwrap();
+        let invalid = Artifact {
+            path: invalid_path.to_string_lossy().into_owned(),
+            sha256: None,
+            schema_identity: Some("lyrion-track-identities-v1".to_owned()),
+            cache_identity: None,
+        };
+        let fallback = load_optional_track_identity_snapshot(Some(&invalid));
+        assert_eq!(fallback.state, "fallback_snapshot_invalid");
+        assert!(fallback.snapshot.is_none());
+        assert!(fallback.sha256.is_some());
+        let _ = fs::remove_file(invalid_path);
+    }
+
+    #[test]
     fn trusted_request_is_explicit_and_limited_to_runtime_commands() {
         let args = vec![
             "bridge".to_owned(),
@@ -6593,6 +6798,7 @@ mod tests {
                     (track + 1) as f32 * (feature + 2) as f32 / 97.0
                 }),
                 artist_key: format!("artist-{track}"),
+                artist_repeat_keys: Vec::new(),
                 album_key: format!("album-{track}"),
             })
             .collect::<Vec<_>>();
@@ -6632,6 +6838,7 @@ mod tests {
                     },
                 ),
                 artist_key: format!("artist-{position}"),
+                artist_repeat_keys: Vec::new(),
                 album_key: format!("album-{position}"),
             })
             .collect::<Vec<_>>();
@@ -7100,6 +7307,7 @@ mod tests {
                     index as f32 / 100.0 + feature as f32 / 1000.0
                 }),
                 artist_key: format!("artist-{index}"),
+                artist_repeat_keys: Vec::new(),
                 album_key: format!("album-{index}"),
             })
             .collect::<Vec<_>>();
@@ -7758,7 +7966,15 @@ mod tests {
         .unwrap();
         let mut conflict_request = conflict.request;
         let first_artist = conflict_request.source_tracks[0].artist.clone();
+        let first_artist_identity_keys = vec!["artist-mbid:repeat-conflict".to_owned()];
+        let first_primary_artist_identity_key = Some("artist-mbid:repeat-conflict".to_owned());
+        conflict_request.source_tracks[0].artist_identity_keys = first_artist_identity_keys.clone();
+        conflict_request.source_tracks[0].primary_artist_identity_key =
+            first_primary_artist_identity_key.clone();
         conflict_request.source_tracks[1].artist = first_artist;
+        conflict_request.source_tracks[1].artist_identity_keys = first_artist_identity_keys;
+        conflict_request.source_tracks[1].primary_artist_identity_key =
+            first_primary_artist_identity_key;
         let conflict_matrix_sha256 = conflict
             .summary
             .learned_matrix_sha256
