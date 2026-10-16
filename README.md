@@ -35,7 +35,7 @@ Provider scoring remains network-free.
 flowchart LR
     B[Better Call Bliss] -->|frozen request, local candidate inventory| O[bliss-playlist-optimizer]
     O --> C[bliss-mixer-core\nBliss distance and matrices]
-    O <-->|SPI v2: resolved artifact| L[Last.fm provider]
+    O <-->|SPI v2: artifact or direct prepare| L[Last.fm provider]
     O <-->|SPI v2: read-only persist.db| P[Library Signals provider]
     O -->|result, progress, diagnostics| B
 ```
@@ -44,9 +44,9 @@ flowchart LR
 
 | Component | Responsibility |
 | --- | --- |
-| [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss) | Lyrion UI, request capture, LastMix acquisition, preview, reporting, and persistence. |
+| [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss) | Lyrion UI, request capture, provider discovery, preview, reporting, and persistence. |
 | [`bliss-playlist-guidance-spi`](https://github.com/chrober/bliss-playlist-guidance-spi) | Host-neutral JSONL contract for optional candidate guidance. |
-| [`bliss-guidance-lastfm`](https://github.com/chrober/bliss-guidance-lastfm) | Consumes Better Call Bliss's frozen, resolved Last.fm artifact. |
+| [`bliss-guidance-lastfm`](https://github.com/chrober/bliss-guidance-lastfm) | Consumes a frozen LastMix artifact or performs bounded direct acquisition during `prepare`; scoring is network-free. |
 | [`bliss-guidance-library-signals`](https://github.com/chrober/bliss-guidance-library-signals) | Reads a trusted, read-only Lyrion `persist.db` snapshot for play count, last played, and library age. |
 | [`bliss-mixer-core`](https://github.com/chrober/bliss-mixer-core) | Shared Bliss scoring and matrix behavior. |
 

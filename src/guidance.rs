@@ -1085,6 +1085,7 @@ mod tests {
                 confidence: 1.0,
                 rationale: None,
                 observed_at: None,
+                observation: None,
             }],
         )
         .unwrap_err();
@@ -1104,6 +1105,7 @@ mod tests {
                     confidence: 1.0,
                     rationale: None,
                     observed_at: None,
+                    observation: None,
                 },
             },
             ProviderSignal {
@@ -1116,6 +1118,7 @@ mod tests {
                     confidence: 0.5,
                     rationale: None,
                     observed_at: None,
+                    observation: None,
                 },
             },
         ];
@@ -1252,6 +1255,7 @@ mod tests {
                 confidence: 1.0,
                 rationale: None,
                 observed_at: None,
+                observation: None,
             },
         }];
         let weights = GuidanceWeights::from_policy(&[crate::GuidancePolicyEntry {

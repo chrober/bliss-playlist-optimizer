@@ -21,11 +21,13 @@ similarity behavior with `bliss-mixer` through `bliss-mixer-core`, uses
 deterministic parallel Rust search where useful, and requires neither Python nor
 network access on the server.
 
-This program deliberately does not call Last.fm, modify `bliss.db`, write audio
-metadata, or create Lyrion playlists. Better Call Bliss owns provider access,
-provider-to-LMS identity resolution, user interaction, Preview, and playlist
-persistence; this repository owns the versioned native request/result contracts,
-validation, scoring, selection, routing, and diagnostic artifacts. The
+This program deliberately does not call Last.fm itself, modify `bliss.db`,
+write audio metadata, or create Lyrion playlists. Better Call Bliss owns
+provider discovery and trusted launch configuration, user interaction, Preview,
+and playlist persistence. A configured provider may acquire its own bounded
+data during `prepare`; the optimizer owns the provider lifecycle, versioned
+native request/result contracts, validation, scoring, selection, routing, and
+diagnostic artifacts. The
 user-facing playlist modes and options are described in the plugin's
 [strategy guide](https://github.com/chrober/lms-better-call-bliss/blob/main/ALGORITHMS.md).
 
@@ -121,13 +123,15 @@ change is a safe miss.
 Cache format v2 stores compact metadata separately from the route features and
 artist/album repeat keys. Destination jobs borrow those decoded route tracks
 instead of cloning the complete library for every optimizer process. Optional
-candidate-guidance lookup is evidence-scoped. Current Better Call Bliss requests
-carry explicit `bliss-row-N` candidate identities resolved against the frozen
-LMS/Bliss inventory before launch, so the native engine does not interpret
-Last.fm names or MusicBrainz identifiers. The legacy unresolved-evidence form
-remains accepted by the v1 contract. In either form the optimizer scans
-candidates once but retains index entries only for identities actually named by
-the evidence bundle. Its retained memory is therefore proportional to evidence
+candidate-guidance lookup is evidence-scoped. Current Better Call Bliss
+requests carry explicit `bliss-row-N` candidate identities resolved against the
+frozen LMS/Bliss inventory before launch. Bounded provider score batches retain
+the matching title, artist, album, recording MBID, artist MBIDs, and Lyrion URL
+MD5 where available, so providers can resolve their own identities without
+changing optimizer candidate IDs. The legacy unresolved-evidence form remains
+accepted by the v1 contract. Artifact-backed lookup scans candidates once but
+retains index entries only for identities named by the evidence bundle. Its
+retained memory is therefore proportional to evidence
 matches rather than the full library. A 200,000-candidate regression test
 protects this property. The remaining cold and warm setup passes are
 intentionally linear in library size; the benchmark command below should be used
@@ -207,28 +211,27 @@ membership or weaken acoustic, local-library, uniqueness, or repeat gates.
 
 ## Optional guidance addons
 
-The optimizer owns a small process-based guidance SPI, shared by the
+The optimizer hosts a small process-based guidance SPI, shared by the
 [`bliss-playlist-guidance-spi`](https://github.com/chrober/bliss-playlist-guidance-spi)
 crate and independent addon repositories. The initial addon implementations are
 [`bliss-guidance-lastfm`](https://github.com/chrober/bliss-guidance-lastfm),
-which adapts the raw `semantic-evidence-v1` snapshot into contextual Last.fm
-guidance, and
+which adapts a resolved LastMix artifact or performs bounded direct acquisition
+during `prepare` before producing contextual Last.fm guidance, and
 [`bliss-guidance-library-signals`](https://github.com/chrober/bliss-guidance-library-signals),
-which adapts the raw `lms-play-counts-v1` snapshot into global play-count
-guidance. “Evidence” names are retained for those existing raw artifact schemas;
+which reads trusted, read-only Lyrion data for play count, last played, and
+library age. “Evidence” names are retained for those existing raw artifact schemas;
 addon output is called guidance because it is advisory input to candidate
 reranking.
 
 An addon is a trusted executable speaking versioned JSONL over stdin/stdout. The
 optimizer discovers and prepares configured addons, batches candidate requests,
 bounds their signals, and treats a timeout or provider failure as neutral
-guidance. Provider acquisition, network access, and LMS integration remain
-outside the native engine. The `guidance_addons` request field is an initial
-host contract: it initializes configured add-ons and records bounded signals and
-diagnostics in the native artifact. A subsequent integration gate will apply
-those provider-neutral indexes consistently to each planner's candidate
-reranking policy. Existing request-level selection fields remain the active
-compatibility path until then.
+guidance. Provider acquisition and network access remain provider-owned; LMS
+integration remains plugin-owned. The `guidance_addons` request field
+initializes configured providers and records bounded signals, structured log
+events, and diagnostics in the native artifact. Provider-neutral signals are
+applied by the planner's Bliss-first candidate policy; they cannot admit a
+candidate rejected by acoustic or hard constraints.
 
 Adaptive transition scores are cached privately within each restart. Independent
 restarts run through indexed Rayon iteration and are reduced with stable
