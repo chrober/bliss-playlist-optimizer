@@ -5170,26 +5170,23 @@ fn analyze_bridge_validated(
                 let minimum = request.extension.min_added_tracks.unwrap_or(0);
                 let maximum =
                     max_added_tracks.expect("automatic destination route has a validated maximum");
-                let direct_selection = search_destination(0)?
-                    .into_iter()
-                    .next()
-                    .expect("a direct destination option is always available");
-                let direct_route = direct_selection
-                    .selection
-                    .final_route
-                    .as_deref()
-                    .expect("the direct destination option is feasible");
-                let direct_quality = evaluate_consensus(direct_route)?;
+                let direct_selection = search_destination(0)?.into_iter().next();
+                let direct_quality = evaluate_consensus(&selected_library_route)?;
                 let cautious_consensus = direct_caution == "cautious";
                 let disagreement_triggered = destination_distance_selection
                     .as_ref()
                     .expect("destination routes have direct model evidence")
                     .3
                     .disagreement_triggered_search;
-                if minimum == 0
+                let accepted_direct = if minimum == 0
                     && direct_quality.worst_percentile <= threshold
                     && !disagreement_triggered
                 {
+                    direct_selection.clone()
+                } else {
+                    None
+                };
+                if let Some(direct_selection) = accepted_direct {
                     (
                         0,
                         direct_selection.selection,
@@ -5220,9 +5217,13 @@ fn analyze_bridge_validated(
                         .iter()
                         .find(|option| option.added_track_count == 0)
                         .cloned()
-                        .unwrap_or(direct_selection);
+                        .or(direct_selection);
                     let mut qualifying = None;
-                    let mut fallback = (minimum == 0).then_some((searched_direct, direct_quality));
+                    let mut fallback = if minimum == 0 {
+                        searched_direct.map(|selection| (selection, direct_quality))
+                    } else {
+                        None
+                    };
                     for option in options
                         .into_iter()
                         .filter(|option| option.added_track_count >= minimum.max(1))
@@ -6913,12 +6914,31 @@ mod tests {
         request["extension"]["min_added_tracks"] = Value::from(2);
         fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
         let result = analyze_bridge_request(&temporary).unwrap();
-        let _ = fs::remove_file(temporary);
+        let _ = fs::remove_file(&temporary);
         let SelectionPreviewArtifact::Exact(preview) = result.selection_preview else {
             panic!("destination route must return an exact-selection preview");
         };
         assert_eq!(preview.added_track_count, 2);
         assert_eq!(preview.requested_added_tracks, 2);
+
+        request["job_id"] = Value::String("destination-route-repeat-budget-test".to_owned());
+        request["extension"]["min_added_tracks"] = Value::from(0);
+        let destination = request["source_tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|track| track["id"] == "track-07")
+            .unwrap()
+            .clone();
+        request["history_tracks"] = Value::Array(vec![destination]);
+        fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+        let failure = analyze_bridge_request(&temporary).unwrap_err();
+        let _ = fs::remove_file(temporary);
+        assert_eq!(failure.code, "DESTINATION_ROUTE_NOT_FOUND");
+        assert_eq!(
+            failure.message,
+            "no repeat-safe destination route could be constructed within the configured budget"
+        );
     }
 
     #[test]

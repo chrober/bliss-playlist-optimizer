@@ -159,20 +159,28 @@ fn generated_positions_repeat_safe(
     tracks: &[RouteTrack],
     config: AnchoredPathSearchConfig,
 ) -> bool {
-    (first_generated..first_generated.saturating_add(generated_count)).all(|position| {
-        repeat_windows_safe_at(
-            route,
-            tracks,
-            position,
-            config.artist_window,
-            config.album_window,
-        ) && (config.track_window == 0
-            || route.iter().enumerate().all(|(other_position, track)| {
-                other_position == position
-                    || other_position.abs_diff(position) > config.track_window
-                    || *track != route[position]
-            }))
-    })
+    (first_generated..first_generated.saturating_add(generated_count))
+        .all(|position| position_repeat_safe(route, position, tracks, config))
+}
+
+fn position_repeat_safe(
+    route: &[usize],
+    position: usize,
+    tracks: &[RouteTrack],
+    config: AnchoredPathSearchConfig,
+) -> bool {
+    repeat_windows_safe_at(
+        route,
+        tracks,
+        position,
+        config.artist_window,
+        config.album_window,
+    ) && (config.track_window == 0
+        || route.iter().enumerate().all(|(other_position, track)| {
+            other_position == position
+                || other_position.abs_diff(position) > config.track_window
+                || *track != route[position]
+        }))
 }
 
 fn validate_track_indices(
@@ -260,24 +268,33 @@ where
     }
     let candidates = candidates_by_track.keys().copied().collect::<Vec<_>>();
     let structural_upper_bound = request.config.max_intermediates.min(candidates.len());
-    let direct = adjacent_distance(request.left_anchor, request.right_anchor);
-    let mut direct_route = request.route_prefix.to_vec();
-    direct_route.push(request.right_anchor);
-    let mut options = vec![AnchoredPathOption {
-        intermediates: Vec::new(),
-        route: direct_route,
-        transition_sum: direct,
-        worst_transition: direct,
-        stats: AnchoredPathSearchStats {
-            evaluated_states: 1,
-            retained_states: 1,
-            structural_upper_bound,
-        },
-    }];
-
     let mut repeat_prefix = request.immutable_history.to_vec();
     repeat_prefix.extend(request.route_prefix.iter().copied());
     let first_generated = repeat_prefix.len();
+    let direct = adjacent_distance(request.left_anchor, request.right_anchor);
+    let mut direct_repeat_route = repeat_prefix.clone();
+    direct_repeat_route.push(request.right_anchor);
+    let mut options = Vec::new();
+    if position_repeat_safe(
+        &direct_repeat_route,
+        direct_repeat_route.len() - 1,
+        request.tracks,
+        request.config,
+    ) {
+        let mut direct_route = request.route_prefix.to_vec();
+        direct_route.push(request.right_anchor);
+        options.push(AnchoredPathOption {
+            intermediates: Vec::new(),
+            route: direct_route,
+            transition_sum: direct,
+            worst_transition: direct,
+            stats: AnchoredPathSearchStats {
+                evaluated_states: 1,
+                retained_states: 1,
+                structural_upper_bound,
+            },
+        });
+    }
 
     for requested in 1..=request.config.max_intermediates {
         let mut evaluated_states = 1usize;
@@ -381,6 +398,9 @@ where
                     request.tracks,
                     request.config,
                 ) {
+                    return None;
+                }
+                if !position_repeat_safe(&route, route.len() - 1, request.tracks, request.config) {
                     return None;
                 }
                 let final_edge =
@@ -567,6 +587,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(repeated_generated_track.len(), 1);
+    }
+
+    #[test]
+    fn same_artist_destination_requires_enough_intermediates_for_the_repeat_window() {
+        let tracks = vec![
+            track(0.0, "same-artist", "start-album"),
+            track(1.0, "bridge-1", "bridge-1"),
+            track(2.0, "bridge-2", "bridge-2"),
+            track(3.0, "bridge-3", "bridge-3"),
+            track(4.0, "bridge-4", "bridge-4"),
+            track(5.0, "bridge-5", "bridge-5"),
+            track(6.0, "same-artist", "destination-album"),
+        ];
+        let candidates = (1..=5)
+            .map(|track| AnchoredPathCandidate {
+                track,
+                guidance_adjustment: 0.0,
+            })
+            .collect::<Vec<_>>();
+        let search = |max_intermediates| {
+            search_anchored_paths(
+                AnchoredPathRequest {
+                    route_prefix: &[0],
+                    immutable_history: &[],
+                    unavailable_tracks: &[0, 6],
+                    left_anchor: 0,
+                    right_anchor: 6,
+                    candidates: &candidates,
+                    tracks: &tracks,
+                    config: AnchoredPathSearchConfig {
+                        max_intermediates,
+                        artist_window: 5,
+                        album_window: 0,
+                        track_window: 0,
+                        ..config(max_intermediates)
+                    },
+                },
+                |left, right| left.abs_diff(right) as f64,
+            )
+            .unwrap()
+        };
+
+        assert!(
+            search(4).is_empty(),
+            "a four-track budget cannot separate same-artist anchors for a window of five"
+        );
+        let sufficient = search(5);
+        assert_eq!(sufficient.len(), 1);
+        assert_eq!(sufficient[0].intermediates.len(), 5);
+        assert_eq!(sufficient[0].route, vec![0, 1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
