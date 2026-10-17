@@ -283,6 +283,180 @@ struct ExtensionSettings {
     direct_transition_caution: Option<String>,
     shortlist_limit: Option<usize>,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DestinationRepeatRequirement {
+    artist: usize,
+    album: usize,
+    track: usize,
+}
+
+impl DestinationRepeatRequirement {
+    fn minimum(self) -> usize {
+        self.artist.max(self.album).max(self.track)
+    }
+
+    fn explanation(self, windows: &RepeatWindows) -> String {
+        let mut constraints = Vec::new();
+        if self.artist > 0 {
+            constraints.push(format!(
+                "artist window {} requires {}",
+                windows.artist, self.artist
+            ));
+        }
+        if self.album > 0 {
+            constraints.push(format!(
+                "album window {} requires {}",
+                windows.album, self.album
+            ));
+        }
+        if self.track > 0 {
+            constraints.push(format!(
+                "track window {} requires {}",
+                windows.track, self.track
+            ));
+        }
+        constraints.join("; ")
+    }
+}
+
+fn request_artist_repeat_keys(track: &SourceTrack, mode: ArtistRepeatMode) -> Vec<String> {
+    let identity =
+        if track.artist_identity_keys.is_empty() && track.primary_artist_identity_key.is_none() {
+            ArtistIdentitySet::legacy(track.artist.as_deref().unwrap_or_default())
+        } else {
+            ArtistIdentitySet {
+                shared_keys: track.artist_identity_keys.clone(),
+                primary_key: track.primary_artist_identity_key.clone(),
+                legacy_credit: track.artist.clone().unwrap_or_default(),
+            }
+        };
+    artist_repeat_keys(&identity, mode)
+}
+
+fn minimum_intermediates_after_conflict(
+    prefix_position: usize,
+    prefix_len: usize,
+    window: usize,
+) -> usize {
+    window
+        .saturating_add(1)
+        .saturating_sub(prefix_len.saturating_sub(prefix_position))
+}
+
+fn destination_repeat_requirement(
+    history: &[SourceTrack],
+    route_prefix: &[SourceTrack],
+    destination: &SourceTrack,
+    windows: &RepeatWindows,
+) -> DestinationRepeatRequirement {
+    let prefix_len = history.len() + route_prefix.len();
+    let destination_artist_keys =
+        request_artist_repeat_keys(destination, windows.artist_identity_mode);
+    let destination_album = destination
+        .album
+        .as_deref()
+        .map(repeat_key)
+        .unwrap_or_default();
+    let destination_file = destination.database_file.as_deref();
+
+    let mut requirement = DestinationRepeatRequirement::default();
+    for (position, previous) in history.iter().chain(route_prefix).enumerate() {
+        let required = |window| minimum_intermediates_after_conflict(position, prefix_len, window);
+        if windows.artist > 0 {
+            let previous_artist_keys =
+                request_artist_repeat_keys(previous, windows.artist_identity_mode);
+            if !destination_artist_keys.is_empty()
+                && destination_artist_keys
+                    .iter()
+                    .any(|key| previous_artist_keys.contains(key))
+            {
+                requirement.artist = requirement.artist.max(required(windows.artist));
+            }
+        }
+        if windows.album > 0
+            && !destination_album.is_empty()
+            && previous
+                .album
+                .as_deref()
+                .is_some_and(|album| repeat_key(album) == destination_album)
+        {
+            requirement.album = requirement.album.max(required(windows.album));
+        }
+        if windows.track > 0
+            && (previous.id == destination.id
+                || destination_file
+                    .is_some_and(|file| previous.database_file.as_deref() == Some(file)))
+        {
+            requirement.track = requirement.track.max(required(windows.track));
+        }
+    }
+    requirement
+}
+
+fn preflight_destination_repeat_budget(request: &Request) -> Result<(), CommandFailure> {
+    if request.extension.mode != "destination_route"
+        || request.route.rejoin_track_id.is_some()
+        || request.route.destination_track_ids.len() > 1
+    {
+        return Ok(());
+    }
+    let Some(start_id) = request.route.start_track_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(destination_id) = request.route.destination_track_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(start_position) = request
+        .source_tracks
+        .iter()
+        .position(|track| track.id == start_id)
+    else {
+        return Ok(());
+    };
+    let Some(destination_position) = request
+        .source_tracks
+        .iter()
+        .position(|track| track.id == destination_id)
+    else {
+        return Ok(());
+    };
+    if start_position + 1 != destination_position
+        || destination_position + 1 != request.source_tracks.len()
+    {
+        return Ok(());
+    }
+
+    let requirement = destination_repeat_requirement(
+        &request.history_tracks,
+        &request.source_tracks[..destination_position],
+        &request.source_tracks[destination_position],
+        &request.repeat_windows,
+    );
+    let (available, budget_label) =
+        if request.extension.destination_mode.as_deref() == Some("exact") {
+            (
+                request.extension.additional_track_count.unwrap_or(0),
+                "configured exact count",
+            )
+        } else {
+            (
+                request.extension.max_added_tracks.unwrap_or(0),
+                "configured maximum",
+            )
+        };
+    if requirement.minimum() > available {
+        return Err(CommandFailure::new(
+            "DESTINATION_ROUTE_BUDGET_UNSATISFIABLE",
+            format!(
+                "destination repeat constraints require at least {} intermediate tracks ({}); {budget_label} is {available}",
+                requirement.minimum(),
+                requirement.explanation(&request.repeat_windows),
+            ),
+        ));
+    }
+    Ok(())
+}
 #[derive(Debug, Serialize)]
 struct ValidationSummary {
     schema_version: u8,
@@ -2088,6 +2262,16 @@ fn prepare_runtime_request(
     let started = Instant::now();
     let (request, request_sha256) = decode_request_once(path, options.validate_contracts)?;
     timings.record("request_decode", started.elapsed());
+
+    progress.update(
+        "destination_repeat_preflight",
+        "Checking destination repeat-window feasibility",
+        None,
+        None,
+    );
+    let started = Instant::now();
+    preflight_destination_repeat_budget(&request)?;
+    timings.record("destination_repeat_preflight", started.elapsed());
 
     if let Some(identity) = &request.artifacts.database.schema_identity {
         if identity != "TracksV2" && identity != SUPPORTED_SCHEMA_IDENTITY {
@@ -6503,6 +6687,65 @@ mod tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    fn repeat_track(id: &str, artist_key: &str, album: &str) -> SourceTrack {
+        SourceTrack {
+            id: id.to_owned(),
+            database_file: Some(format!("{id}.flac")),
+            title: Some(id.to_owned()),
+            artist: Some(artist_key.to_owned()),
+            album: Some(album.to_owned()),
+            recording_mbid: None,
+            artist_mbids: Vec::new(),
+            artist_identity_keys: vec![artist_key.to_owned()],
+            primary_artist_identity_key: Some(artist_key.to_owned()),
+        }
+    }
+
+    #[test]
+    fn destination_repeat_preflight_reports_the_governing_minimum() {
+        let history = vec![
+            repeat_track("old-album-track", "artist:other", "destination album"),
+            repeat_track("recent-track", "artist:other", "other album"),
+        ];
+        let prefix = vec![repeat_track("start", "artist:destination", "start album")];
+        let destination = repeat_track("destination", "artist:destination", "destination album");
+        let windows = RepeatWindows {
+            artist: 5,
+            album: 10,
+            track: 100,
+            artist_identity_mode: ArtistRepeatMode::SharedArtist,
+        };
+
+        let requirement = destination_repeat_requirement(&history, &prefix, &destination, &windows);
+
+        assert_eq!(requirement.artist, 5);
+        assert_eq!(requirement.album, 8);
+        assert_eq!(requirement.track, 0);
+        assert_eq!(requirement.minimum(), 8);
+        assert_eq!(
+            requirement.explanation(&windows),
+            "artist window 5 requires 5; album window 10 requires 8"
+        );
+    }
+
+    #[test]
+    fn destination_repeat_preflight_accounts_for_exact_track_history() {
+        let destination = repeat_track("destination", "artist:destination", "album");
+        let history = vec![repeat_track("destination", "artist:other", "other album")];
+        let prefix = vec![repeat_track("start", "artist:start", "start album")];
+        let windows = RepeatWindows {
+            artist: 0,
+            album: 0,
+            track: 100,
+            artist_identity_mode: ArtistRepeatMode::SharedArtist,
+        };
+
+        let requirement = destination_repeat_requirement(&history, &prefix, &destination, &windows);
+
+        assert_eq!(requirement.track, 99);
+        assert_eq!(requirement.minimum(), 99);
+    }
+
     #[test]
     fn shared_candidate_genre_filter_excludes_christmas_and_unrelated_groups() {
         let library = Library {
@@ -6934,10 +7177,10 @@ mod tests {
         fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
         let failure = analyze_bridge_request(&temporary).unwrap_err();
         let _ = fs::remove_file(temporary);
-        assert_eq!(failure.code, "DESTINATION_ROUTE_NOT_FOUND");
+        assert_eq!(failure.code, "DESTINATION_ROUTE_BUDGET_UNSATISFIABLE");
         assert_eq!(
             failure.message,
-            "no repeat-safe destination route could be constructed within the configured budget"
+            "destination repeat constraints require at least 89 intermediate tracks (track window 100 requires 89); configured maximum is 4"
         );
     }
 
