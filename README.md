@@ -1,6 +1,6 @@
 # bliss-playlist-optimizer
 
-`bliss-playlist-optimizer` is the network-free Rust engine that turns a frozen
+`bliss-playlist-optimizer` is the Bliss-first Rust engine that turns a frozen
 Lyrion playlist or queue request into an auditable Bliss-first result. It is
 used by [Better Call Bliss](https://github.com/chrober/lms-better-call-bliss).
 
