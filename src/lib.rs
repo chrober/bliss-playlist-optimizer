@@ -3,6 +3,7 @@
 pub mod anchored_path;
 pub mod bridge;
 pub mod contextual;
+pub mod multi_gap;
 pub mod preview;
 pub mod route;
 pub mod semantic;

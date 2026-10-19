@@ -105,6 +105,7 @@ pub struct AnchoredPathOption {
     pub route: Vec<usize>,
     pub transition_sum: f64,
     pub worst_transition: f64,
+    pub guidance_adjustment: f64,
     pub stats: AnchoredPathSearchStats,
 }
 
@@ -325,6 +326,7 @@ where
             route: direct_route,
             transition_sum: direct,
             worst_transition: direct,
+            guidance_adjustment: 0.0,
             stats: AnchoredPathSearchStats {
                 evaluated_states: 1,
                 retained_states: 1,
@@ -460,16 +462,15 @@ where
         };
         let worst_limit = best.worst_transition + (best.worst_transition * 0.02).max(1.0e-9);
         let sum_limit = best.transition_sum + (best.transition_sum * 0.05).max(1.0e-9);
-        let quality_band = complete
-            .into_iter()
+        let quality_band_len = complete
+            .iter()
             .take_while(|candidate| candidate.worst_transition <= worst_limit)
             .filter(|candidate| candidate.transition_sum <= sum_limit)
-            .collect::<Vec<_>>();
-        let selection_pool =
-            varied_pool_length(quality_band.len(), request.config.variation_percent)
-                .max(request.config.alternatives_per_count)
-                .min(quality_band.len());
-        let mut selected = quality_band
+            .count();
+        let selection_pool = varied_pool_length(quality_band_len, request.config.variation_percent)
+            .max(request.config.alternatives_per_count)
+            .min(complete.len());
+        let mut selected = complete
             .into_iter()
             .take(selection_pool)
             .collect::<Vec<_>>();
@@ -501,6 +502,7 @@ where
                 route,
                 transition_sum: state.transition_sum,
                 worst_transition: state.worst_transition,
+                guidance_adjustment: state.guidance_adjustment,
                 stats: AnchoredPathSearchStats {
                     evaluated_states,
                     retained_states,
