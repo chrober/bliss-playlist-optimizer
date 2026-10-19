@@ -313,12 +313,14 @@ where
     let mut direct_repeat_route = repeat_prefix.clone();
     direct_repeat_route.push(request.right_anchor);
     let mut options = Vec::new();
-    if position_repeat_safe(
-        &direct_repeat_route,
-        direct_repeat_route.len() - 1,
-        request.tracks,
-        request.config,
-    ) {
+    if direct.is_finite()
+        && position_repeat_safe(
+            &direct_repeat_route,
+            direct_repeat_route.len() - 1,
+            request.tracks,
+            request.config,
+        )
+    {
         let mut direct_route = request.route_prefix.to_vec();
         direct_route.push(request.right_anchor);
         options.push(AnchoredPathOption {
@@ -393,9 +395,17 @@ where
                             scoring_prefix.extend(state.intermediates.iter().copied());
                             debug_assert_eq!(scoring_prefix.last().copied(), Some(left));
                             let edge = scorer.score_leg(&scoring_prefix, candidate);
+                            if !edge.is_finite() {
+                                return None;
+                            }
                             scoring_prefix.push(candidate);
                             let remaining_distance =
                                 scorer.score_leg(&scoring_prefix, request.right_anchor);
+                            let remaining_distance = if remaining_distance.is_finite() {
+                                remaining_distance
+                            } else {
+                                0.0
+                            };
                             let transition_sum = state.transition_sum + edge;
                             let worst_transition = state.worst_transition.max(edge);
                             let mut intermediates = state.intermediates.clone();
@@ -449,6 +459,9 @@ where
                 let mut scoring_prefix = request.route_prefix.to_vec();
                 scoring_prefix.extend(state.intermediates.iter().copied());
                 let final_edge = scorer.score_leg(&scoring_prefix, request.right_anchor);
+                if !final_edge.is_finite() {
+                    return None;
+                }
                 state.transition_sum += final_edge;
                 state.worst_transition = state.worst_transition.max(final_edge);
                 state.lower_sum = state.transition_sum;

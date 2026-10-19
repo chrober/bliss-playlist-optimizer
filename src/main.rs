@@ -276,6 +276,7 @@ struct ExtensionSettings {
     allow_closing_track: Option<bool>,
     candidate_limit: Option<usize>,
     max_tracks_per_gap: Option<usize>,
+    tracks_per_gap: Option<usize>,
     gap_context_mode: Option<String>,
     min_added_tracks: Option<usize>,
     max_added_tracks: Option<usize>,
@@ -1828,7 +1829,7 @@ fn usage() -> &'static str {
 
 fn version_metadata_json() -> String {
     format!(
-        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"guidance_spi_v2\":true}}"
+        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"guidance_spi_v2\":true,\"fixed_gap_count_v1\":true}}"
     )
 }
 
@@ -4113,6 +4114,7 @@ fn analyze_bridge_validated(
                     )
                 })?),
             ),
+            "fixed_gap_count" => (None, None, None),
             "fixed_source_extension" => (None, None, None),
             "destination_route" => (
                 Some(request.extension.max_added_tracks.ok_or_else(|| {
@@ -5134,6 +5136,181 @@ fn analyze_bridge_validated(
                 final_sequence: sequence_artifact(&selection.final_route),
                 decisions: preview_decisions,
             })
+        }
+        "fixed_gap_count" => {
+            let tracks_per_gap = request.extension.tracks_per_gap.ok_or_else(|| {
+                CommandFailure::new(
+                    "FIXED_GAP_COUNT_INVALID",
+                    "fixed_gap_count requires extension.tracks_per_gap",
+                )
+            })?;
+            let gap_count = selected_library_route.len().saturating_sub(1);
+            let requested_added_tracks =
+                tracks_per_gap.checked_mul(gap_count).ok_or_else(|| {
+                    CommandFailure::new(
+                        "FIXED_GAP_COUNT_TOO_LARGE",
+                        "the derived fixed-gap addition count overflows",
+                    )
+                })?;
+            let final_count = selected_library_route
+                .len()
+                .checked_add(requested_added_tracks)
+                .ok_or_else(|| {
+                    CommandFailure::new(
+                        "FIXED_GAP_COUNT_TOO_LARGE",
+                        "the derived fixed-gap final track count overflows",
+                    )
+                })?;
+            if !(1..=8).contains(&tracks_per_gap) {
+                return Err(CommandFailure::new(
+                    "FIXED_GAP_COUNT_INVALID",
+                    "tracks_per_gap must be between one and eight",
+                ));
+            }
+            if final_count > 500 {
+                return Err(CommandFailure::new(
+                    "FIXED_GAP_COUNT_TOO_LARGE",
+                    format!(
+                        "{tracks_per_gap} bridges in each of {gap_count} gaps would create {final_count} tracks; the maximum is 500"
+                    ),
+                ));
+            }
+            let unique_candidates = preview_gaps
+                .iter()
+                .flat_map(|gap| {
+                    gap.semantics
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.candidate)
+                })
+                .collect::<HashSet<_>>()
+                .len();
+            if unique_candidates < requested_added_tracks {
+                return Err(CommandFailure::new(
+                    "FIXED_GAP_INSUFFICIENT_CANDIDATES",
+                    format!(
+                        "the fixed-gap plan needs {requested_added_tracks} unique additions but only {unique_candidates} eligible candidates are available"
+                    ),
+                ));
+            }
+            progress.update(
+                "bridge_selection",
+                format!(
+                    "Planning exactly {tracks_per_gap} bridges in each of {gap_count} source gaps"
+                ),
+                Some(0),
+                Some(gap_count),
+            );
+            let selection = preview::select_fixed_gap_count_bridges(
+                &selected_library_route,
+                &preview_gaps,
+                &preview::FixedGapCountConfig {
+                    tracks_per_gap,
+                    candidate_limit: retained_candidate_limit,
+                    beam_width: EXACT_COUNT_BEAM_WIDTH,
+                    alternatives_per_gap: EXACT_COUNT_BEAM_WIDTH.min(16),
+                    variation_percent: request.selection.variation_percent,
+                    generation_seed: request.selection.generation_seed,
+                },
+                bridge_tracks,
+                &learned_matrix,
+                &bridge_config,
+                &reference,
+            )
+            .map_err(|error| CommandFailure::new("FIXED_GAP_ROUTE_NOT_FOUND", error.to_string()))?;
+            let final_route = selection.final_route.as_ref().ok_or_else(|| {
+                CommandFailure::new(
+                    "FIXED_GAP_ROUTE_NOT_FOUND",
+                    "the global fixed-gap search returned no complete route",
+                )
+            })?;
+            selected_route_objective = route::evaluate_adaptive_sequence(
+                final_route,
+                bridge_tracks,
+                &learned_matrix,
+                bridge_config.seed_limit,
+                bridge_config.learned_percent,
+            )
+            .map_err(|error| CommandFailure::new("FIXED_GAP_ROUTE_NOT_FOUND", error.to_string()))?
+            .objective;
+            let decisions = selection
+                .decisions
+                .iter()
+                .map(|decision| ExactPreviewDecisionArtifact {
+                    original_position: decision.original_position,
+                    route_position: decision.route_position,
+                    left_track_id: original_ids_by_library[&decision.left].clone(),
+                    right_track_id: original_ids_by_library[&decision.right].clone(),
+                    direct_distance: decision.direct_distance,
+                    direct_percentile: decision.direct_percentile,
+                    semantic_pool: decision.semantic_pool,
+                    reason: decision.reason,
+                    selected_bridge: decision.selected.as_ref().map(|selected| {
+                        bridge_candidate_artifact(
+                            &selected.evaluation,
+                            &selected.semantics,
+                            guidance_contributions_by_gap
+                                .get(&decision.original_position)
+                                .and_then(|candidates| {
+                                    candidates.get(&selected.evaluation.candidate)
+                                })
+                                .cloned()
+                                .unwrap_or_default(),
+                            &library,
+                        )
+                    }),
+                })
+                .collect::<Vec<_>>();
+            semantic_assisted |= decisions.iter().any(|decision| {
+                decision
+                    .selected_bridge
+                    .as_ref()
+                    .is_some_and(|bridge| !bridge.semantic_evidence.is_empty())
+            });
+            let original_subsequence_preserved = final_route
+                .iter()
+                .filter(|index| original_ids_by_library.contains_key(index))
+                .eq(selected_library_route.iter());
+            let unique_membership =
+                final_route.iter().collect::<HashSet<_>>().len() == final_route.len();
+            progress.update(
+                "bridge_selection",
+                format!(
+                    "Planned {requested_added_tracks} bridges across all {gap_count} source gaps"
+                ),
+                Some(gap_count),
+                Some(gap_count),
+            );
+            SelectionPreviewArtifact::Exact(Box::new(ExactSelectionArtifact {
+                mode: "fixed_gap_count",
+                processing_order: "global-fixed-gap-beam-search",
+                requested_added_tracks,
+                feasible: true,
+                added_track_count: requested_added_tracks,
+                original_subsequence_preserved: Some(original_subsequence_preserved),
+                unique_membership: Some(unique_membership),
+                final_sequence: Some(sequence_artifact(final_route)),
+                decisions,
+                endpoint_policy: None,
+                endpoint_decisions: Vec::new(),
+                quality_target_met: None,
+                achieved_max_leg_percentile: None,
+                best_effort: None,
+                best_effort_reason: None,
+                route_quality: None,
+                history_track_ids: Vec::new(),
+                search: ExactSearchArtifact {
+                    beam_width: EXACT_COUNT_BEAM_WIDTH,
+                    search_effort: None,
+                    candidate_limit: retained_candidate_limit,
+                    max_tracks_per_gap: tracks_per_gap,
+                    evaluated_states: selection.stats.evaluated_states,
+                    retained_states: selection.stats.retained_states,
+                    maximum_additions_found: requested_added_tracks,
+                    structural_upper_bound: requested_added_tracks,
+                },
+                infeasibility: None,
+            }))
         }
         "exact_count" | "destination_route" => {
             let destination_route = request.extension.mode == "destination_route";
@@ -6308,12 +6485,16 @@ fn analyze_bridge_request_with_options(
     }
     if !matches!(
         request.extension.mode.as_str(),
-        "automatic" | "exact_count" | "fixed_source_extension" | "destination_route"
+        "automatic"
+            | "exact_count"
+            | "fixed_gap_count"
+            | "fixed_source_extension"
+            | "destination_route"
     ) {
         return Err(CommandFailure::new(
             "EXTENSION_MODE_UNSUPPORTED",
             format!(
-                "the bridge command currently analyzes automatic, exact_count, fixed_source_extension, or destination_route extension, not '{}'",
+                "the bridge command currently analyzes automatic, exact_count, fixed_gap_count, fixed_source_extension, or destination_route extension, not '{}'",
                 request.extension.mode
             ),
         ));
@@ -6325,10 +6506,13 @@ fn analyze_bridge_request_with_options(
                 format!("unsupported extension.gap_context_mode '{mode}'"),
             ));
         }
-        if !matches!(request.extension.mode.as_str(), "automatic" | "exact_count") {
+        if !matches!(
+            request.extension.mode.as_str(),
+            "automatic" | "exact_count" | "fixed_gap_count"
+        ) {
             return Err(CommandFailure::new(
                 "GAP_CONTEXT_MODE_UNSUPPORTED",
-                "extension.gap_context_mode is supported only for automatic and exact_count gap additions",
+                "extension.gap_context_mode is supported only for automatic, exact_count, and fixed_gap_count additions",
             ));
         }
         if request.scoring.algorithm != "adaptive" && mode == "frozen" {
@@ -6342,6 +6526,12 @@ fn analyze_bridge_request_with_options(
         return Err(CommandFailure::new(
             "MAX_TRACKS_PER_GAP_UNSUPPORTED",
             "extension.max_tracks_per_gap is supported only for exact_count requests",
+        ));
+    }
+    if request.extension.tracks_per_gap.is_some() && request.extension.mode != "fixed_gap_count" {
+        return Err(CommandFailure::new(
+            "FIXED_GAP_COUNT_INVALID",
+            "extension.tracks_per_gap is supported only for fixed_gap_count requests",
         ));
     }
     if (request.extension.allow_opening_track.is_some()
@@ -7004,6 +7194,7 @@ mod tests {
     #[test]
     fn version_metadata_advertises_guidance_spi_v2() {
         assert!(version_metadata_json().contains("\"guidance_spi_v2\":true"));
+        assert!(version_metadata_json().contains("\"fixed_gap_count_v1\":true"));
     }
 
     #[test]

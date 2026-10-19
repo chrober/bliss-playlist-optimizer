@@ -181,7 +181,7 @@
       "required": ["mode"],
       "properties": {
         "mode": {
-          "enum": ["none", "automatic", "exact_count", "fixed_source_extension", "destination_route", "one_per_transition", "target_length"]
+          "enum": ["none", "automatic", "exact_count", "fixed_gap_count", "fixed_source_extension", "destination_route", "one_per_transition", "target_length"]
         },
         "additional_track_count": { "type": "integer", "minimum": 0 },
         "search_effort": { "enum": ["fast", "balanced", "thorough"] },
@@ -191,6 +191,7 @@
         "target_track_count": { "type": "integer", "minimum": 2 },
         "candidate_limit": { "type": "integer", "minimum": 1 },
         "max_tracks_per_gap": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "tracks_per_gap": { "type": "integer", "minimum": 1, "maximum": 8 },
         "gap_context_mode": { "enum": ["rolling", "frozen"] },
         "min_added_tracks": { "type": "integer", "minimum": 0, "maximum": 8 },
         "max_added_tracks": { "type": "integer", "minimum": 0 },
@@ -210,6 +211,29 @@
             "properties": { "mode": { "const": "exact_count" } }
           },
           "then": { "required": ["additional_track_count"] }
+        },
+        {
+          "if": {
+            "properties": { "mode": { "const": "fixed_gap_count" } }
+          },
+          "then": {
+            "required": ["tracks_per_gap"],
+            "not": {
+              "anyOf": [
+                { "required": ["additional_track_count"] },
+                { "required": ["target_track_count"] },
+                { "required": ["max_tracks_per_gap"] },
+                { "required": ["max_added_tracks"] },
+                { "required": ["trigger_percentile"] },
+                { "required": ["allow_opening_track"] },
+                { "required": ["allow_closing_track"] },
+                { "required": ["destination_mode"] },
+                { "required": ["min_added_tracks"] },
+                { "required": ["direct_transition_caution"] },
+                { "required": ["search_effort"] }
+              ]
+            }
+          }
         },
         {
           "if": {
@@ -311,6 +335,20 @@
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "extension": { "required": ["tracks_per_gap"] }
+        }
+      },
+      "then": {
+        "properties": {
+          "extension": {
+            "properties": { "mode": { "const": "fixed_gap_count" } }
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {

@@ -437,10 +437,11 @@
         "infeasibility"
       ],
       "properties": {
-        "mode": { "const": "exact_count" },
+        "mode": { "enum": ["exact_count", "fixed_gap_count"] },
         "processing_order": {
           "enum": [
             "left-to-right-original-gaps-beam-search",
+            "global-fixed-gap-beam-search",
             "bounded-endpoints-and-original-gaps-beam-search",
             "fixed-adjacent-layered-destination-beam-search"
           ]

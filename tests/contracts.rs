@@ -99,6 +99,10 @@ fn published_examples_satisfy_their_v1_contracts() {
         ),
         (
             "schemas/optimizer-request-v1.schema.json",
+            "fixtures/synthetic/fixed-gap-count-request.json",
+        ),
+        (
+            "schemas/optimizer-request-v1.schema.json",
             "fixtures/synthetic/preserve-endpoint-slots-request.json",
         ),
         (
@@ -417,6 +421,39 @@ fn exact_count_request_requires_the_requested_addition_count() {
         .unwrap()
         .remove("additional_track_count");
     assert!(!validator.is_valid(&example));
+}
+
+#[test]
+fn fixed_gap_count_requires_one_to_eight_tracks_and_rejects_other_amount_fields() {
+    let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut request = read_json(&repository_path(
+        "fixtures/synthetic/preserve-multi-track-gap-request.json",
+    ));
+    request["extension"] = serde_json::json!({
+        "mode": "fixed_gap_count",
+        "tracks_per_gap": 2,
+        "candidate_limit": 8,
+        "shortlist_limit": 256,
+        "gap_context_mode": "rolling"
+    });
+    assert!(validator.is_valid(&request));
+
+    let mut zero = request.clone();
+    zero["extension"]["tracks_per_gap"] = Value::from(0);
+    assert!(!validator.is_valid(&zero));
+
+    let mut excessive = request.clone();
+    excessive["extension"]["tracks_per_gap"] = Value::from(9);
+    assert!(!validator.is_valid(&excessive));
+
+    let mut contradictory_total = request.clone();
+    contradictory_total["extension"]["additional_track_count"] = Value::from(6);
+    assert!(!validator.is_valid(&contradictory_total));
+
+    let mut endpoint = request;
+    endpoint["extension"]["allow_opening_track"] = Value::Bool(true);
+    assert!(!validator.is_valid(&endpoint));
 }
 
 #[test]

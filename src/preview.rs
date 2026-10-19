@@ -9,12 +9,15 @@ use serde::Serialize;
 
 use crate::anchored_path::{
     search_anchored_paths, AnchoredPathCandidate, AnchoredPathError, AnchoredPathRequest,
-    AnchoredPathSearchConfig, FixedAdjacentScorer,
+    AnchoredPathScorer, AnchoredPathSearchConfig, FixedAdjacentScorer,
 };
 use crate::bridge::{
     gap_context_matrix, rank_candidates_in_context, rank_endpoint_candidates,
     BridgeCandidateEvaluation, BridgeConfig, BridgeError, CandidateScoringContext,
     EndpointCandidateEvaluation, EndpointSlot, FrozenReference,
+};
+use crate::multi_gap::{
+    plan_fixed_gap_count, FixedGap, FixedGapPlanConfig, FixedGapPlanError, FixedGapPlanRequest,
 };
 use crate::route::{self, RouteTrack};
 use crate::semantic::{CandidateSemantics, GapEvidence, SemanticPool};
@@ -44,6 +47,199 @@ pub struct AutomaticSelectionConfig {
     pub trigger_percentile: f64,
     pub variation_percent: u8,
     pub generation_seed: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedGapCountConfig {
+    pub tracks_per_gap: usize,
+    pub candidate_limit: usize,
+    pub beam_width: usize,
+    pub alternatives_per_gap: usize,
+    pub variation_percent: u8,
+    pub generation_seed: u64,
+}
+
+struct ContextualFixedGapScorer<'a> {
+    source_route: &'a [usize],
+    tracks: &'a [RouteTrack],
+    learned_matrix: &'a Array2<f32>,
+    config: &'a BridgeConfig,
+    reference: &'a FrozenReference,
+    frozen_matrices: Vec<Array2<f32>>,
+}
+
+impl AnchoredPathScorer for ContextualFixedGapScorer<'_> {
+    fn score_leg(&self, route_prefix: &[usize], next: usize) -> f64 {
+        let gap_index = route_prefix
+            .iter()
+            .rev()
+            .find_map(|track| self.source_route.iter().position(|source| source == track))
+            .unwrap_or(0)
+            .min(self.source_route.len().saturating_sub(2));
+        let distance = if self.config.gap_context_mode == crate::bridge::GapContextMode::Frozen {
+            crate::bridge::contextual_distance_with_matrix(
+                route_prefix,
+                next,
+                self.tracks,
+                &self.frozen_matrices[gap_index],
+                self.config,
+            )
+        } else {
+            crate::bridge::contextual_distance(
+                route_prefix,
+                next,
+                self.tracks,
+                self.learned_matrix,
+                self.config,
+            )
+        };
+        let Ok(distance) = distance else {
+            return f64::INFINITY;
+        };
+        match self.reference.percentile(distance) {
+            Ok(percentile) if percentile <= self.config.max_leg_percentile => distance,
+            _ => f64::INFINITY,
+        }
+    }
+}
+
+pub fn select_fixed_gap_count_bridges(
+    original_route: &[usize],
+    gaps: &[AutomaticGap],
+    selection_config: &FixedGapCountConfig,
+    tracks: &[RouteTrack],
+    learned_matrix: &Array2<f32>,
+    config: &BridgeConfig,
+    reference: &FrozenReference,
+) -> Result<ExactSelection, PreviewError> {
+    let mut ordered_gaps = gaps.to_vec();
+    ordered_gaps.sort_by_key(|gap| gap.original_position);
+    let candidate_sets = ordered_gaps
+        .iter()
+        .map(|gap| {
+            gap.semantics
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    let target_weight = gap
+                        .guidance_target_weights
+                        .get(&candidate.candidate)
+                        .copied()
+                        .unwrap_or(1.0)
+                        .max(1.0e-12);
+                    AnchoredPathCandidate {
+                        track: candidate.candidate,
+                        guidance_adjustment: gap
+                            .guidance_adjustments
+                            .get(&candidate.candidate)
+                            .copied()
+                            .unwrap_or(0.0)
+                            + target_weight.ln(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let fixed_gaps = ordered_gaps
+        .iter()
+        .zip(&candidate_sets)
+        .map(|(gap, candidates)| FixedGap {
+            left: gap.left,
+            right: gap.right,
+            candidates,
+        })
+        .collect::<Vec<_>>();
+    let frozen_matrices = if config.gap_context_mode == crate::bridge::GapContextMode::Frozen {
+        (1..original_route.len())
+            .map(|position| {
+                gap_context_matrix(original_route, position, tracks, learned_matrix, config)
+                    .map_err(PreviewError::Scoring)
+                    .map(|matrix| matrix.expect("frozen context returns a matrix"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    let scorer = ContextualFixedGapScorer {
+        source_route: original_route,
+        tracks,
+        learned_matrix,
+        config,
+        reference,
+        frozen_matrices,
+    };
+    let plan = plan_fixed_gap_count(
+        FixedGapPlanRequest {
+            source_route: original_route,
+            immutable_history: &[],
+            gaps: &fixed_gaps,
+            tracks,
+            config: FixedGapPlanConfig {
+                tracks_per_gap: selection_config.tracks_per_gap,
+                candidate_limit: selection_config.candidate_limit,
+                beam_width: selection_config.beam_width,
+                alternatives_per_gap: selection_config.alternatives_per_gap,
+                variation_percent: selection_config.variation_percent,
+                generation_seed: selection_config.generation_seed,
+                artist_window: config.artist_window,
+                album_window: config.album_window,
+                track_window: 0,
+            },
+        },
+        scorer,
+    )
+    .map_err(|error| match error {
+        FixedGapPlanError::InvalidConfig(message) => PreviewError::InvalidExactConfig(message),
+        FixedGapPlanError::InvalidSource(message)
+        | FixedGapPlanError::FinalRouteInvalid(message) => PreviewError::FinalRouteInvalid(message),
+        FixedGapPlanError::Path(error) => anchored_path_error(error),
+        FixedGapPlanError::InvalidTrackIndex(index) => {
+            anchored_path_error(AnchoredPathError::InvalidTrackIndex(index))
+        }
+        FixedGapPlanError::NoCompleteRoute { .. } => {
+            PreviewError::FinalRouteInvalid("no complete fixed-gap route was found")
+        }
+    })?;
+    let gap_selections = plan
+        .gaps
+        .iter()
+        .map(|gap| gap.intermediates.clone())
+        .collect::<Vec<_>>();
+    let exact_config = ExactSelectionConfig {
+        requested_added_tracks: selection_config
+            .tracks_per_gap
+            .saturating_mul(original_route.len().saturating_sub(1)),
+        candidate_limit: selection_config.candidate_limit,
+        beam_width: selection_config.beam_width,
+        max_tracks_per_gap: selection_config.tracks_per_gap,
+        variation_percent: selection_config.variation_percent,
+        generation_seed: selection_config.generation_seed,
+    };
+    let decisions = final_exact_decisions(
+        &plan.final_route,
+        &ordered_gaps,
+        &gap_selections,
+        ExactScoringContext {
+            tracks,
+            learned_matrix,
+            config,
+            reference,
+        },
+        &exact_config,
+    )?;
+    Ok(ExactSelection {
+        requested_added_tracks: exact_config.requested_added_tracks,
+        final_route: Some(plan.final_route),
+        decisions,
+        endpoint_decisions: Vec::new(),
+        stats: ExactSearchStats {
+            max_tracks_per_gap: selection_config.tracks_per_gap,
+            evaluated_states: plan.stats.evaluated_states,
+            retained_states: plan.stats.retained_states,
+            maximum_additions_found: exact_config.requested_added_tracks,
+            structural_upper_bound: exact_config.requested_added_tracks,
+        },
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
