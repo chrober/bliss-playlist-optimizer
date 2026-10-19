@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::anchored_path::{
     search_anchored_paths, AnchoredPathCandidate, AnchoredPathError, AnchoredPathRequest,
-    AnchoredPathSearchConfig,
+    AnchoredPathSearchConfig, FixedAdjacentScorer,
 };
 use crate::bridge::{
     gap_context_matrix, rank_candidates_in_context, rank_endpoint_candidates,
@@ -1074,7 +1074,7 @@ where
                 track_window: repeat.track_window,
             },
         },
-        adjacent_distance,
+        FixedAdjacentScorer::new(adjacent_distance),
     )
     .map_err(anchored_path_error)?;
 

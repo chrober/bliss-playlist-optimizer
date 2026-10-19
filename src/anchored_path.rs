@@ -22,6 +22,43 @@ pub struct AnchoredPathCandidate {
     pub guidance_adjustment: f64,
 }
 
+pub trait AnchoredPathScorer: Sync {
+    fn score_leg(&self, route_prefix: &[usize], next: usize) -> f64;
+}
+
+impl<T> AnchoredPathScorer for &T
+where
+    T: AnchoredPathScorer + ?Sized,
+{
+    fn score_leg(&self, route_prefix: &[usize], next: usize) -> f64 {
+        (*self).score_leg(route_prefix, next)
+    }
+}
+
+pub struct FixedAdjacentScorer<F> {
+    adjacent_distance: F,
+}
+
+impl<F> FixedAdjacentScorer<F> {
+    pub fn new(adjacent_distance: F) -> Self {
+        Self { adjacent_distance }
+    }
+}
+
+impl<F> AnchoredPathScorer for FixedAdjacentScorer<F>
+where
+    F: Fn(usize, usize) -> f64 + Sync,
+{
+    fn score_leg(&self, route_prefix: &[usize], next: usize) -> f64 {
+        (self.adjacent_distance)(
+            *route_prefix
+                .last()
+                .expect("anchored path scorer always receives a non-empty prefix"),
+            next,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnchoredPathSearchConfig {
     pub max_intermediates: usize,
@@ -246,12 +283,12 @@ fn validate_request(request: &AnchoredPathRequest<'_>) -> Result<(), AnchoredPat
 /// The search is pure: it never mutates outer-planner state. Existing callers
 /// retain one option per count; future multi-gap planners can request several
 /// alternatives and choose a globally compatible combination.
-pub fn search_anchored_paths<F>(
+pub fn search_anchored_paths<S>(
     request: AnchoredPathRequest<'_>,
-    adjacent_distance: F,
+    scorer: S,
 ) -> Result<Vec<AnchoredPathOption>, AnchoredPathError>
 where
-    F: Fn(usize, usize) -> f64 + Sync + Copy,
+    S: AnchoredPathScorer,
 {
     validate_request(&request)?;
 
@@ -271,7 +308,7 @@ where
     let mut repeat_prefix = request.immutable_history.to_vec();
     repeat_prefix.extend(request.route_prefix.iter().copied());
     let first_generated = repeat_prefix.len();
-    let direct = adjacent_distance(request.left_anchor, request.right_anchor);
+    let direct = scorer.score_leg(request.route_prefix, request.right_anchor);
     let mut direct_repeat_route = repeat_prefix.clone();
     direct_repeat_route.push(request.right_anchor);
     let mut options = Vec::new();
@@ -350,9 +387,13 @@ where
                                 return None;
                             }
 
-                            let edge = adjacent_distance(left, candidate);
+                            let mut scoring_prefix = request.route_prefix.to_vec();
+                            scoring_prefix.extend(state.intermediates.iter().copied());
+                            debug_assert_eq!(scoring_prefix.last().copied(), Some(left));
+                            let edge = scorer.score_leg(&scoring_prefix, candidate);
+                            scoring_prefix.push(candidate);
                             let remaining_distance =
-                                adjacent_distance(candidate, request.right_anchor);
+                                scorer.score_leg(&scoring_prefix, request.right_anchor);
                             let transition_sum = state.transition_sum + edge;
                             let worst_transition = state.worst_transition.max(edge);
                             let mut intermediates = state.intermediates.clone();
@@ -403,8 +444,9 @@ where
                 if !position_repeat_safe(&route, route.len() - 1, request.tracks, request.config) {
                     return None;
                 }
-                let final_edge =
-                    adjacent_distance(*state.intermediates.last()?, request.right_anchor);
+                let mut scoring_prefix = request.route_prefix.to_vec();
+                scoring_prefix.extend(state.intermediates.iter().copied());
+                let final_edge = scorer.score_leg(&scoring_prefix, request.right_anchor);
                 state.transition_sum += final_edge;
                 state.worst_transition = state.worst_transition.max(final_edge);
                 state.lower_sum = state.transition_sum;
@@ -474,6 +516,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn track(value: f32, artist: &str, album: &str) -> RouteTrack {
         RouteTrack {
@@ -527,7 +570,7 @@ mod tests {
                 tracks: &tracks,
                 config: config(2),
             },
-            |left, right| left.abs_diff(right) as f64,
+            FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
         )
         .unwrap();
 
@@ -563,7 +606,7 @@ mod tests {
                     ..config(1)
                 },
             },
-            |left, right| left.abs_diff(right) as f64,
+            FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
         )
         .unwrap();
         assert_eq!(options[1].route, vec![0, 1, 2]);
@@ -583,7 +626,7 @@ mod tests {
                     ..config(1)
                 },
             },
-            |left, right| left.abs_diff(right) as f64,
+            FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
         )
         .unwrap();
         assert_eq!(repeated_generated_track.len(), 1);
@@ -624,7 +667,7 @@ mod tests {
                         ..config(max_intermediates)
                     },
                 },
-                |left, right| left.abs_diff(right) as f64,
+                FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
             )
             .unwrap()
         };
@@ -671,7 +714,9 @@ mod tests {
                     ..config(1)
                 },
             },
-            |left, right| (tracks[left].features[0] - tracks[right].features[0]).abs() as f64,
+            FixedAdjacentScorer::new(|left: usize, right: usize| {
+                (tracks[left].features[0] - tracks[right].features[0]).abs() as f64
+            }),
         )
         .unwrap();
 
@@ -724,10 +769,97 @@ mod tests {
                     track_window: 0,
                 },
             },
-            |left, right| (tracks[left].features[0] - tracks[right].features[0]).abs() as f64,
+            FixedAdjacentScorer::new(|left: usize, right: usize| {
+                (tracks[left].features[0] - tracks[right].features[0]).abs() as f64
+            }),
         )
         .unwrap();
 
         assert_eq!(options[1].intermediates, vec![2]);
+    }
+
+    #[test]
+    fn contextual_scorer_receives_the_evolving_prefix_for_every_leg() {
+        struct RecordingScorer {
+            calls: Mutex<Vec<(Vec<usize>, usize)>>,
+        }
+
+        impl AnchoredPathScorer for RecordingScorer {
+            fn score_leg(&self, route_prefix: &[usize], next: usize) -> f64 {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((route_prefix.to_vec(), next));
+                1.0
+            }
+        }
+
+        let tracks = vec![
+            track(0.0, "a", "a"),
+            track(1.0, "b", "b"),
+            track(2.0, "c", "c"),
+        ];
+        let candidates = [AnchoredPathCandidate {
+            track: 1,
+            guidance_adjustment: 0.0,
+        }];
+        let scorer = RecordingScorer {
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let options = search_anchored_paths(
+            AnchoredPathRequest {
+                route_prefix: &[0],
+                immutable_history: &[],
+                unavailable_tracks: &[0, 2],
+                left_anchor: 0,
+                right_anchor: 2,
+                candidates: &candidates,
+                tracks: &tracks,
+                config: config(1),
+            },
+            &scorer,
+        )
+        .unwrap();
+
+        assert_eq!(options[1].route, vec![0, 1, 2]);
+        let calls = scorer.calls.into_inner().unwrap();
+        assert!(calls.contains(&(vec![0], 1)));
+        assert!(calls.contains(&(vec![0, 1], 2)));
+    }
+
+    #[test]
+    fn fixed_adjacent_scorer_preserves_pairwise_search_behavior() {
+        let tracks = vec![
+            track(0.0, "a", "a"),
+            track(1.0, "b", "b"),
+            track(2.0, "c", "c"),
+        ];
+        let candidates = [AnchoredPathCandidate {
+            track: 1,
+            guidance_adjustment: 0.0,
+        }];
+        let scorer =
+            FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64);
+
+        let options = search_anchored_paths(
+            AnchoredPathRequest {
+                route_prefix: &[0],
+                immutable_history: &[],
+                unavailable_tracks: &[0, 2],
+                left_anchor: 0,
+                right_anchor: 2,
+                candidates: &candidates,
+                tracks: &tracks,
+                config: config(1),
+            },
+            &scorer,
+        )
+        .unwrap();
+
+        assert_eq!(options[0].route, vec![0, 2]);
+        assert_eq!(options[0].transition_sum, 2.0);
+        assert_eq!(options[1].route, vec![0, 1, 2]);
+        assert_eq!(options[1].transition_sum, 2.0);
     }
 }
