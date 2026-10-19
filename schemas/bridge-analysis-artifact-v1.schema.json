@@ -102,6 +102,7 @@
     "selection_preview": {
       "oneOf": [
         { "$ref": "#/$defs/automatic_selection_preview" },
+        { "$ref": "#/$defs/fixed_gap_count_selection_preview" },
         { "$ref": "#/$defs/exact_selection_preview" },
         { "$ref": "#/$defs/fixed_source_extension_selection_preview" }
       ]
@@ -427,6 +428,44 @@
         }
       }
     },
+    "fixed_gap_count_selection_preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode", "processing_order", "source_track_count", "source_gap_count",
+        "tracks_per_gap", "requested_added_tracks", "feasible",
+        "added_track_count", "no_endpoint_tracks",
+        "original_subsequence_preserved", "unique_membership",
+        "every_gap_exact_count", "repeat_windows_satisfied",
+        "final_sequence", "decisions", "search"
+      ],
+      "properties": {
+        "mode": { "const": "fixed_gap_count" },
+        "processing_order": { "const": "global-fixed-gap-beam-search" },
+        "source_track_count": { "type": "integer", "minimum": 2 },
+        "source_gap_count": { "type": "integer", "minimum": 1 },
+        "tracks_per_gap": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "requested_added_tracks": { "type": "integer", "minimum": 1 },
+        "feasible": { "const": true },
+        "added_track_count": { "type": "integer", "minimum": 1 },
+        "no_endpoint_tracks": { "const": true },
+        "original_subsequence_preserved": { "const": true },
+        "unique_membership": { "const": true },
+        "every_gap_exact_count": { "const": true },
+        "repeat_windows_satisfied": { "const": true },
+        "final_sequence": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "$ref": "#/$defs/preview_sequence_entry" }
+        },
+        "decisions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/exact_preview_decision" }
+        },
+        "search": { "$ref": "#/$defs/exact_search" }
+      }
+    },
     "exact_selection_preview": {
       "type": "object",
       "additionalProperties": false,
@@ -437,11 +476,10 @@
         "infeasibility"
       ],
       "properties": {
-        "mode": { "enum": ["exact_count", "fixed_gap_count"] },
+        "mode": { "const": "exact_count" },
         "processing_order": {
           "enum": [
             "left-to-right-original-gaps-beam-search",
-            "global-fixed-gap-beam-search",
             "bounded-endpoints-and-original-gaps-beam-search",
             "fixed-adjacent-layered-destination-beam-search"
           ]

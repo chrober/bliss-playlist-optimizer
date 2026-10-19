@@ -37,7 +37,7 @@ pub struct RouteTrack {
     pub album_key: String,
 }
 
-pub(crate) fn artists_repeat(left: &RouteTrack, right: &RouteTrack) -> bool {
+pub fn artists_repeat(left: &RouteTrack, right: &RouteTrack) -> bool {
     if left.artist_repeat_keys.is_empty() || right.artist_repeat_keys.is_empty() {
         if left.artist_key == "various artists" || right.artist_key == "various artists" {
             return false;

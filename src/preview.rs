@@ -226,6 +226,7 @@ pub fn select_fixed_gap_count_bridges(
             reference,
         },
         &exact_config,
+        Some(original_route),
     )?;
     Ok(ExactSelection {
         requested_added_tracks: exact_config.requested_added_tracks,
@@ -883,6 +884,7 @@ fn final_exact_decisions(
     gap_selections: &[Vec<usize>],
     scoring: ExactScoringContext<'_>,
     selection_config: &ExactSelectionConfig,
+    frozen_source_route: Option<&[usize]>,
 ) -> Result<Vec<GapDecision>, PreviewError> {
     let ExactScoringContext {
         tracks,
@@ -927,12 +929,13 @@ fn final_exact_decisions(
                 .clone();
             let mut route_without_candidate = final_route.to_vec();
             route_without_candidate.remove(position);
-            let left_position = route_without_candidate
+            let matrix_route = frozen_source_route.unwrap_or(&route_without_candidate);
+            let left_position = matrix_route
                 .iter()
                 .position(|track| *track == gap.left)
                 .ok_or(PreviewError::InvalidOriginalGap(gap.original_position))?;
             let frozen_matrix = gap_context_matrix(
-                &route_without_candidate,
+                matrix_route,
                 left_position + 1,
                 tracks,
                 learned_matrix,
@@ -1163,6 +1166,7 @@ fn select_exact_count_multi_gap_bridges(
                 reference,
             },
             selection_config,
+            None,
         )?;
         (Some(state.route), decisions)
     } else {
@@ -1283,6 +1287,7 @@ where
             std::slice::from_ref(&anchored.intermediates),
             scoring,
             selection_config,
+            None,
         )?;
         options.push(DestinationRouteOption {
             added_track_count: requested,
@@ -1402,6 +1407,7 @@ where
                         &[outward_bridges],
                         scoring,
                         selection_config,
+                        None,
                     )?;
                     return Ok(vec![DestinationRouteOption {
                         added_track_count: outward_count,
@@ -1482,6 +1488,7 @@ where
                         &[outward_bridges, return_bridges],
                         scoring,
                         selection_config,
+                        None,
                     )?;
                     let boundary_edges = final_route[route_start..=destination_first_position]
                         .windows(2)
@@ -1851,6 +1858,7 @@ pub fn select_exact_count_bridges_with_endpoints(
                         &gap_selections,
                         scoring,
                         selection_config,
+                        None,
                     ) {
                         Ok(decisions) => decisions,
                         Err(PreviewError::FinalRouteInvalid(_)) => continue,

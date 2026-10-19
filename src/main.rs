@@ -1105,7 +1105,28 @@ struct AutomaticSelectionArtifact {
 enum SelectionPreviewArtifact {
     Automatic(AutomaticSelectionArtifact),
     Exact(Box<ExactSelectionArtifact>),
+    FixedGapCount(Box<FixedGapCountSelectionArtifact>),
     FixedSourceExtension(FixedSourceExtensionSelectionArtifact),
+}
+
+#[derive(Debug, Serialize)]
+struct FixedGapCountSelectionArtifact {
+    mode: &'static str,
+    processing_order: &'static str,
+    source_track_count: usize,
+    source_gap_count: usize,
+    tracks_per_gap: usize,
+    requested_added_tracks: usize,
+    feasible: bool,
+    added_track_count: usize,
+    no_endpoint_tracks: bool,
+    original_subsequence_preserved: bool,
+    unique_membership: bool,
+    every_gap_exact_count: bool,
+    repeat_windows_satisfied: bool,
+    final_sequence: Vec<PreviewSequenceEntryArtifact>,
+    decisions: Vec<ExactPreviewDecisionArtifact>,
+    search: ExactSearchArtifact,
 }
 
 #[derive(Debug, Serialize)]
@@ -4344,7 +4365,7 @@ fn analyze_bridge_validated(
             } else {
                 route::repeat_violations(&preserved, &source_route_tracks, &base_route_config)
             };
-            if !violations.is_empty() {
+            if !violations.is_empty() && request.extension.mode != "fixed_gap_count" {
                 return Err(CommandFailure::new(
                     "PRESERVED_ANCHOR_REPEAT_CONFLICT",
                     format!(
@@ -5175,6 +5196,31 @@ fn analyze_bridge_validated(
                     ),
                 ));
             }
+            for right in 1..selected_library_route.len() {
+                for left in 0..right {
+                    let projected_distance = (right - left) * (tracks_per_gap + 1);
+                    let left_track = &source_route_tracks[selected_local_route[left]];
+                    let right_track = &source_route_tracks[selected_local_route[right]];
+                    let artist_conflict = bridge_config.artist_window > 0
+                        && projected_distance <= bridge_config.artist_window
+                        && route::artists_repeat(left_track, right_track);
+                    let album_conflict = bridge_config.album_window > 0
+                        && projected_distance <= bridge_config.album_window
+                        && !right_track.album_key.is_empty()
+                        && left_track.album_key == right_track.album_key;
+                    if artist_conflict || album_conflict {
+                        let kind = if artist_conflict { "artist" } else { "album" };
+                        return Err(CommandFailure::new(
+                            "FIXED_GAP_SOURCE_REPEAT_CONFLICT",
+                            format!(
+                                "source tracks {} and {} retain a {kind} repeat at projected distance {projected_distance}; the configured {kind} window cannot be satisfied with {tracks_per_gap} bridges per gap",
+                                left + 1,
+                                right + 1,
+                            ),
+                        ));
+                    }
+                }
+            }
             let unique_candidates = preview_gaps
                 .iter()
                 .flat_map(|gap| {
@@ -5273,6 +5319,42 @@ fn analyze_bridge_validated(
                 .eq(selected_library_route.iter());
             let unique_membership =
                 final_route.iter().collect::<HashSet<_>>().len() == final_route.len();
+            let no_endpoint_tracks = final_route.first() == selected_library_route.first()
+                && final_route.last() == selected_library_route.last();
+            let every_gap_exact_count = (1..=gap_count).all(|position| {
+                decisions
+                    .iter()
+                    .filter(|decision| {
+                        decision.original_position == position
+                            && decision.reason == preview::DecisionReason::Selected
+                    })
+                    .count()
+                    == tracks_per_gap
+            });
+            let repeat_windows_satisfied = route::repeat_violations(
+                final_route,
+                bridge_tracks,
+                &route::SearchConfig {
+                    seed_limit: bridge_config.seed_limit,
+                    learned_percent: bridge_config.learned_percent,
+                    deterministic_seed: request.selection.generation_seed,
+                    restart_count: 0,
+                    artist_window: bridge_config.artist_window,
+                    album_window: bridge_config.album_window,
+                },
+            )
+            .is_empty();
+            if !(original_subsequence_preserved
+                && unique_membership
+                && no_endpoint_tracks
+                && every_gap_exact_count
+                && repeat_windows_satisfied)
+            {
+                return Err(CommandFailure::new(
+                    "FIXED_GAP_ROUTE_NOT_FOUND",
+                    "the completed route failed its independent fixed-gap acceptance proof",
+                ));
+            }
             progress.update(
                 "bridge_selection",
                 format!(
@@ -5281,24 +5363,22 @@ fn analyze_bridge_validated(
                 Some(gap_count),
                 Some(gap_count),
             );
-            SelectionPreviewArtifact::Exact(Box::new(ExactSelectionArtifact {
+            SelectionPreviewArtifact::FixedGapCount(Box::new(FixedGapCountSelectionArtifact {
                 mode: "fixed_gap_count",
                 processing_order: "global-fixed-gap-beam-search",
+                source_track_count: selected_library_route.len(),
+                source_gap_count: gap_count,
+                tracks_per_gap,
                 requested_added_tracks,
                 feasible: true,
                 added_track_count: requested_added_tracks,
-                original_subsequence_preserved: Some(original_subsequence_preserved),
-                unique_membership: Some(unique_membership),
-                final_sequence: Some(sequence_artifact(final_route)),
+                no_endpoint_tracks,
+                original_subsequence_preserved,
+                unique_membership,
+                every_gap_exact_count,
+                repeat_windows_satisfied,
+                final_sequence: sequence_artifact(final_route),
                 decisions,
-                endpoint_policy: None,
-                endpoint_decisions: Vec::new(),
-                quality_target_met: None,
-                achieved_max_leg_percentile: None,
-                best_effort: None,
-                best_effort_reason: None,
-                route_quality: None,
-                history_track_ids: Vec::new(),
                 search: ExactSearchArtifact {
                     beam_width: EXACT_COUNT_BEAM_WIDTH,
                     search_effort: None,
@@ -5309,7 +5389,6 @@ fn analyze_bridge_validated(
                     maximum_additions_found: requested_added_tracks,
                     structural_upper_bound: requested_added_tracks,
                 },
-                infeasibility: None,
             }))
         }
         "exact_count" | "destination_route" => {
@@ -8194,8 +8273,7 @@ mod tests {
             SelectionPreviewArtifact::Automatic(preview) => {
                 assert_eq!(preview.added_track_count, 0)
             }
-            SelectionPreviewArtifact::Exact(_)
-            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
+            _ => {
                 panic!("expected automatic preview")
             }
         }
@@ -8585,8 +8663,7 @@ mod tests {
         );
         let automatic = match &preview_artifact.selection_preview {
             SelectionPreviewArtifact::Automatic(automatic) => automatic,
-            SelectionPreviewArtifact::Exact(_)
-            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
+            _ => {
                 panic!("expected automatic preview")
             }
         };
@@ -8627,8 +8704,7 @@ mod tests {
         );
         let exact = match &exact_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_)
-            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
+            _ => {
                 panic!("expected exact-count preview")
             }
         };
@@ -8661,8 +8737,7 @@ mod tests {
         );
         let infeasible = match &infeasible_exact_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_)
-            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
+            _ => {
                 panic!("expected exact-count preview")
             }
         };
@@ -8712,8 +8787,7 @@ mod tests {
         );
         let preserve_automatic = match &preserve_automatic_artifact.selection_preview {
             SelectionPreviewArtifact::Automatic(automatic) => automatic,
-            SelectionPreviewArtifact::Exact(_)
-            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
+            _ => {
                 panic!("expected automatic preview")
             }
         };
@@ -8761,8 +8835,7 @@ mod tests {
         );
         let preserve_exact = match &preserve_exact_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_)
-            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
+            _ => {
                 panic!("expected exact-count preview")
             }
         };
@@ -8812,8 +8885,7 @@ mod tests {
         );
         let preserve_multi_track = match &preserve_multi_track_artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_)
-            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
+            _ => {
                 panic!("expected exact-count preview")
             }
         };
@@ -8857,6 +8929,88 @@ mod tests {
     }
 
     #[test]
+    fn fixed_gap_fixture_is_contract_complete_and_worker_deterministic() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let path = Path::new("fixtures/synthetic/fixed-gap-count-request.json");
+        let four = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| analyze_bridge_request(path))
+            .unwrap();
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| analyze_bridge_request(path))
+            .unwrap();
+        std::env::set_current_dir(original).unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&four).unwrap(),
+            serde_json::to_string(&one).unwrap()
+        );
+        let fixed = match &four.selection_preview {
+            SelectionPreviewArtifact::FixedGapCount(fixed) => fixed,
+            _ => panic!("expected fixed-gap preview"),
+        };
+        assert_eq!(fixed.source_track_count, 4);
+        assert_eq!(fixed.source_gap_count, 3);
+        assert_eq!(fixed.tracks_per_gap, 2);
+        assert_eq!(fixed.added_track_count, 6);
+        assert!(fixed.no_endpoint_tracks);
+        assert!(fixed.every_gap_exact_count);
+        assert!(fixed.repeat_windows_satisfied);
+        assert_eq!(fixed.final_sequence.len(), 10);
+        assert_eq!(fixed.final_sequence.first().unwrap().kind, "original");
+        assert_eq!(fixed.final_sequence.last().unwrap().kind, "original");
+        for gap in 1..=fixed.source_gap_count {
+            assert_eq!(
+                fixed
+                    .decisions
+                    .iter()
+                    .filter(|decision| {
+                        decision.original_position == gap
+                            && decision.reason == preview::DecisionReason::Selected
+                    })
+                    .count(),
+                fixed.tracks_per_gap
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_gap_source_repeat_conflict_fails_before_search() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let source = repository.join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["repeat_windows"]["artist"] = Value::from(3);
+        request["source_tracks"][1]["artist"] = request["source_tracks"][0]["artist"].clone();
+        request["source_tracks"][0]["artist_identity_keys"] =
+            serde_json::json!(["artist-mbid:repeat-conflict"]);
+        request["source_tracks"][0]["primary_artist_identity_key"] =
+            Value::from("artist-mbid:repeat-conflict");
+        request["source_tracks"][1]["artist_identity_keys"] =
+            serde_json::json!(["artist-mbid:repeat-conflict"]);
+        request["source_tracks"][1]["primary_artist_identity_key"] =
+            Value::from("artist-mbid:repeat-conflict");
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-fixed-gap-repeat-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+        let failure = analyze_bridge_request(&temporary).unwrap_err();
+        let _ = fs::remove_file(temporary);
+        std::env::set_current_dir(original).unwrap();
+
+        assert_eq!(failure.code, "FIXED_GAP_SOURCE_REPEAT_CONFLICT");
+    }
+
+    #[test]
     fn endpoint_slot_fixture_is_exact_and_worker_deterministic() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
         let original = std::env::current_dir().unwrap();
@@ -8886,8 +9040,7 @@ mod tests {
 
         let exact = match &artifact.selection_preview {
             SelectionPreviewArtifact::Exact(exact) => exact,
-            SelectionPreviewArtifact::Automatic(_)
-            | SelectionPreviewArtifact::FixedSourceExtension(_) => {
+            _ => {
                 panic!("expected exact-count preview")
             }
         };
