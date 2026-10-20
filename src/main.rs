@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use bliss_playlist_optimizer::{bridge, preview, route, semantic};
+use bliss_playlist_optimizer::{bridge, multi_gap, preview, route, semantic};
 mod guidance;
 
 const PROGRAM: &str = "bliss-playlist-optimizer";
@@ -455,6 +455,65 @@ fn preflight_destination_repeat_budget(request: &Request) -> Result<(), CommandF
                 requirement.explanation(&request.repeat_windows),
             ),
         ));
+    }
+    Ok(())
+}
+
+fn preflight_fixed_gap_repeat_budget(request: &Request) -> Result<(), CommandFailure> {
+    if request.extension.mode != "fixed_gap_count" {
+        return Ok(());
+    }
+    let Some(tracks_per_gap) = request.extension.tracks_per_gap else {
+        return Ok(());
+    };
+    if !(1..=preview::MAX_EXACT_TRACKS_PER_GAP).contains(&tracks_per_gap) {
+        return Ok(());
+    }
+
+    for right in 1..request.source_tracks.len() {
+        for left in 0..right {
+            let projected_distance = (right - left) * (tracks_per_gap + 1);
+            let left_track = &request.source_tracks[left];
+            let right_track = &request.source_tracks[right];
+            let artist_conflict = request.repeat_windows.artist > 0
+                && projected_distance <= request.repeat_windows.artist
+                && {
+                    let left_keys = request_artist_repeat_keys(
+                        left_track,
+                        request.repeat_windows.artist_identity_mode,
+                    );
+                    let right_keys = request_artist_repeat_keys(
+                        right_track,
+                        request.repeat_windows.artist_identity_mode,
+                    );
+                    !left_keys.is_empty() && left_keys.iter().any(|key| right_keys.contains(key))
+                };
+            let left_album = left_track
+                .album
+                .as_deref()
+                .map(repeat_key)
+                .unwrap_or_default();
+            let right_album = right_track
+                .album
+                .as_deref()
+                .map(repeat_key)
+                .unwrap_or_default();
+            let album_conflict = request.repeat_windows.album > 0
+                && projected_distance <= request.repeat_windows.album
+                && !right_album.is_empty()
+                && left_album == right_album;
+            if artist_conflict || album_conflict {
+                let kind = if artist_conflict { "artist" } else { "album" };
+                return Err(CommandFailure::new(
+                    "FIXED_GAP_SOURCE_REPEAT_CONFLICT",
+                    format!(
+                        "source tracks {} and {} retain a {kind} repeat at projected distance {projected_distance}; the configured {kind} window cannot be satisfied with {tracks_per_gap} bridges per gap",
+                        left + 1,
+                        right + 1,
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1580,6 +1639,12 @@ struct ProgressReporter {
     started: Instant,
 }
 
+struct ProgressHeartbeatUpdate {
+    message: String,
+    current: Option<usize>,
+    total: Option<usize>,
+}
+
 impl ProgressReporter {
     fn new(path: Option<PathBuf>) -> Self {
         Self {
@@ -1602,6 +1667,22 @@ impl ProgressReporter {
     where
         F: Fn() -> String + Send + 'static,
     {
+        self.dynamic_counted_heartbeat(stage, interval, move || ProgressHeartbeatUpdate {
+            message: message(),
+            current: None,
+            total: None,
+        })
+    }
+
+    fn dynamic_counted_heartbeat<F>(
+        &self,
+        stage: &'static str,
+        interval: Duration,
+        update: F,
+    ) -> ProgressHeartbeat
+    where
+        F: Fn() -> ProgressHeartbeatUpdate + Send + 'static,
+    {
         let Some(path) = self.path.clone() else {
             return ProgressHeartbeat::disabled();
         };
@@ -1618,7 +1699,8 @@ impl ProgressReporter {
                 if done_for_thread.load(Ordering::Relaxed) {
                     break;
                 }
-                reporter.update(stage, message(), None, None);
+                let update = update();
+                reporter.update(stage, update.message, update.current, update.total);
             }
         });
         ProgressHeartbeat {
@@ -1699,6 +1781,36 @@ struct RouteProgressSnapshot {
     completed_tasks: usize,
     total_tasks: usize,
     local_search_passes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FixedGapProgressSnapshot {
+    phase: multi_gap::FixedGapProgressPhase,
+    gap: usize,
+    total_gaps: usize,
+    completed_gaps: usize,
+    evaluated_states: usize,
+    retained_states: usize,
+}
+
+impl FixedGapProgressSnapshot {
+    fn update(self) -> ProgressHeartbeatUpdate {
+        let message = match self.phase {
+            multi_gap::FixedGapProgressPhase::Searching => format!(
+                "Searching source gap {} of {}; {} completed; {} global route states retained",
+                self.gap, self.total_gaps, self.completed_gaps, self.retained_states
+            ),
+            multi_gap::FixedGapProgressPhase::Completed => format!(
+                "Completed source gap {} of {}; evaluated {} and retained {} global route states",
+                self.gap, self.total_gaps, self.evaluated_states, self.retained_states
+            ),
+        };
+        ProgressHeartbeatUpdate {
+            message,
+            current: Some(self.completed_gaps),
+            total: Some(self.total_gaps),
+        }
+    }
 }
 
 impl Default for RouteProgressSnapshot {
@@ -2293,6 +2405,7 @@ fn prepare_runtime_request(
     );
     let started = Instant::now();
     preflight_destination_repeat_budget(&request)?;
+    preflight_fixed_gap_repeat_budget(&request)?;
     timings.record("destination_repeat_preflight", started.elapsed());
 
     if let Some(identity) = &request.artifacts.database.schema_identity {
@@ -5196,31 +5309,6 @@ fn analyze_bridge_validated(
                     ),
                 ));
             }
-            for right in 1..selected_library_route.len() {
-                for left in 0..right {
-                    let projected_distance = (right - left) * (tracks_per_gap + 1);
-                    let left_track = &source_route_tracks[selected_local_route[left]];
-                    let right_track = &source_route_tracks[selected_local_route[right]];
-                    let artist_conflict = bridge_config.artist_window > 0
-                        && projected_distance <= bridge_config.artist_window
-                        && route::artists_repeat(left_track, right_track);
-                    let album_conflict = bridge_config.album_window > 0
-                        && projected_distance <= bridge_config.album_window
-                        && !right_track.album_key.is_empty()
-                        && left_track.album_key == right_track.album_key;
-                    if artist_conflict || album_conflict {
-                        let kind = if artist_conflict { "artist" } else { "album" };
-                        return Err(CommandFailure::new(
-                            "FIXED_GAP_SOURCE_REPEAT_CONFLICT",
-                            format!(
-                                "source tracks {} and {} retain a {kind} repeat at projected distance {projected_distance}; the configured {kind} window cannot be satisfied with {tracks_per_gap} bridges per gap",
-                                left + 1,
-                                right + 1,
-                            ),
-                        ));
-                    }
-                }
-            }
             let unique_candidates = preview_gaps
                 .iter()
                 .flat_map(|gap| {
@@ -5247,7 +5335,31 @@ fn analyze_bridge_validated(
                 Some(0),
                 Some(gap_count),
             );
-            let selection = preview::select_fixed_gap_count_bridges(
+            let fixed_gap_progress = Arc::new(Mutex::new(FixedGapProgressSnapshot {
+                phase: multi_gap::FixedGapProgressPhase::Searching,
+                gap: 1,
+                total_gaps: gap_count,
+                completed_gaps: 0,
+                evaluated_states: 0,
+                retained_states: 1,
+            }));
+            let heartbeat_progress = Arc::clone(&fixed_gap_progress);
+            let heartbeat = progress.dynamic_counted_heartbeat(
+                "bridge_selection",
+                Duration::from_secs(2),
+                move || {
+                    heartbeat_progress
+                        .lock()
+                        .map(|snapshot| snapshot.update())
+                        .unwrap_or_else(|_| ProgressHeartbeatUpdate {
+                            message: "Planning bridges across source gaps".to_owned(),
+                            current: Some(0),
+                            total: Some(gap_count),
+                        })
+                },
+            );
+            let progress_writer = Arc::clone(&fixed_gap_progress);
+            let selection = preview::select_fixed_gap_count_bridges_with_progress(
                 &selected_library_route,
                 &preview_gaps,
                 &preview::FixedGapCountConfig {
@@ -5258,12 +5370,29 @@ fn analyze_bridge_validated(
                     variation_percent: request.selection.variation_percent,
                     generation_seed: request.selection.generation_seed,
                 },
-                bridge_tracks,
-                &learned_matrix,
-                &bridge_config,
-                &reference,
-            )
-            .map_err(|error| CommandFailure::new("FIXED_GAP_ROUTE_NOT_FOUND", error.to_string()))?;
+                preview::FixedGapScoringContext {
+                    tracks: bridge_tracks,
+                    learned_matrix: &learned_matrix,
+                    config: &bridge_config,
+                    reference: &reference,
+                },
+                move |event| {
+                    if let Ok(mut snapshot) = progress_writer.lock() {
+                        *snapshot = FixedGapProgressSnapshot {
+                            phase: event.phase,
+                            gap: event.gap,
+                            total_gaps: event.total_gaps,
+                            completed_gaps: event.completed_gaps,
+                            evaluated_states: event.evaluated_states,
+                            retained_states: event.retained_states,
+                        };
+                    }
+                },
+            );
+            drop(heartbeat);
+            let selection = selection.map_err(|error| {
+                CommandFailure::new("FIXED_GAP_ROUTE_NOT_FOUND", error.to_string())
+            })?;
             let final_route = selection.final_route.as_ref().ok_or_else(|| {
                 CommandFailure::new(
                     "FIXED_GAP_ROUTE_NOT_FOUND",
@@ -7304,6 +7433,38 @@ mod tests {
         assert_eq!(progress["msg"], "Optimization finished");
         let _ = fs::remove_file(progress_path);
     }
+
+    #[test]
+    fn counted_progress_heartbeat_keeps_gap_counters_visible() {
+        let progress_path = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-progress-{}-fixed-gap.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&progress_path);
+        let reporter = ProgressReporter::new(Some(progress_path.clone()));
+        let heartbeat = reporter.dynamic_counted_heartbeat(
+            "bridge_selection",
+            Duration::from_millis(10),
+            || ProgressHeartbeatUpdate {
+                message: "Searching source gap 2 of 7; 1 gap completed".to_owned(),
+                current: Some(1),
+                total: Some(7),
+            },
+        );
+        thread::sleep(Duration::from_millis(30));
+        drop(heartbeat);
+
+        let progress: Value = serde_json::from_slice(&fs::read(&progress_path).unwrap()).unwrap();
+        assert_eq!(progress["stage"], "bridge_selection");
+        assert_eq!(
+            progress["msg"],
+            "Searching source gap 2 of 7; 1 gap completed"
+        );
+        assert_eq!(progress["current"], 1);
+        assert_eq!(progress["total"], 7);
+        assert_eq!(progress["percent"], 100.0 / 7.0);
+        let _ = fs::remove_file(progress_path);
+    }
     #[test]
     fn fixed_matrix_index_matches_core_pairwise_distance() {
         let tracks = (0..4)
@@ -8998,6 +9159,8 @@ mod tests {
             serde_json::json!(["artist-mbid:repeat-conflict"]);
         request["source_tracks"][1]["primary_artist_identity_key"] =
             Value::from("artist-mbid:repeat-conflict");
+        request["artifacts"]["database"]["path"] =
+            Value::from("fixtures/synthetic/does-not-exist.db");
         let temporary = std::env::temp_dir().join(format!(
             "bliss-playlist-optimizer-fixed-gap-repeat-{}.json",
             std::process::id()

@@ -17,7 +17,8 @@ use crate::bridge::{
     EndpointCandidateEvaluation, EndpointSlot, FrozenReference,
 };
 use crate::multi_gap::{
-    plan_fixed_gap_count, FixedGap, FixedGapPlanConfig, FixedGapPlanError, FixedGapPlanRequest,
+    plan_fixed_gap_count_with_progress, FixedGap, FixedGapPlanConfig, FixedGapPlanError,
+    FixedGapPlanRequest, FixedGapProgressEvent,
 };
 use crate::route::{self, RouteTrack};
 use crate::semantic::{CandidateSemantics, GapEvidence, SemanticPool};
@@ -57,6 +58,14 @@ pub struct FixedGapCountConfig {
     pub alternatives_per_gap: usize,
     pub variation_percent: u8,
     pub generation_seed: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct FixedGapScoringContext<'a> {
+    pub tracks: &'a [RouteTrack],
+    pub learned_matrix: &'a Array2<f32>,
+    pub config: &'a BridgeConfig,
+    pub reference: &'a FrozenReference,
 }
 
 struct ContextualFixedGapScorer<'a> {
@@ -112,6 +121,36 @@ pub fn select_fixed_gap_count_bridges(
     config: &BridgeConfig,
     reference: &FrozenReference,
 ) -> Result<ExactSelection, PreviewError> {
+    select_fixed_gap_count_bridges_with_progress(
+        original_route,
+        gaps,
+        selection_config,
+        FixedGapScoringContext {
+            tracks,
+            learned_matrix,
+            config,
+            reference,
+        },
+        |_| {},
+    )
+}
+
+pub fn select_fixed_gap_count_bridges_with_progress<F>(
+    original_route: &[usize],
+    gaps: &[AutomaticGap],
+    selection_config: &FixedGapCountConfig,
+    scoring: FixedGapScoringContext<'_>,
+    progress: F,
+) -> Result<ExactSelection, PreviewError>
+where
+    F: FnMut(FixedGapProgressEvent),
+{
+    let FixedGapScoringContext {
+        tracks,
+        learned_matrix,
+        config,
+        reference,
+    } = scoring;
     let mut ordered_gaps = gaps.to_vec();
     ordered_gaps.sort_by_key(|gap| gap.original_position);
     let candidate_sets = ordered_gaps
@@ -168,7 +207,7 @@ pub fn select_fixed_gap_count_bridges(
         reference,
         frozen_matrices,
     };
-    let plan = plan_fixed_gap_count(
+    let plan = plan_fixed_gap_count_with_progress(
         FixedGapPlanRequest {
             source_route: original_route,
             immutable_history: &[],
@@ -187,6 +226,7 @@ pub fn select_fixed_gap_count_bridges(
             },
         },
         scorer,
+        progress,
     )
     .map_err(|error| match error {
         FixedGapPlanError::InvalidConfig(message) => PreviewError::InvalidExactConfig(message),

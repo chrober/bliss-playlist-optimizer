@@ -60,6 +60,22 @@ pub struct FixedGapPlanStats {
     pub completed_gaps: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixedGapProgressPhase {
+    Searching,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedGapProgressEvent {
+    pub phase: FixedGapProgressPhase,
+    pub gap: usize,
+    pub total_gaps: usize,
+    pub completed_gaps: usize,
+    pub evaluated_states: usize,
+    pub retained_states: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FixedGapPlan {
     pub final_route: Vec<usize>,
@@ -266,6 +282,18 @@ pub fn plan_fixed_gap_count<S>(
 where
     S: AnchoredPathScorer,
 {
+    plan_fixed_gap_count_with_progress(request, scorer, |_| {})
+}
+
+pub fn plan_fixed_gap_count_with_progress<S, F>(
+    request: FixedGapPlanRequest<'_>,
+    scorer: S,
+    mut progress: F,
+) -> Result<FixedGapPlan, FixedGapPlanError>
+where
+    S: AnchoredPathScorer,
+    F: FnMut(FixedGapProgressEvent),
+{
     validate_request(&request)?;
     let source_unavailable = request.source_route.to_vec();
     let mut states = vec![GlobalState {
@@ -282,6 +310,14 @@ where
     }];
 
     for (gap_index, gap) in request.gaps.iter().enumerate() {
+        progress(FixedGapProgressEvent {
+            phase: FixedGapProgressPhase::Searching,
+            gap: gap_index + 1,
+            total_gaps: request.gaps.len(),
+            completed_gaps: gap_index,
+            evaluated_states: states.len(),
+            retained_states: states.len(),
+        });
         let batches = states
             .par_iter()
             .map(|state| {
@@ -367,6 +403,14 @@ where
             });
         }
         states = expanded;
+        progress(FixedGapProgressEvent {
+            phase: FixedGapProgressPhase::Completed,
+            gap: gap_index + 1,
+            total_gaps: request.gaps.len(),
+            completed_gaps: gap_index + 1,
+            evaluated_states: evaluated,
+            retained_states: retained,
+        });
     }
 
     states.retain(|state| final_route_valid(&request, state));

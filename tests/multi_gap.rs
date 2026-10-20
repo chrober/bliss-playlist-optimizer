@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use bliss_playlist_optimizer::anchored_path::{AnchoredPathCandidate, FixedAdjacentScorer};
 use bliss_playlist_optimizer::multi_gap::{
-    plan_fixed_gap_count, FixedGap, FixedGapPlanConfig, FixedGapPlanError, FixedGapPlanRequest,
+    plan_fixed_gap_count, plan_fixed_gap_count_with_progress, FixedGap, FixedGapPlanConfig,
+    FixedGapPlanError, FixedGapPlanRequest, FixedGapProgressPhase,
 };
 use bliss_playlist_optimizer::route::RouteTrack;
 
@@ -84,6 +85,68 @@ fn fills_every_internal_gap_with_the_exact_requested_count() {
         .filter(|track| [0, 3, 6].contains(track))
         .collect::<Vec<_>>();
     assert_eq!(sources, vec![0, 3, 6]);
+}
+
+#[test]
+fn reports_start_and_completion_for_every_gap() {
+    let tracks = (0..7)
+        .map(|index| {
+            track(
+                index as f32,
+                &format!("artist-{index}"),
+                &format!("album-{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let gaps = [
+        FixedGap {
+            left: 0,
+            right: 3,
+            candidates: &[candidate(1), candidate(2)],
+        },
+        FixedGap {
+            left: 3,
+            right: 6,
+            candidates: &[candidate(4), candidate(5)],
+        },
+    ];
+    let mut events = Vec::new();
+
+    plan_fixed_gap_count_with_progress(
+        FixedGapPlanRequest {
+            source_route: &[0, 3, 6],
+            immutable_history: &[],
+            gaps: &gaps,
+            tracks: &tracks,
+            config: config(1),
+        },
+        FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
+        |event| events.push(event),
+    )
+    .unwrap();
+
+    assert_eq!(events.len(), 4);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| (
+                event.phase,
+                event.gap,
+                event.total_gaps,
+                event.completed_gaps
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (FixedGapProgressPhase::Searching, 1, 2, 0),
+            (FixedGapProgressPhase::Completed, 1, 2, 1),
+            (FixedGapProgressPhase::Searching, 2, 2, 1),
+            (FixedGapProgressPhase::Completed, 2, 2, 2),
+        ]
+    );
+    assert!(events
+        .iter()
+        .filter(|event| event.phase == FixedGapProgressPhase::Completed)
+        .all(|event| event.evaluated_states > 0 && event.retained_states > 0));
 }
 
 #[test]
