@@ -204,6 +204,29 @@ struct GlobalState {
     stats: FixedGapPlanStats,
 }
 
+#[derive(Clone, Copy)]
+enum AdditionPolicy {
+    ExactPerGap(usize),
+    MinimumTotal(usize),
+}
+
+#[derive(Clone, Copy)]
+struct GlobalPlanRequest<'a> {
+    source_route: &'a [usize],
+    immutable_history: &'a [usize],
+    gaps: &'a [FixedGap<'a>],
+    tracks: &'a [RouteTrack],
+    candidate_limit: usize,
+    beam_width: usize,
+    alternatives_per_gap: usize,
+    variation_percent: u8,
+    generation_seed: u64,
+    artist_window: usize,
+    album_window: usize,
+    track_window: usize,
+    addition_policy: AdditionPolicy,
+}
+
 fn state_order(left: &GlobalState, right: &GlobalState) -> std::cmp::Ordering {
     left.worst_transition
         .total_cmp(&right.worst_transition)
@@ -221,6 +244,20 @@ fn variation_key(seed: u64, route: &[usize]) -> u64 {
         let mixed = value ^ (*track as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
         mixed.rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb)
     })
+}
+
+fn policy_state_order(
+    policy: AdditionPolicy,
+    left: &GlobalState,
+    right: &GlobalState,
+) -> std::cmp::Ordering {
+    match policy {
+        AdditionPolicy::ExactPerGap(_) => state_order(left, right),
+        AdditionPolicy::MinimumTotal(_) => left
+            .added_track_count
+            .cmp(&right.added_track_count)
+            .then_with(|| state_order(left, right)),
+    }
 }
 
 fn validate_request(request: &FixedGapPlanRequest<'_>) -> Result<(), FixedGapPlanError> {
@@ -471,6 +508,84 @@ where
     F: FnMut(FixedGapProgressEvent),
 {
     validate_request(&request)?;
+    plan_global_with_progress(
+        GlobalPlanRequest {
+            source_route: request.source_route,
+            immutable_history: request.immutable_history,
+            gaps: request.gaps,
+            tracks: request.tracks,
+            candidate_limit: request.config.candidate_limit,
+            beam_width: request.config.beam_width,
+            alternatives_per_gap: request.config.alternatives_per_gap,
+            variation_percent: request.config.variation_percent,
+            generation_seed: request.config.generation_seed,
+            artist_window: request.config.artist_window,
+            album_window: request.config.album_window,
+            track_window: request.config.track_window,
+            addition_policy: AdditionPolicy::ExactPerGap(request.config.tracks_per_gap),
+        },
+        scorer,
+        &mut progress,
+        |state| final_route_valid(&request, state),
+        "no retained route passed the final global proof",
+    )
+}
+
+pub fn plan_repeat_window_repair<S>(
+    request: RepeatWindowRepairRequest<'_>,
+    scorer: S,
+) -> Result<FixedGapPlan, FixedGapPlanError>
+where
+    S: AnchoredPathScorer,
+{
+    plan_repeat_window_repair_with_progress(request, scorer, |_| {})
+}
+
+pub fn plan_repeat_window_repair_with_progress<S, F>(
+    request: RepeatWindowRepairRequest<'_>,
+    scorer: S,
+    mut progress: F,
+) -> Result<FixedGapPlan, FixedGapPlanError>
+where
+    S: AnchoredPathScorer,
+    F: FnMut(FixedGapProgressEvent),
+{
+    validate_repair_request(&request)?;
+    plan_global_with_progress(
+        GlobalPlanRequest {
+            source_route: request.source_route,
+            immutable_history: request.immutable_history,
+            gaps: request.gaps,
+            tracks: request.tracks,
+            candidate_limit: request.config.candidate_limit,
+            beam_width: request.config.beam_width,
+            alternatives_per_gap: request.config.alternatives_per_gap,
+            variation_percent: request.config.variation_percent,
+            generation_seed: request.config.generation_seed,
+            artist_window: request.config.artist_window,
+            album_window: request.config.album_window,
+            track_window: request.config.track_window,
+            addition_policy: AdditionPolicy::MinimumTotal(request.config.max_added_tracks),
+        },
+        scorer,
+        &mut progress,
+        |state| repair_final_route_valid(&request, state),
+        "no retained repeat-window repair passed the final global proof",
+    )
+}
+
+fn plan_global_with_progress<S, F, V>(
+    request: GlobalPlanRequest<'_>,
+    scorer: S,
+    progress: &mut F,
+    final_route_valid: V,
+    final_invalid_message: &'static str,
+) -> Result<FixedGapPlan, FixedGapPlanError>
+where
+    S: AnchoredPathScorer,
+    F: FnMut(FixedGapProgressEvent),
+    V: Fn(&GlobalState) -> bool,
+{
     let source_unavailable = request.source_route.to_vec();
     let mut states = vec![GlobalState {
         route: vec![request.source_route[0]],
@@ -498,6 +613,12 @@ where
         let batches = states
             .par_iter()
             .map(|state| {
+                let max_intermediates = match request.addition_policy {
+                    AdditionPolicy::ExactPerGap(count) => count,
+                    AdditionPolicy::MinimumTotal(maximum) => {
+                        maximum.saturating_sub(state.added_track_count)
+                    }
+                };
                 let mut unavailable = source_unavailable.clone();
                 unavailable.extend(state.route.iter().copied());
                 let options = search_anchored_paths(
@@ -510,15 +631,15 @@ where
                         candidates: gap.candidates,
                         tracks: request.tracks,
                         config: AnchoredPathSearchConfig {
-                            max_intermediates: request.config.tracks_per_gap,
-                            candidate_limit: request.config.candidate_limit,
-                            beam_width: request.config.beam_width,
-                            alternatives_per_count: request.config.alternatives_per_gap,
+                            max_intermediates,
+                            candidate_limit: request.candidate_limit,
+                            beam_width: request.beam_width,
+                            alternatives_per_count: request.alternatives_per_gap,
                             variation_percent: 0,
-                            generation_seed: request.config.generation_seed,
-                            artist_window: request.config.artist_window,
-                            album_window: request.config.album_window,
-                            track_window: request.config.track_window,
+                            generation_seed: request.generation_seed,
+                            artist_window: request.artist_window,
+                            album_window: request.album_window,
+                            track_window: request.track_window,
                         },
                     },
                     &scorer,
@@ -526,7 +647,12 @@ where
                 .map_err(FixedGapPlanError::Path)?;
                 Ok(options
                     .into_iter()
-                    .filter(|option| option.intermediates.len() == request.config.tracks_per_gap)
+                    .filter(|option| match request.addition_policy {
+                        AdditionPolicy::ExactPerGap(count) => option.intermediates.len() == count,
+                        AdditionPolicy::MinimumTotal(maximum) => {
+                            state.added_track_count + option.intermediates.len() <= maximum
+                        }
+                    })
                     .map(|option| GlobalState {
                         added_track_count: state.added_track_count + option.intermediates.len(),
                         route: option.route,
@@ -562,205 +688,24 @@ where
             expanded.extend(batch?);
         }
         let evaluated = expanded.len();
-        expanded.sort_by(state_order);
+        expanded.sort_by(|left, right| policy_state_order(request.addition_policy, left, right));
         expanded.dedup_by(|left, right| left.route == right.route);
         let before_prune = expanded.len();
-        expanded.truncate(request.config.beam_width);
-        let retained = expanded.len();
-        let pruned = before_prune.saturating_sub(retained);
-        for state in &mut expanded {
-            state.stats.evaluated_states = state.stats.evaluated_states.saturating_add(evaluated);
-            state.stats.retained_states = state.stats.retained_states.saturating_add(retained);
-            state.stats.pruned_states = state.stats.pruned_states.saturating_add(pruned);
-        }
-        if expanded.is_empty() {
-            return Err(FixedGapPlanError::NoCompleteRoute {
-                blocking_gap: gap_index,
-                evaluated_states: evaluated,
-                retained_states: 0,
-            });
-        }
-        states = expanded;
-        progress(FixedGapProgressEvent {
-            phase: FixedGapProgressPhase::Completed,
-            gap: gap_index + 1,
-            total_gaps: request.gaps.len(),
-            completed_gaps: gap_index + 1,
-            evaluated_states: evaluated,
-            retained_states: retained,
-        });
-    }
-
-    states.retain(|state| final_route_valid(&request, state));
-    if states.is_empty() {
-        return Err(FixedGapPlanError::FinalRouteInvalid(
-            "no retained route passed the final global proof",
-        ));
-    }
-    states.sort_by(state_order);
-    let best = &states[0];
-    let worst_limit = best.worst_transition + (best.worst_transition * 0.02).max(1.0e-9);
-    let sum_limit = best.transition_sum + (best.transition_sum * 0.05).max(1.0e-9);
-    let quality_count = states
-        .iter()
-        .take_while(|state| state.worst_transition <= worst_limit)
-        .filter(|state| state.transition_sum <= sum_limit)
-        .count()
-        .max(1);
-    let selection_pool = if request.config.variation_percent == 0 {
-        1
-    } else {
-        1 + (quality_count.saturating_sub(1) * usize::from(request.config.variation_percent) / 100)
-    };
-    let mut selected = states.into_iter().take(selection_pool).collect::<Vec<_>>();
-    if request.config.variation_percent > 0 {
-        selected.sort_by_key(|state| variation_key(request.config.generation_seed, &state.route));
-    }
-    let state = selected.remove(0);
-    Ok(FixedGapPlan {
-        final_route: state.route,
-        gaps: state.gaps,
-        transition_sum: state.transition_sum,
-        worst_transition: state.worst_transition,
-        guidance_adjustment: state.guidance_adjustment,
-        stats: state.stats,
-    })
-}
-
-pub fn plan_repeat_window_repair<S>(
-    request: RepeatWindowRepairRequest<'_>,
-    scorer: S,
-) -> Result<FixedGapPlan, FixedGapPlanError>
-where
-    S: AnchoredPathScorer,
-{
-    plan_repeat_window_repair_with_progress(request, scorer, |_| {})
-}
-
-pub fn plan_repeat_window_repair_with_progress<S, F>(
-    request: RepeatWindowRepairRequest<'_>,
-    scorer: S,
-    mut progress: F,
-) -> Result<FixedGapPlan, FixedGapPlanError>
-where
-    S: AnchoredPathScorer,
-    F: FnMut(FixedGapProgressEvent),
-{
-    validate_repair_request(&request)?;
-    let source_unavailable = request.source_route.to_vec();
-    let mut states = vec![GlobalState {
-        route: vec![request.source_route[0]],
-        gaps: Vec::with_capacity(request.gaps.len()),
-        added_track_count: 0,
-        transition_sum: 0.0,
-        worst_transition: 0.0,
-        guidance_adjustment: 0.0,
-        stats: FixedGapPlanStats {
-            evaluated_states: 1,
-            retained_states: 1,
-            ..FixedGapPlanStats::default()
-        },
-    }];
-
-    for (gap_index, gap) in request.gaps.iter().enumerate() {
-        progress(FixedGapProgressEvent {
-            phase: FixedGapProgressPhase::Searching,
-            gap: gap_index + 1,
-            total_gaps: request.gaps.len(),
-            completed_gaps: gap_index,
-            evaluated_states: states.len(),
-            retained_states: states.len(),
-        });
-        let batches = states
-            .par_iter()
-            .map(|state| {
-                let remaining = request
-                    .config
-                    .max_added_tracks
-                    .saturating_sub(state.added_track_count);
-                let mut unavailable = source_unavailable.clone();
-                unavailable.extend(state.route.iter().copied());
-                let options = search_anchored_paths(
-                    AnchoredPathRequest {
-                        route_prefix: &state.route,
-                        immutable_history: request.immutable_history,
-                        unavailable_tracks: &unavailable,
-                        left_anchor: gap.left,
-                        right_anchor: gap.right,
-                        candidates: gap.candidates,
-                        tracks: request.tracks,
-                        config: AnchoredPathSearchConfig {
-                            max_intermediates: remaining,
-                            candidate_limit: request.config.candidate_limit,
-                            beam_width: request.config.beam_width,
-                            alternatives_per_count: request.config.alternatives_per_gap,
-                            variation_percent: 0,
-                            generation_seed: request.config.generation_seed,
-                            artist_window: request.config.artist_window,
-                            album_window: request.config.album_window,
-                            track_window: request.config.track_window,
-                        },
-                    },
-                    &scorer,
-                )
-                .map_err(FixedGapPlanError::Path)?;
-                Ok(options
-                    .into_iter()
-                    .filter(|option| option.intermediates.len() <= remaining)
-                    .map(|option| {
-                        let added_track_count =
-                            state.added_track_count + option.intermediates.len();
-                        GlobalState {
-                            route: option.route,
-                            gaps: state
-                                .gaps
-                                .iter()
-                                .cloned()
-                                .chain(std::iter::once(FixedGapSelection {
-                                    left: gap.left,
-                                    right: gap.right,
-                                    intermediates: option.intermediates,
-                                }))
-                                .collect(),
-                            added_track_count,
-                            transition_sum: state.transition_sum + option.transition_sum,
-                            worst_transition: state.worst_transition.max(option.worst_transition),
-                            guidance_adjustment: state.guidance_adjustment
-                                + option.guidance_adjustment,
-                            stats: FixedGapPlanStats {
-                                evaluated_states: state
-                                    .stats
-                                    .evaluated_states
-                                    .saturating_add(option.stats.evaluated_states),
-                                retained_states: state.stats.retained_states,
-                                pruned_states: state.stats.pruned_states,
-                                completed_gaps: gap_index + 1,
-                            },
-                        }
-                    })
-                    .collect::<Vec<_>>())
-            })
-            .collect::<Vec<Result<Vec<_>, FixedGapPlanError>>>();
-
-        let mut expanded = Vec::new();
-        for batch in batches {
-            expanded.extend(batch?);
-        }
-        let evaluated = expanded.len();
-        expanded.sort_by(|left, right| {
-            left.added_track_count
-                .cmp(&right.added_track_count)
-                .then_with(|| state_order(left, right))
-        });
-        expanded.dedup_by(|left, right| left.route == right.route);
-        let before_prune = expanded.len();
-        let mut per_count = vec![Vec::new(); request.config.max_added_tracks + 1];
-        for state in expanded {
-            if per_count[state.added_track_count].len() < request.config.beam_width {
-                per_count[state.added_track_count].push(state);
+        let mut retained_states = match request.addition_policy {
+            AdditionPolicy::ExactPerGap(_) => {
+                expanded.truncate(request.beam_width);
+                expanded
             }
-        }
-        let mut retained_states = per_count.into_iter().flatten().collect::<Vec<_>>();
+            AdditionPolicy::MinimumTotal(maximum) => {
+                let mut per_count = vec![Vec::new(); maximum + 1];
+                for state in expanded {
+                    if per_count[state.added_track_count].len() < request.beam_width {
+                        per_count[state.added_track_count].push(state);
+                    }
+                }
+                per_count.into_iter().flatten().collect()
+            }
+        };
         let retained = retained_states.len();
         let pruned = before_prune.saturating_sub(retained);
         for state in &mut retained_states {
@@ -786,19 +731,15 @@ where
         });
     }
 
-    states.retain(|state| repair_final_route_valid(&request, state));
+    states.retain(final_route_valid);
     if states.is_empty() {
-        return Err(FixedGapPlanError::FinalRouteInvalid(
-            "no retained repeat-window repair passed the final global proof",
-        ));
+        return Err(FixedGapPlanError::FinalRouteInvalid(final_invalid_message));
     }
-    states.sort_by(|left, right| {
-        left.added_track_count
-            .cmp(&right.added_track_count)
-            .then_with(|| state_order(left, right))
-    });
-    let minimum_count = states[0].added_track_count;
-    states.retain(|state| state.added_track_count == minimum_count);
+    states.sort_by(|left, right| policy_state_order(request.addition_policy, left, right));
+    if matches!(request.addition_policy, AdditionPolicy::MinimumTotal(_)) {
+        let minimum_count = states[0].added_track_count;
+        states.retain(|state| state.added_track_count == minimum_count);
+    }
     let best = &states[0];
     let worst_limit = best.worst_transition + (best.worst_transition * 0.02).max(1.0e-9);
     let sum_limit = best.transition_sum + (best.transition_sum * 0.05).max(1.0e-9);
@@ -808,14 +749,14 @@ where
         .filter(|state| state.transition_sum <= sum_limit)
         .count()
         .max(1);
-    let selection_pool = if request.config.variation_percent == 0 {
+    let selection_pool = if request.variation_percent == 0 {
         1
     } else {
-        1 + (quality_count.saturating_sub(1) * usize::from(request.config.variation_percent) / 100)
+        1 + (quality_count.saturating_sub(1) * usize::from(request.variation_percent) / 100)
     };
     let mut selected = states.into_iter().take(selection_pool).collect::<Vec<_>>();
-    if request.config.variation_percent > 0 {
-        selected.sort_by_key(|state| variation_key(request.config.generation_seed, &state.route));
+    if request.variation_percent > 0 {
+        selected.sort_by_key(|state| variation_key(request.generation_seed, &state.route));
     }
     let state = selected.remove(0);
     Ok(FixedGapPlan {
