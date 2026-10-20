@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use bliss_playlist_optimizer::anchored_path::{AnchoredPathCandidate, FixedAdjacentScorer};
 use bliss_playlist_optimizer::multi_gap::{
-    plan_fixed_gap_count, plan_fixed_gap_count_with_progress, FixedGap, FixedGapPlanConfig,
-    FixedGapPlanError, FixedGapPlanRequest, FixedGapProgressPhase,
+    plan_fixed_gap_count, plan_fixed_gap_count_with_progress, plan_repeat_window_repair, FixedGap,
+    FixedGapPlanConfig, FixedGapPlanError, FixedGapPlanRequest, FixedGapProgressPhase,
+    RepeatWindowRepairConfig, RepeatWindowRepairRequest,
 };
 use bliss_playlist_optimizer::route::RouteTrack;
 
@@ -35,6 +36,256 @@ fn config(tracks_per_gap: usize) -> FixedGapPlanConfig {
         album_window: 0,
         track_window: 100,
     }
+}
+
+fn repair_config(max_added_tracks: usize) -> RepeatWindowRepairConfig {
+    RepeatWindowRepairConfig {
+        max_added_tracks,
+        candidate_limit: 16,
+        beam_width: 64,
+        alternatives_per_gap: 8,
+        variation_percent: 0,
+        generation_seed: 42,
+        artist_window: 2,
+        album_window: 0,
+        track_window: 100,
+    }
+}
+
+#[test]
+fn repair_uses_zero_tracks_in_safe_gaps_and_two_where_required() {
+    let tracks = vec![
+        track(0.0, "repeated", "source-a"),
+        track(1.0, "bridge-one", "bridge-one"),
+        track(2.0, "bridge-two", "bridge-two"),
+        track(3.0, "repeated", "source-b"),
+        track(4.0, "unused", "unused"),
+        track(5.0, "unused-two", "unused-two"),
+        track(6.0, "final", "source-c"),
+    ];
+    let gaps = [
+        FixedGap {
+            left: 0,
+            right: 3,
+            candidates: &[candidate(1), candidate(2)],
+        },
+        FixedGap {
+            left: 3,
+            right: 6,
+            candidates: &[candidate(4), candidate(5)],
+        },
+    ];
+
+    let plan = plan_repeat_window_repair(
+        RepeatWindowRepairRequest {
+            source_route: &[0, 3, 6],
+            immutable_history: &[],
+            gaps: &gaps,
+            tracks: &tracks,
+            config: repair_config(3),
+        },
+        FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
+    )
+    .unwrap();
+
+    assert_eq!(plan.final_route, vec![0, 1, 2, 3, 6]);
+    assert_eq!(plan.gaps[0].intermediates, vec![1, 2]);
+    assert!(plan.gaps[1].intermediates.is_empty());
+}
+
+#[test]
+fn repair_minimizes_total_additions_before_acoustic_score() {
+    let tracks = vec![
+        track(0.0, "repeated", "source-a"),
+        track(1.0, "bridge-one", "bridge-one"),
+        track(2.0, "bridge-two", "bridge-two"),
+        track(4.0, "repeated", "source-b"),
+    ];
+    let gaps = [FixedGap {
+        left: 0,
+        right: 3,
+        candidates: &[candidate(1), candidate(2)],
+    }];
+    let distances = BTreeMap::from([
+        ((0, 1), 10.0),
+        ((1, 3), 10.0),
+        ((0, 2), 10.0),
+        ((2, 3), 10.0),
+        ((1, 2), 0.1),
+    ]);
+    let mut repair = repair_config(2);
+    repair.artist_window = 1;
+
+    let plan = plan_repeat_window_repair(
+        RepeatWindowRepairRequest {
+            source_route: &[0, 3],
+            immutable_history: &[],
+            gaps: &gaps,
+            tracks: &tracks,
+            config: repair,
+        },
+        FixedAdjacentScorer::new(|left: usize, right: usize| {
+            distances
+                .get(&(left, right))
+                .copied()
+                .or_else(|| distances.get(&(right, left)).copied())
+                .unwrap_or(100.0)
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(plan.gaps[0].intermediates.len(), 1);
+}
+
+#[test]
+fn repair_keeps_separate_total_count_beams_for_later_source_conflicts() {
+    let tracks = vec![
+        track(0.0, "repeated", "source-a"),
+        track(1.0, "spacing", "spacing"),
+        track(2.0, "unused", "unused"),
+        track(3.0, "middle", "source-b"),
+        track(4.0, "unused-two", "unused-two"),
+        track(5.0, "unused-three", "unused-three"),
+        track(6.0, "repeated", "source-c"),
+    ];
+    let gaps = [
+        FixedGap {
+            left: 0,
+            right: 3,
+            candidates: &[candidate(1)],
+        },
+        FixedGap {
+            left: 3,
+            right: 6,
+            candidates: &[],
+        },
+    ];
+    let mut repair = repair_config(1);
+    repair.beam_width = 1;
+
+    let plan = plan_repeat_window_repair(
+        RepeatWindowRepairRequest {
+            source_route: &[0, 3, 6],
+            immutable_history: &[],
+            gaps: &gaps,
+            tracks: &tracks,
+            config: repair,
+        },
+        FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
+    )
+    .unwrap();
+
+    assert_eq!(plan.final_route, vec![0, 1, 3, 6]);
+}
+
+#[test]
+fn repair_respects_global_budget_without_returning_a_partial_route() {
+    let tracks = vec![
+        track(0.0, "repeated", "source-a"),
+        track(1.0, "bridge-one", "bridge-one"),
+        track(2.0, "bridge-two", "bridge-two"),
+        track(3.0, "repeated", "source-b"),
+    ];
+    let gaps = [FixedGap {
+        left: 0,
+        right: 3,
+        candidates: &[candidate(1), candidate(2)],
+    }];
+
+    let error = plan_repeat_window_repair(
+        RepeatWindowRepairRequest {
+            source_route: &[0, 3],
+            immutable_history: &[],
+            gaps: &gaps,
+            tracks: &tracks,
+            config: repair_config(1),
+        },
+        FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        FixedGapPlanError::NoCompleteRoute { .. } | FixedGapPlanError::FinalRouteInvalid(_)
+    ));
+}
+
+#[test]
+fn repair_is_deterministic_across_one_and_four_rayon_workers() {
+    let tracks = vec![
+        track(0.0, "repeated", "source-a"),
+        track(1.0, "bridge-one", "bridge-one"),
+        track(2.0, "bridge-two", "bridge-two"),
+        track(3.0, "repeated", "source-b"),
+        track(4.0, "final", "source-c"),
+    ];
+    let gaps = [
+        FixedGap {
+            left: 0,
+            right: 3,
+            candidates: &[candidate(1), candidate(2)],
+        },
+        FixedGap {
+            left: 3,
+            right: 4,
+            candidates: &[candidate(1), candidate(2)],
+        },
+    ];
+    let run = |threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                plan_repeat_window_repair(
+                    RepeatWindowRepairRequest {
+                        source_route: &[0, 3, 4],
+                        immutable_history: &[],
+                        gaps: &gaps,
+                        tracks: &tracks,
+                        config: repair_config(3),
+                    },
+                    FixedAdjacentScorer::new(|left: usize, right: usize| {
+                        left.abs_diff(right) as f64
+                    }),
+                )
+                .unwrap()
+            })
+    };
+
+    assert_eq!(run(1), run(4));
+}
+
+#[test]
+fn repair_variation_never_selects_a_larger_valid_total() {
+    let tracks = vec![
+        track(0.0, "repeated", "source-a"),
+        track(1.0, "bridge-one", "bridge-one"),
+        track(2.0, "bridge-two", "bridge-two"),
+        track(3.0, "repeated", "source-b"),
+    ];
+    let gaps = [FixedGap {
+        left: 0,
+        right: 3,
+        candidates: &[candidate(1), candidate(2)],
+    }];
+    let mut repair = repair_config(2);
+    repair.artist_window = 1;
+    repair.variation_percent = 100;
+
+    let plan = plan_repeat_window_repair(
+        RepeatWindowRepairRequest {
+            source_route: &[0, 3],
+            immutable_history: &[],
+            gaps: &gaps,
+            tracks: &tracks,
+            config: repair,
+        },
+        FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
+    )
+    .unwrap();
+
+    assert_eq!(plan.gaps[0].intermediates.len(), 1);
 }
 
 #[test]
