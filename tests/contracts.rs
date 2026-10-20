@@ -457,6 +457,42 @@ fn fixed_gap_count_requires_one_to_eight_tracks_and_rejects_other_amount_fields(
 }
 
 #[test]
+fn repeat_window_repair_requires_a_global_budget_and_rejects_target_fields() {
+    let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut request = read_json(&repository_path(
+        "fixtures/synthetic/preserve-multi-track-gap-request.json",
+    ));
+    request["extension"] = serde_json::json!({
+        "mode": "repeat_window_repair",
+        "max_added_tracks": 20,
+        "candidate_limit": 16,
+        "shortlist_limit": 256,
+        "gap_context_mode": "rolling"
+    });
+    assert!(validator.is_valid(&request));
+
+    let mut without_budget = request.clone();
+    without_budget["extension"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_added_tracks");
+    assert!(!validator.is_valid(&without_budget));
+
+    let mut fixed_count = request.clone();
+    fixed_count["extension"]["tracks_per_gap"] = Value::from(2);
+    assert!(!validator.is_valid(&fixed_count));
+
+    let mut target_count = request.clone();
+    target_count["extension"]["target_track_count"] = Value::from(24);
+    assert!(!validator.is_valid(&target_count));
+
+    let mut exact_count = request;
+    exact_count["extension"]["additional_track_count"] = Value::from(8);
+    assert!(!validator.is_valid(&exact_count));
+}
+
+#[test]
 fn multi_track_gap_bound_requires_exact_count_and_preserve_order() {
     let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
     let validator = jsonschema::validator_for(&schema).unwrap();

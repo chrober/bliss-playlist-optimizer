@@ -1165,6 +1165,7 @@ enum SelectionPreviewArtifact {
     Automatic(AutomaticSelectionArtifact),
     Exact(Box<ExactSelectionArtifact>),
     FixedGapCount(Box<FixedGapCountSelectionArtifact>),
+    RepeatWindowRepair(Box<RepeatWindowRepairSelectionArtifact>),
     FixedSourceExtension(FixedSourceExtensionSelectionArtifact),
 }
 
@@ -1183,6 +1184,25 @@ struct FixedGapCountSelectionArtifact {
     unique_membership: bool,
     every_gap_exact_count: bool,
     repeat_windows_satisfied: bool,
+    final_sequence: Vec<PreviewSequenceEntryArtifact>,
+    decisions: Vec<ExactPreviewDecisionArtifact>,
+    search: ExactSearchArtifact,
+}
+
+#[derive(Debug, Serialize)]
+struct RepeatWindowRepairSelectionArtifact {
+    mode: &'static str,
+    processing_order: &'static str,
+    source_track_count: usize,
+    source_gap_count: usize,
+    max_added_tracks: usize,
+    feasible: bool,
+    added_track_count: usize,
+    no_endpoint_tracks: bool,
+    original_subsequence_preserved: bool,
+    unique_membership: bool,
+    repeat_windows_satisfied: bool,
+    minimum_total_selected: bool,
     final_sequence: Vec<PreviewSequenceEntryArtifact>,
     decisions: Vec<ExactPreviewDecisionArtifact>,
     search: ExactSearchArtifact,
@@ -1962,7 +1982,7 @@ fn usage() -> &'static str {
 
 fn version_metadata_json() -> String {
     format!(
-        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"guidance_spi_v2\":true,\"fixed_gap_count_v1\":true}}"
+        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"guidance_spi_v2\":true,\"fixed_gap_count_v1\":true,\"repeat_window_repair_v1\":true}}"
     )
 }
 
@@ -4249,6 +4269,7 @@ fn analyze_bridge_validated(
                 })?),
             ),
             "fixed_gap_count" => (None, None, None),
+            "repeat_window_repair" => (None, None, None),
             "fixed_source_extension" => (None, None, None),
             "destination_route" => (
                 Some(request.extension.max_added_tracks.ok_or_else(|| {
@@ -4478,7 +4499,12 @@ fn analyze_bridge_validated(
             } else {
                 route::repeat_violations(&preserved, &source_route_tracks, &base_route_config)
             };
-            if !violations.is_empty() && request.extension.mode != "fixed_gap_count" {
+            if !violations.is_empty()
+                && !matches!(
+                    request.extension.mode.as_str(),
+                    "fixed_gap_count" | "repeat_window_repair"
+                )
+            {
                 return Err(CommandFailure::new(
                     "PRESERVED_ANCHOR_REPEAT_CONFLICT",
                     format!(
@@ -4592,7 +4618,18 @@ fn analyze_bridge_validated(
     } else {
         Vec::new()
     };
-    let bridge_tracks = library.tracks.as_slice();
+    let mut bridge_track_storage = library.tracks.clone();
+    for (library_index, source_track) in source_library_indices
+        .iter()
+        .copied()
+        .zip(source_route_tracks.iter())
+    {
+        bridge_track_storage[library_index].artist_key = source_track.artist_key.clone();
+        bridge_track_storage[library_index].artist_repeat_keys =
+            source_track.artist_repeat_keys.clone();
+        bridge_track_storage[library_index].album_key = source_track.album_key.clone();
+    }
+    let bridge_tracks = bridge_track_storage.as_slice();
     let bridge_config = bridge::BridgeConfig {
         seed_limit,
         learned_percent,
@@ -5519,6 +5556,267 @@ fn analyze_bridge_validated(
                     structural_upper_bound: requested_added_tracks,
                 },
             }))
+        }
+        "repeat_window_repair" => {
+            let max_added_tracks = request.extension.max_added_tracks.ok_or_else(|| {
+                CommandFailure::new(
+                    "REPEAT_WINDOW_REPAIR_BUDGET_REQUIRED",
+                    "repeat_window_repair requires extension.max_added_tracks",
+                )
+            })?;
+            if max_added_tracks == 0 {
+                return Err(CommandFailure::new(
+                    "REPEAT_WINDOW_REPAIR_BUDGET_INVALID",
+                    "repeat-window repair requires a positive addition budget",
+                ));
+            }
+            let gap_count = selected_library_route.len().saturating_sub(1);
+            let maximum_final_count = selected_library_route
+                .len()
+                .checked_add(max_added_tracks)
+                .ok_or_else(|| {
+                    CommandFailure::new(
+                        "REPEAT_WINDOW_REPAIR_TOO_LARGE",
+                        "the repeat-window repair size limit overflows",
+                    )
+                })?;
+            if maximum_final_count > 500 {
+                return Err(CommandFailure::new(
+                    "REPEAT_WINDOW_REPAIR_TOO_LARGE",
+                    format!(
+                        "a budget of {max_added_tracks} additions could create {maximum_final_count} tracks; the maximum is 500"
+                    ),
+                ));
+            }
+            let minimum_required = multi_gap::minimum_repeat_spacing_additions(
+                &selected_library_route,
+                bridge_tracks,
+                request.repeat_windows.artist,
+                request.repeat_windows.album,
+                request.repeat_windows.track,
+            )
+            .map_err(|error| {
+                CommandFailure::new("REPEAT_WINDOW_REPAIR_NOT_FOUND", error.to_string())
+            })?;
+            if minimum_required == 0 {
+                return Err(CommandFailure::new(
+                    "REPEAT_WINDOW_REPAIR_NOT_NEEDED",
+                    "the source route already satisfies the configured repeat windows",
+                ));
+            }
+            if minimum_required > max_added_tracks {
+                return Err(CommandFailure::new(
+                    "REPEAT_WINDOW_REPAIR_BUDGET_INSUFFICIENT",
+                    format!(
+                        "the source repeat constraints require at least {minimum_required} additions, but the configured maximum is {max_added_tracks}"
+                    ),
+                ));
+            }
+            let unique_candidates = preview_gaps
+                .iter()
+                .flat_map(|gap| {
+                    gap.semantics
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.candidate)
+                })
+                .collect::<HashSet<_>>()
+                .len();
+            if unique_candidates < minimum_required {
+                return Err(CommandFailure::new(
+                    "REPEAT_WINDOW_REPAIR_INSUFFICIENT_CANDIDATES",
+                    format!(
+                        "the repeat-window repair needs at least {minimum_required} unique additions but only {unique_candidates} eligible candidates are available"
+                    ),
+                ));
+            }
+            progress.update(
+                "bridge_selection",
+                format!(
+                    "Searching for the minimum repeat-window repair across {gap_count} source gaps"
+                ),
+                Some(0),
+                Some(gap_count),
+            );
+            let repair_progress = Arc::new(Mutex::new(FixedGapProgressSnapshot {
+                phase: multi_gap::FixedGapProgressPhase::Searching,
+                gap: 1,
+                total_gaps: gap_count,
+                completed_gaps: 0,
+                evaluated_states: 0,
+                retained_states: 1,
+            }));
+            let heartbeat_progress = Arc::clone(&repair_progress);
+            let heartbeat = progress.dynamic_counted_heartbeat(
+                "bridge_selection",
+                Duration::from_secs(2),
+                move || {
+                    heartbeat_progress
+                        .lock()
+                        .map(|snapshot| snapshot.update())
+                        .unwrap_or_else(|_| ProgressHeartbeatUpdate {
+                            message: "Repairing repeat windows across source gaps".to_owned(),
+                            current: Some(0),
+                            total: Some(gap_count),
+                        })
+                },
+            );
+            let progress_writer = Arc::clone(&repair_progress);
+            let selection = preview::select_repeat_window_repair_with_progress(
+                &selected_library_route,
+                &preview_gaps,
+                &preview::RepeatWindowRepairConfig {
+                    max_added_tracks,
+                    candidate_limit: retained_candidate_limit,
+                    beam_width: EXACT_COUNT_BEAM_WIDTH,
+                    alternatives_per_gap: EXACT_COUNT_BEAM_WIDTH.min(16),
+                    variation_percent: request.selection.variation_percent,
+                    generation_seed: request.selection.generation_seed,
+                    track_window: request.repeat_windows.track,
+                },
+                preview::FixedGapScoringContext {
+                    tracks: bridge_tracks,
+                    learned_matrix: &learned_matrix,
+                    config: &bridge_config,
+                    reference: &reference,
+                },
+                move |event| {
+                    if let Ok(mut snapshot) = progress_writer.lock() {
+                        *snapshot = FixedGapProgressSnapshot {
+                            phase: event.phase,
+                            gap: event.gap,
+                            total_gaps: event.total_gaps,
+                            completed_gaps: event.completed_gaps,
+                            evaluated_states: event.evaluated_states,
+                            retained_states: event.retained_states,
+                        };
+                    }
+                },
+            );
+            drop(heartbeat);
+            let selection = selection.map_err(|error| {
+                CommandFailure::new("REPEAT_WINDOW_REPAIR_NOT_FOUND", error.to_string())
+            })?;
+            if selection.added_track_count == 0 {
+                return Err(CommandFailure::new(
+                    "REPEAT_WINDOW_REPAIR_NOT_NEEDED",
+                    "the source route already satisfies the configured repeat windows",
+                ));
+            }
+            let final_route = &selection.final_route;
+            selected_route_objective = route::evaluate_adaptive_sequence(
+                final_route,
+                bridge_tracks,
+                &learned_matrix,
+                bridge_config.seed_limit,
+                bridge_config.learned_percent,
+            )
+            .map_err(|error| {
+                CommandFailure::new("REPEAT_WINDOW_REPAIR_NOT_FOUND", error.to_string())
+            })?
+            .objective;
+            let decisions = selection
+                .decisions
+                .iter()
+                .map(|decision| ExactPreviewDecisionArtifact {
+                    original_position: decision.original_position,
+                    route_position: decision.route_position,
+                    left_track_id: original_ids_by_library[&decision.left].clone(),
+                    right_track_id: original_ids_by_library[&decision.right].clone(),
+                    direct_distance: decision.direct_distance,
+                    direct_percentile: decision.direct_percentile,
+                    semantic_pool: decision.semantic_pool,
+                    reason: decision.reason,
+                    selected_bridge: decision.selected.as_ref().map(|selected| {
+                        bridge_candidate_artifact(
+                            &selected.evaluation,
+                            &selected.semantics,
+                            guidance_contributions_by_gap
+                                .get(&decision.original_position)
+                                .and_then(|candidates| {
+                                    candidates.get(&selected.evaluation.candidate)
+                                })
+                                .cloned()
+                                .unwrap_or_default(),
+                            &library,
+                        )
+                    }),
+                })
+                .collect::<Vec<_>>();
+            semantic_assisted |= decisions.iter().any(|decision| {
+                decision
+                    .selected_bridge
+                    .as_ref()
+                    .is_some_and(|bridge| !bridge.semantic_evidence.is_empty())
+            });
+            let original_subsequence_preserved = final_route
+                .iter()
+                .filter(|index| original_ids_by_library.contains_key(index))
+                .eq(selected_library_route.iter());
+            let unique_membership =
+                final_route.iter().collect::<HashSet<_>>().len() == final_route.len();
+            let no_endpoint_tracks = final_route.first() == selected_library_route.first()
+                && final_route.last() == selected_library_route.last();
+            let repeat_windows_satisfied = route::repeat_violations(
+                final_route,
+                bridge_tracks,
+                &route::SearchConfig {
+                    seed_limit: bridge_config.seed_limit,
+                    learned_percent: bridge_config.learned_percent,
+                    deterministic_seed: request.selection.generation_seed,
+                    restart_count: 0,
+                    artist_window: bridge_config.artist_window,
+                    album_window: bridge_config.album_window,
+                },
+            )
+            .is_empty();
+            if !(original_subsequence_preserved
+                && unique_membership
+                && no_endpoint_tracks
+                && repeat_windows_satisfied)
+            {
+                return Err(CommandFailure::new(
+                    "REPEAT_WINDOW_REPAIR_NOT_FOUND",
+                    "the completed route failed its independent repeat-window acceptance proof",
+                ));
+            }
+            progress.update(
+                "bridge_selection",
+                format!(
+                    "Repaired all repeat windows with {} addition(s) across {gap_count} source gaps",
+                    selection.added_track_count
+                ),
+                Some(gap_count),
+                Some(gap_count),
+            );
+            SelectionPreviewArtifact::RepeatWindowRepair(Box::new(
+                RepeatWindowRepairSelectionArtifact {
+                    mode: "repeat_window_repair",
+                    processing_order: "global-minimum-repeat-window-repair",
+                    source_track_count: selected_library_route.len(),
+                    source_gap_count: gap_count,
+                    max_added_tracks: selection.max_added_tracks,
+                    feasible: true,
+                    added_track_count: selection.added_track_count,
+                    no_endpoint_tracks,
+                    original_subsequence_preserved,
+                    unique_membership,
+                    repeat_windows_satisfied,
+                    minimum_total_selected: true,
+                    final_sequence: sequence_artifact(final_route),
+                    decisions,
+                    search: ExactSearchArtifact {
+                        beam_width: EXACT_COUNT_BEAM_WIDTH,
+                        search_effort: None,
+                        candidate_limit: retained_candidate_limit,
+                        max_tracks_per_gap: selection.stats.max_tracks_per_gap,
+                        evaluated_states: selection.stats.evaluated_states,
+                        retained_states: selection.stats.retained_states,
+                        maximum_additions_found: selection.added_track_count,
+                        structural_upper_bound: max_added_tracks,
+                    },
+                },
+            ))
         }
         "exact_count" | "destination_route" => {
             let destination_route = request.extension.mode == "destination_route";
@@ -6696,13 +6994,14 @@ fn analyze_bridge_request_with_options(
         "automatic"
             | "exact_count"
             | "fixed_gap_count"
+            | "repeat_window_repair"
             | "fixed_source_extension"
             | "destination_route"
     ) {
         return Err(CommandFailure::new(
             "EXTENSION_MODE_UNSUPPORTED",
             format!(
-                "the bridge command currently analyzes automatic, exact_count, fixed_gap_count, fixed_source_extension, or destination_route extension, not '{}'",
+                "the bridge command currently analyzes automatic, exact_count, fixed_gap_count, repeat_window_repair, fixed_source_extension, or destination_route extension, not '{}'",
                 request.extension.mode
             ),
         ));
@@ -6716,11 +7015,11 @@ fn analyze_bridge_request_with_options(
         }
         if !matches!(
             request.extension.mode.as_str(),
-            "automatic" | "exact_count" | "fixed_gap_count"
+            "automatic" | "exact_count" | "fixed_gap_count" | "repeat_window_repair"
         ) {
             return Err(CommandFailure::new(
                 "GAP_CONTEXT_MODE_UNSUPPORTED",
-                "extension.gap_context_mode is supported only for automatic, exact_count, and fixed_gap_count additions",
+                "extension.gap_context_mode is supported only for automatic, exact_count, fixed_gap_count, and repeat_window_repair additions",
             ));
         }
         if request.scoring.algorithm != "adaptive" && mode == "frozen" {
@@ -7403,6 +7702,7 @@ mod tests {
     fn version_metadata_advertises_guidance_spi_v2() {
         assert!(version_metadata_json().contains("\"guidance_spi_v2\":true"));
         assert!(version_metadata_json().contains("\"fixed_gap_count_v1\":true"));
+        assert!(version_metadata_json().contains("\"repeat_window_repair_v1\":true"));
     }
 
     #[test]
@@ -9171,6 +9471,67 @@ mod tests {
         std::env::set_current_dir(original).unwrap();
 
         assert_eq!(failure.code, "FIXED_GAP_SOURCE_REPEAT_CONFLICT");
+    }
+
+    #[test]
+    fn repeat_window_repair_fixture_is_minimal_and_worker_deterministic() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let source = repository.join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "repeat_window_repair",
+            "max_added_tracks": 2,
+            "candidate_limit": 16,
+            "shortlist_limit": 256,
+            "gap_context_mode": "rolling"
+        });
+        request["repeat_windows"]["artist"] = Value::from(2);
+        request["source_tracks"][1]["artist"] = request["source_tracks"][0]["artist"].clone();
+        request["source_tracks"][0]["artist_identity_keys"] =
+            serde_json::json!(["artist-mbid:repeat-conflict"]);
+        request["source_tracks"][0]["primary_artist_identity_key"] =
+            Value::from("artist-mbid:repeat-conflict");
+        request["source_tracks"][1]["artist_identity_keys"] =
+            serde_json::json!(["artist-mbid:repeat-conflict"]);
+        request["source_tracks"][1]["primary_artist_identity_key"] =
+            Value::from("artist-mbid:repeat-conflict");
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-repeat-window-repair-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+        let four = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| analyze_bridge_request(&temporary));
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| analyze_bridge_request(&temporary));
+        let _ = fs::remove_file(temporary);
+        std::env::set_current_dir(original).unwrap();
+
+        let four = four.unwrap();
+        let one = one.unwrap();
+        assert_eq!(
+            serde_json::to_string(&four).unwrap(),
+            serde_json::to_string(&one).unwrap()
+        );
+        let repair = match &four.selection_preview {
+            SelectionPreviewArtifact::RepeatWindowRepair(repair) => repair,
+            _ => panic!("expected repeat-window repair preview"),
+        };
+        assert_eq!(repair.source_track_count, 4);
+        assert_eq!(repair.source_gap_count, 3);
+        assert_eq!(repair.added_track_count, 2);
+        assert!(repair.no_endpoint_tracks);
+        assert!(repair.repeat_windows_satisfied);
+        assert!(repair.minimum_total_selected);
+        assert_eq!(repair.final_sequence.len(), 6);
     }
 
     #[test]

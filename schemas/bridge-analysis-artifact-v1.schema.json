@@ -103,6 +103,7 @@
       "oneOf": [
         { "$ref": "#/$defs/automatic_selection_preview" },
         { "$ref": "#/$defs/fixed_gap_count_selection_preview" },
+        { "$ref": "#/$defs/repeat_window_repair_selection_preview" },
         { "$ref": "#/$defs/exact_selection_preview" },
         { "$ref": "#/$defs/fixed_source_extension_selection_preview" }
       ]
@@ -453,6 +454,42 @@
         "unique_membership": { "const": true },
         "every_gap_exact_count": { "const": true },
         "repeat_windows_satisfied": { "const": true },
+        "final_sequence": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "$ref": "#/$defs/preview_sequence_entry" }
+        },
+        "decisions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/exact_preview_decision" }
+        },
+        "search": { "$ref": "#/$defs/exact_search" }
+      }
+    },
+    "repeat_window_repair_selection_preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode", "processing_order", "source_track_count", "source_gap_count",
+        "max_added_tracks", "feasible", "added_track_count",
+        "no_endpoint_tracks", "original_subsequence_preserved",
+        "unique_membership", "repeat_windows_satisfied",
+        "minimum_total_selected", "final_sequence", "decisions", "search"
+      ],
+      "properties": {
+        "mode": { "const": "repeat_window_repair" },
+        "processing_order": { "const": "global-minimum-repeat-window-repair" },
+        "source_track_count": { "type": "integer", "minimum": 2 },
+        "source_gap_count": { "type": "integer", "minimum": 1 },
+        "max_added_tracks": { "type": "integer", "minimum": 1 },
+        "feasible": { "const": true },
+        "added_track_count": { "type": "integer", "minimum": 1 },
+        "no_endpoint_tracks": { "const": true },
+        "original_subsequence_preserved": { "const": true },
+        "unique_membership": { "const": true },
+        "repeat_windows_satisfied": { "const": true },
+        "minimum_total_selected": { "const": true },
         "final_sequence": {
           "type": "array",
           "minItems": 3,

@@ -16,6 +16,46 @@ use crate::route::RouteTrack;
 
 pub const MAX_TRACKS_PER_GAP: usize = 8;
 
+pub fn minimum_repeat_spacing_additions(
+    source_route: &[usize],
+    tracks: &[RouteTrack],
+    artist_window: usize,
+    album_window: usize,
+    track_window: usize,
+) -> Result<usize, FixedGapPlanError> {
+    for index in source_route {
+        if *index >= tracks.len() {
+            return Err(FixedGapPlanError::InvalidTrackIndex(*index));
+        }
+    }
+    let mut cumulative = vec![0usize; source_route.len()];
+    for right in 1..source_route.len() {
+        cumulative[right] = cumulative[right - 1];
+        for left in 0..right {
+            let left_track = &tracks[source_route[left]];
+            let right_track = &tracks[source_route[right]];
+            let mut window = 0;
+            if artist_window > 0 && crate::route::artists_repeat(left_track, right_track) {
+                window = window.max(artist_window);
+            }
+            if album_window > 0
+                && !left_track.album_key.is_empty()
+                && left_track.album_key == right_track.album_key
+            {
+                window = window.max(album_window);
+            }
+            if track_window > 0 && source_route[left] == source_route[right] {
+                window = window.max(track_window);
+            }
+            if window > 0 {
+                let required = window.saturating_add(1).saturating_sub(right - left);
+                cumulative[right] = cumulative[right].max(cumulative[left] + required);
+            }
+        }
+    }
+    Ok(cumulative.last().copied().unwrap_or(0))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct FixedGap<'a> {
     pub left: usize,

@@ -181,7 +181,7 @@
       "required": ["mode"],
       "properties": {
         "mode": {
-          "enum": ["none", "automatic", "exact_count", "fixed_gap_count", "fixed_source_extension", "destination_route", "one_per_transition", "target_length"]
+          "enum": ["none", "automatic", "exact_count", "fixed_gap_count", "repeat_window_repair", "fixed_source_extension", "destination_route", "one_per_transition", "target_length"]
         },
         "additional_track_count": { "type": "integer", "minimum": 0 },
         "search_effort": { "enum": ["fast", "balanced", "thorough"] },
@@ -240,6 +240,29 @@
             "properties": { "mode": { "const": "fixed_source_extension" } }
           },
           "then": { "required": ["target_track_count"] }
+        },
+        {
+          "if": {
+            "properties": { "mode": { "const": "repeat_window_repair" } }
+          },
+          "then": {
+            "required": ["max_added_tracks"],
+            "not": {
+              "anyOf": [
+                { "required": ["additional_track_count"] },
+                { "required": ["target_track_count"] },
+                { "required": ["max_tracks_per_gap"] },
+                { "required": ["tracks_per_gap"] },
+                { "required": ["trigger_percentile"] },
+                { "required": ["allow_opening_track"] },
+                { "required": ["allow_closing_track"] },
+                { "required": ["destination_mode"] },
+                { "required": ["min_added_tracks"] },
+                { "required": ["direct_transition_caution"] },
+                { "required": ["search_effort"] }
+              ]
+            }
+          }
         },
         {
           "if": {

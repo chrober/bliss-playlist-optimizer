@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use bliss_playlist_optimizer::anchored_path::{AnchoredPathCandidate, FixedAdjacentScorer};
 use bliss_playlist_optimizer::multi_gap::{
-    plan_fixed_gap_count, plan_fixed_gap_count_with_progress, plan_repeat_window_repair, FixedGap,
-    FixedGapPlanConfig, FixedGapPlanError, FixedGapPlanRequest, FixedGapProgressPhase,
-    RepeatWindowRepairConfig, RepeatWindowRepairRequest,
+    minimum_repeat_spacing_additions, plan_fixed_gap_count, plan_fixed_gap_count_with_progress,
+    plan_repeat_window_repair, FixedGap, FixedGapPlanConfig, FixedGapPlanError,
+    FixedGapPlanRequest, FixedGapProgressPhase, RepeatWindowRepairConfig,
+    RepeatWindowRepairRequest,
 };
 use bliss_playlist_optimizer::route::RouteTrack;
 
@@ -50,6 +51,21 @@ fn repair_config(max_added_tracks: usize) -> RepeatWindowRepairConfig {
         album_window: 0,
         track_window: 100,
     }
+}
+
+#[test]
+fn repeat_spacing_lower_bound_accounts_for_overlapping_source_constraints() {
+    let tracks = vec![
+        track(0.0, "same", "album-a"),
+        track(1.0, "other", "album-b"),
+        track(2.0, "same", "album-c"),
+        track(3.0, "same", "album-d"),
+    ];
+
+    assert_eq!(
+        minimum_repeat_spacing_additions(&[0, 1, 2, 3], &tracks, 2, 0, 0).unwrap(),
+        3
+    );
 }
 
 #[test]
