@@ -15,6 +15,8 @@ for the same Bliss feature-distance behavior used by the mixer ecosystem.
 - Adds Bliss-qualified tracks to extend a playlist or satisfy repeat windows.
 - Builds one-way and round-trip routes to a selected track or album.
 - Finds and evaluates bridges for difficult playlist transitions.
+- Inserts an exact bridge count into every internal source gap through one
+  global plan, rather than committing locally optimal gaps one at a time.
 - Applies repeat, genre, virtual-library, membership, and route constraints,
   including MBID-aware shared- or primary-artist repeat identities supplied by
   the Lyrion host.
@@ -70,6 +72,7 @@ cargo run -- version --json
 cargo run -- validate --request examples/reorder-only-request.json
 cargo run -- route --request fixtures/synthetic/adaptive-scoring-request.json
 cargo run -- bridge --request fixtures/synthetic/automatic-bridge-request.json
+cargo run -- bridge --request fixtures/synthetic/fixed-gap-count-request.json
 ```
 
 Production integrations use `route` or `bridge` with a request artifact and may

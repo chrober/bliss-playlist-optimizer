@@ -33,6 +33,7 @@ cargo run -- bridge --request fixtures/synthetic/exact-count-infeasible-request.
 cargo run -- bridge --request fixtures/synthetic/preserve-automatic-request.json
 cargo run -- bridge --request fixtures/synthetic/preserve-exact-count-request.json
 cargo run -- bridge --request fixtures/synthetic/preserve-multi-track-gap-request.json
+cargo run -- bridge --request fixtures/synthetic/fixed-gap-count-request.json
 cargo run -- bridge --request fixtures/synthetic/preserve-endpoint-slots-request.json
 ```
 

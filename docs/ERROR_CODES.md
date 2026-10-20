@@ -15,6 +15,11 @@ human-readable messages may improve without a schema-version change.
 | `MATRIX_REQUIRED` | The requested optimizer mode currently requires `artifacts.learned_matrix`; Adaptive routing and bridge scoring still need the matrix for one-track context fallback. |
 | `INFEASIBLE_REPEAT_WINDOWS` | No route satisfies the captured repeat constraints. |
 | `INFEASIBLE_EXTENSION_COUNT` | The exact requested bridge count cannot be achieved safely. |
+| `FIXED_GAP_COUNT_INVALID` | Fixed-gap mode is missing a per-gap count or the count is outside the supported `1..8` range. |
+| `FIXED_GAP_COUNT_TOO_LARGE` | The derived exact fixed-gap result would overflow or exceed the 500-track final-size limit. |
+| `FIXED_GAP_INSUFFICIENT_CANDIDATES` | The frozen eligible inventory does not contain enough unique additions for all requested source gaps. |
+| `FIXED_GAP_SOURCE_REPEAT_CONFLICT` | Even after inserting the configured count into every gap, immutable source artists or albums would still violate a captured repeat window. |
+| `FIXED_GAP_ROUTE_NOT_FOUND` | The bounded global planner could not retain a complete exact route through every source gap, or the completed route failed its independent proof. |
 | `BRIDGE_SHORTLIST_FAILED` | Deterministic bridge-candidate shortlisting could not be completed. |
 | `SEMANTIC_EVIDENCE_REDUCED` | Optional semantic evidence is partial, stale, or unavailable. |
 | `CANCELLED` | The caller requested cancellation before atomic completion. |

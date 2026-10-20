@@ -377,9 +377,10 @@ anchored-path engine: callers provide left/right anchors, immutable history,
 unavailable route membership, candidate evidence, repeat windows, and an
 adjacent-distance function. It returns complete scored alternatives without
 mutating a playlist or queue. Destination-block workflows currently retain one
-alternative per intermediate count for compatibility; future multi-gap playlist
-planners can request several alternatives and choose a globally repeat-safe
-combination. Adaptive requests build one per-run context from the bounded suffix
+alternative per intermediate count for compatibility. The fixed-gap-count
+workflow uses the same anchored-path kernel to retain several exact-count
+alternatives per source gap, then chooses a globally repeat-safe combination
+through its outer multi-gap beam planner. Adaptive requests build one per-run context from the bounded suffix
 of analyzed `history_tracks` followed by the locked start track. The destination
 is never an Adaptive seed. The optimizer passes those features, the optional
 learned matrix, and `scoring.adaptive.learned_percent` to the same
@@ -490,15 +491,30 @@ diagnostics are reconstructed against that complete route, including any opening
 shift. The artifact separately records the endpoint policy, each one-sided
 decision, and its evidence and percentile.
 
-With `route.ordering_policy = preserve_order`, both automatic and exact-count
-extension keep every source track in precisely its input position relative to
+With `route.ordering_policy = preserve_order`, automatic, exact-count, and
+fixed-gap-count extension keep every source track in precisely its input position relative to
 the other source tracks. The artifact records the source IDs separately from the
 selected route IDs and tests their equality with the final original-track
 subsequence. Because source tracks are immutable in this mode, an input order
 that already violates an artist or album look-back window fails with
 `PRESERVED_ANCHOR_REPEAT_CONFLICT`; this slice does not misrepresent a bounded
 gap search as capable of repairing several interacting anchor conflicts.
-Automatic mode remains limited to one bridge per gap.
+Automatic mode remains limited to one bridge per gap. Fixed-gap-count mode is
+the explicit strict alternative: `extension.tracks_per_gap` accepts one through
+eight, derives exactly `tracks_per_gap * (source_count - 1)` additions, and adds
+no opening or closing tracks.
+
+Before global search, fixed-gap mode rejects final sizes above 500, insufficient
+unique candidate inventory, and immutable source repeats whose projected
+distance cannot satisfy the configured artist or album window. Each gap uses a
+frozen candidate shortlist and the shared anchored-path kernel to retain several
+exact-count alternatives. The outer beam processes all gaps with shared route
+membership, repeat state, evolving Adaptive context, transition sum, worst
+transition, guidance adjustment, and deterministic Variation. A failure returns
+no partial route. A success carries independent proofs for exact per-gap counts,
+source subsequence, unique membership, absent endpoint additions, and final
+repeat-window validity. The progress sidecar reports the current gap plus
+evaluated and retained global-state counts while the search runs.
 
 This remains analysis-only by design. Better Call Bliss applies accepted
 previews and writes Lyrion playlists from the returned opaque track identities.
