@@ -519,7 +519,11 @@ Repeat-window repair uses the same anchored-path kernel and outer global beam,
 but each gap may retain paths with different intermediate counts. Separate
 beams are kept for every cumulative addition count so that a cheap early route
 cannot discard a larger partial route needed by a later repeated source
-anchor. `extension.max_added_tracks` is a global ceiling rather than a target.
+anchor. With `optimize_order`, the source-only order is first optimized without
+requiring that incomplete route to satisfy the final repeat windows, then
+frozen; the global repair owns enforcement of those windows. With
+`preserve_order`, the input source order is frozen directly.
+`extension.max_added_tracks` is a global ceiling rather than a target.
 The final objective first minimizes total additions, then worst transition,
 transition sum, guidance adjustment, and seeded Variation inside the
 minimum-count quality band. A source-only lower bound rejects an insufficient

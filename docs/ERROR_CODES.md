@@ -22,6 +22,7 @@ human-readable messages may improve without a schema-version change.
 | `FIXED_GAP_ROUTE_NOT_FOUND` | The bounded global planner could not retain a complete exact route through every source gap, or the completed route failed its independent proof. |
 | `REPEAT_WINDOW_REPAIR_BUDGET_REQUIRED` | Repeat-window repair did not receive its required global maximum-additions budget. |
 | `REPEAT_WINDOW_REPAIR_BUDGET_INVALID` | The repeat-window repair budget is zero or outside the supported request bounds. |
+| `REPEAT_WINDOW_REPAIR_FIELDS_INVALID` | A repeat-window repair request carries a count, endpoint, trigger, or destination field owned by another extension mode. This is enforced for trusted plugin requests as well as schema-validated requests. |
 | `REPEAT_WINDOW_REPAIR_TOO_LARGE` | The source plus the configured repair budget could exceed the 500-track final-size limit. |
 | `REPEAT_WINDOW_REPAIR_NOT_NEEDED` | The frozen source route already satisfies the selected repeat windows and therefore needs no spacing additions. |
 | `REPEAT_WINDOW_REPAIR_BUDGET_INSUFFICIENT` | The exact source-only spacing lower bound exceeds the configured global addition budget. |

@@ -2401,6 +2401,51 @@ fn decode_request_once(
     Ok((request, request_sha256))
 }
 
+fn validate_repeat_window_repair_fields(request: &Request) -> Result<(), CommandFailure> {
+    if request.extension.mode != "repeat_window_repair" {
+        return Ok(());
+    }
+    let extension = &request.extension;
+    let incompatible = [
+        (
+            extension.additional_track_count.is_some(),
+            "additional_track_count",
+        ),
+        (extension.target_track_count.is_some(), "target_track_count"),
+        (extension.max_tracks_per_gap.is_some(), "max_tracks_per_gap"),
+        (extension.tracks_per_gap.is_some(), "tracks_per_gap"),
+        (extension.trigger_percentile.is_some(), "trigger_percentile"),
+        (
+            extension.allow_opening_track.is_some(),
+            "allow_opening_track",
+        ),
+        (
+            extension.allow_closing_track.is_some(),
+            "allow_closing_track",
+        ),
+        (extension.destination_mode.is_some(), "destination_mode"),
+        (extension.min_added_tracks.is_some(), "min_added_tracks"),
+        (
+            extension.direct_transition_caution.is_some(),
+            "direct_transition_caution",
+        ),
+        (extension.search_effort.is_some(), "search_effort"),
+    ]
+    .into_iter()
+    .filter_map(|(present, field)| present.then_some(field))
+    .collect::<Vec<_>>();
+    if !incompatible.is_empty() {
+        return Err(CommandFailure::new(
+            "REPEAT_WINDOW_REPAIR_FIELDS_INVALID",
+            format!(
+                "repeat_window_repair does not accept extension field(s): {}",
+                incompatible.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_runtime_request(
     path: &Path,
     options: &RuntimeOptions,
@@ -2415,6 +2460,7 @@ fn prepare_runtime_request(
     );
     let started = Instant::now();
     let (request, request_sha256) = decode_request_once(path, options.validate_contracts)?;
+    validate_repeat_window_repair_fields(&request)?;
     timings.record("request_decode", started.elapsed());
 
     progress.update(
@@ -4417,7 +4463,10 @@ fn analyze_bridge_validated(
         artist_window: request.repeat_windows.artist,
         album_window: request.repeat_windows.album,
     };
-    let base_route_config = if request.extension.mode == "fixed_source_extension" {
+    let base_route_config = if matches!(
+        request.extension.mode.as_str(),
+        "fixed_source_extension" | "repeat_window_repair"
+    ) {
         route::SearchConfig {
             artist_window: 0,
             album_window: 0,
@@ -7699,6 +7748,43 @@ mod tests {
     }
 
     #[test]
+    fn trusted_repeat_window_repair_rejects_incompatible_known_fields() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let source = repository.join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "repeat_window_repair",
+            "max_added_tracks": 4,
+            "additional_track_count": 2,
+            "candidate_limit": 16,
+            "shortlist_limit": 256,
+            "gap_context_mode": "rolling"
+        });
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-trusted-repair-fields-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+        let failure = analyze_bridge_request_with_options(
+            &temporary,
+            &RuntimeOptions {
+                timings: false,
+                cache_dir: None,
+                progress_path: None,
+                validate_contracts: false,
+            },
+        )
+        .unwrap_err();
+        let _ = fs::remove_file(temporary);
+        std::env::set_current_dir(original).unwrap();
+
+        assert_eq!(failure.code, "REPEAT_WINDOW_REPAIR_FIELDS_INVALID");
+        assert!(failure.message.contains("additional_track_count"));
+    }
+
+    #[test]
     fn version_metadata_advertises_guidance_spi_v2() {
         assert!(version_metadata_json().contains("\"guidance_spi_v2\":true"));
         assert!(version_metadata_json().contains("\"fixed_gap_count_v1\":true"));
@@ -9532,6 +9618,50 @@ mod tests {
         assert!(repair.repeat_windows_satisfied);
         assert!(repair.minimum_total_selected);
         assert_eq!(repair.final_sequence.len(), 6);
+    }
+
+    #[test]
+    fn optimized_repeat_window_repair_routes_sources_before_adding_spacing() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let source = repository.join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["route"]["ordering_policy"] = Value::from("optimize_order");
+        request["extension"] = serde_json::json!({
+            "mode": "repeat_window_repair",
+            "max_added_tracks": 4,
+            "candidate_limit": 16,
+            "shortlist_limit": 256,
+            "gap_context_mode": "rolling"
+        });
+        request["repeat_windows"]["artist"] = Value::from(4);
+        request["source_tracks"][1]["artist"] = request["source_tracks"][0]["artist"].clone();
+        request["source_tracks"][0]["artist_identity_keys"] =
+            serde_json::json!(["artist-mbid:repeat-conflict"]);
+        request["source_tracks"][0]["primary_artist_identity_key"] =
+            Value::from("artist-mbid:repeat-conflict");
+        request["source_tracks"][1]["artist_identity_keys"] =
+            serde_json::json!(["artist-mbid:repeat-conflict"]);
+        request["source_tracks"][1]["primary_artist_identity_key"] =
+            Value::from("artist-mbid:repeat-conflict");
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-playlist-optimizer-optimized-repeat-repair-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+        let result = analyze_bridge_request(&temporary);
+        let _ = fs::remove_file(temporary);
+        std::env::set_current_dir(original).unwrap();
+
+        let artifact = result.unwrap();
+        let repair = match artifact.selection_preview {
+            SelectionPreviewArtifact::RepeatWindowRepair(repair) => repair,
+            _ => panic!("expected repeat-window repair preview"),
+        };
+        assert!(repair.added_track_count > 0);
+        assert!(repair.repeat_windows_satisfied);
+        assert!(repair.minimum_total_selected);
     }
 
     #[test]
