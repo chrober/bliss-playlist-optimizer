@@ -13,6 +13,8 @@ for the same Bliss feature-distance behavior used by the mixer ecosystem.
 
 - Reorders a fixed set of local tracks.
 - Adds Bliss-qualified tracks to extend a playlist or satisfy repeat windows.
+  Repeat-window repair searches all source gaps together and uses the minimum
+  feasible number of additions within the caller's global budget.
 - Builds one-way and round-trip routes to a selected track or album.
 - Finds and evaluates bridges for difficult playlist transitions.
 - Inserts an exact bridge count into every internal source gap through one

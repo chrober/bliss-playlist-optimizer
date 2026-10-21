@@ -491,18 +491,17 @@ diagnostics are reconstructed against that complete route, including any opening
 shift. The artifact separately records the endpoint policy, each one-sided
 decision, and its evidence and percentile.
 
-With `route.ordering_policy = preserve_order`, automatic, exact-count, and
-fixed-gap-count extension keep every source track in precisely its input position relative to
-the other source tracks. The artifact records the source IDs separately from the
-selected route IDs and tests their equality with the final original-track
-subsequence. Because source tracks are immutable in this mode, an input order
-that already violates an artist or album look-back window fails with
-`PRESERVED_ANCHOR_REPEAT_CONFLICT`; this slice does not misrepresent a bounded
-gap search as capable of repairing several interacting anchor conflicts.
-Automatic mode remains limited to one bridge per gap. Fixed-gap-count mode is
-the explicit strict alternative: `extension.tracks_per_gap` accepts one through
-eight, derives exactly `tracks_per_gap * (source_count - 1)` additions, and adds
-no opening or closing tracks.
+With `route.ordering_policy = preserve_order`, automatic, exact-count,
+repeat-window-repair, and fixed-gap-count extension keep every source track in
+precisely its input position relative to the other source tracks. The artifact
+records the source IDs separately from the selected route IDs and tests their
+equality with the final original-track subsequence. Automatic difficult-gap
+repair still requires the immutable source order to satisfy its repeat windows
+and remains limited to one bridge per gap. Repeat-window repair is the explicit
+variable-count alternative for an order containing repeat conflicts. Fixed-gap
+count is the strict structural alternative: `extension.tracks_per_gap` accepts
+one through eight, derives exactly `tracks_per_gap * (source_count - 1)`
+additions, and adds no opening or closing tracks.
 
 Before global search, fixed-gap mode rejects final sizes above 500, insufficient
 unique candidate inventory, and immutable source repeats whose projected
@@ -515,6 +514,19 @@ no partial route. A success carries independent proofs for exact per-gap counts,
 source subsequence, unique membership, absent endpoint additions, and final
 repeat-window validity. The progress sidecar reports the current gap plus
 evaluated and retained global-state counts while the search runs.
+
+Repeat-window repair uses the same anchored-path kernel and outer global beam,
+but each gap may retain paths with different intermediate counts. Separate
+beams are kept for every cumulative addition count so that a cheap early route
+cannot discard a larger partial route needed by a later repeated source
+anchor. `extension.max_added_tracks` is a global ceiling rather than a target.
+The final objective first minimizes total additions, then worst transition,
+transition sum, guidance adjustment, and seeded Variation inside the
+minimum-count quality band. A source-only lower bound rejects an insufficient
+budget or unique-candidate inventory before the global search. Successful
+artifacts prove the chosen per-gap counts, source subsequence, unique
+membership, absent endpoint additions, and complete-route repeat validity.
+Failure is atomic and never returns a partial repaired route.
 
 This remains analysis-only by design. Better Call Bliss applies accepted
 previews and writes Lyrion playlists from the returned opaque track identities.

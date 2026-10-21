@@ -20,6 +20,13 @@ human-readable messages may improve without a schema-version change.
 | `FIXED_GAP_INSUFFICIENT_CANDIDATES` | The frozen eligible inventory does not contain enough unique additions for all requested source gaps. |
 | `FIXED_GAP_SOURCE_REPEAT_CONFLICT` | Even after inserting the configured count into every gap, immutable source artists or albums would still violate a captured repeat window. |
 | `FIXED_GAP_ROUTE_NOT_FOUND` | The bounded global planner could not retain a complete exact route through every source gap, or the completed route failed its independent proof. |
+| `REPEAT_WINDOW_REPAIR_BUDGET_REQUIRED` | Repeat-window repair did not receive its required global maximum-additions budget. |
+| `REPEAT_WINDOW_REPAIR_BUDGET_INVALID` | The repeat-window repair budget is zero or outside the supported request bounds. |
+| `REPEAT_WINDOW_REPAIR_TOO_LARGE` | The source plus the configured repair budget could exceed the 500-track final-size limit. |
+| `REPEAT_WINDOW_REPAIR_NOT_NEEDED` | The frozen source route already satisfies the selected repeat windows and therefore needs no spacing additions. |
+| `REPEAT_WINDOW_REPAIR_BUDGET_INSUFFICIENT` | The exact source-only spacing lower bound exceeds the configured global addition budget. |
+| `REPEAT_WINDOW_REPAIR_INSUFFICIENT_CANDIDATES` | The frozen eligible inventory cannot supply the minimum number of unique additions required by the source repeats. |
+| `REPEAT_WINDOW_REPAIR_NOT_FOUND` | The bounded global planner found no complete minimum-total repair inside the budget, or the completed route failed its independent proof. |
 | `BRIDGE_SHORTLIST_FAILED` | Deterministic bridge-candidate shortlisting could not be completed. |
 | `SEMANTIC_EVIDENCE_REDUCED` | Optional semantic evidence is partial, stale, or unavailable. |
 | `CANCELLED` | The caller requested cancellation before atomic completion. |
