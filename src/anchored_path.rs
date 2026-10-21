@@ -99,6 +99,16 @@ pub struct AnchoredPathSearchStats {
     pub structural_upper_bound: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnchoredPathProgressEvent {
+    pub requested_intermediates: usize,
+    pub max_intermediates: usize,
+    pub completed_layers: usize,
+    pub total_layers: usize,
+    pub evaluated_states: usize,
+    pub retained_states: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnchoredPathOption {
     pub intermediates: Vec<usize>,
@@ -221,6 +231,39 @@ fn position_repeat_safe(
         }))
 }
 
+fn minimum_destination_intermediates(
+    repeat_prefix: &[usize],
+    right_anchor: usize,
+    tracks: &[RouteTrack],
+    config: AnchoredPathSearchConfig,
+) -> usize {
+    let destination = &tracks[right_anchor];
+    repeat_prefix
+        .iter()
+        .enumerate()
+        .map(|(position, track)| {
+            let previous = &tracks[*track];
+            let mut window = 0;
+            if config.artist_window > 0 && artists_repeat(previous, destination) {
+                window = window.max(config.artist_window);
+            }
+            if config.album_window > 0
+                && !previous.album_key.is_empty()
+                && previous.album_key == destination.album_key
+            {
+                window = window.max(config.album_window);
+            }
+            if config.track_window > 0 && *track == right_anchor {
+                window = window.max(config.track_window);
+            }
+            window
+                .saturating_add(1)
+                .saturating_sub(repeat_prefix.len() - position)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 fn validate_track_indices(
     indices: impl IntoIterator<Item = usize>,
     track_count: usize,
@@ -291,6 +334,18 @@ pub fn search_anchored_paths<S>(
 where
     S: AnchoredPathScorer,
 {
+    search_anchored_paths_with_progress(request, scorer, |_| {})
+}
+
+pub fn search_anchored_paths_with_progress<S, F>(
+    request: AnchoredPathRequest<'_>,
+    scorer: S,
+    mut progress: F,
+) -> Result<Vec<AnchoredPathOption>, AnchoredPathError>
+where
+    S: AnchoredPathScorer,
+    F: FnMut(AnchoredPathProgressEvent),
+{
     validate_request(&request)?;
 
     let unavailable = request
@@ -309,6 +364,12 @@ where
     let mut repeat_prefix = request.immutable_history.to_vec();
     repeat_prefix.extend(request.route_prefix.iter().copied());
     let first_generated = repeat_prefix.len();
+    let minimum_intermediates = minimum_destination_intermediates(
+        &repeat_prefix,
+        request.right_anchor,
+        request.tracks,
+        request.config,
+    );
     let direct = scorer.score_leg(request.route_prefix, request.right_anchor);
     let mut direct_repeat_route = repeat_prefix.clone();
     direct_repeat_route.push(request.right_anchor);
@@ -337,7 +398,7 @@ where
         });
     }
 
-    for requested in 1..=request.config.max_intermediates {
+    for requested in minimum_intermediates.max(1)..=structural_upper_bound {
         let mut evaluated_states = 1usize;
         let mut retained_states = 1usize;
         let mut frontier = vec![PathState {
@@ -433,6 +494,14 @@ where
             next.truncate(request.config.beam_width);
             retained_states = retained_states.saturating_add(next.len());
             frontier = next;
+            progress(AnchoredPathProgressEvent {
+                requested_intermediates: requested,
+                max_intermediates: structural_upper_bound,
+                completed_layers: layer + 1,
+                total_layers: requested,
+                evaluated_states,
+                retained_states,
+            });
             if frontier.is_empty() {
                 break;
             }

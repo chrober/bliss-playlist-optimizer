@@ -164,7 +164,7 @@ pub fn select_fixed_gap_count_bridges_with_progress<F>(
     progress: F,
 ) -> Result<ExactSelection, PreviewError>
 where
-    F: FnMut(FixedGapProgressEvent),
+    F: Fn(FixedGapProgressEvent) + Sync,
 {
     let FixedGapScoringContext {
         tracks,
@@ -312,7 +312,7 @@ pub fn select_repeat_window_repair_with_progress<F>(
     progress: F,
 ) -> Result<RepeatWindowRepairSelection, PreviewError>
 where
-    F: FnMut(FixedGapProgressEvent),
+    F: Fn(FixedGapProgressEvent) + Sync,
 {
     let FixedGapScoringContext {
         tracks,

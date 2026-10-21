@@ -8,8 +8,8 @@ use std::fmt;
 use rayon::prelude::*;
 
 use crate::anchored_path::{
-    search_anchored_paths, AnchoredPathCandidate, AnchoredPathError, AnchoredPathRequest,
-    AnchoredPathScorer, AnchoredPathSearchConfig,
+    search_anchored_paths_with_progress, AnchoredPathCandidate, AnchoredPathError,
+    AnchoredPathRequest, AnchoredPathScorer, AnchoredPathSearchConfig,
 };
 use crate::bridge::repeat_windows_safe_at;
 use crate::route::RouteTrack;
@@ -129,6 +129,18 @@ pub enum FixedGapProgressPhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedGapPathProgress {
+    pub route_state: usize,
+    pub total_route_states: usize,
+    pub requested_intermediates: usize,
+    pub max_intermediates: usize,
+    pub completed_layers: usize,
+    pub total_layers: usize,
+    pub evaluated_states: usize,
+    pub retained_states: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FixedGapProgressEvent {
     pub phase: FixedGapProgressPhase,
     pub gap: usize,
@@ -136,6 +148,9 @@ pub struct FixedGapProgressEvent {
     pub completed_gaps: usize,
     pub evaluated_states: usize,
     pub retained_states: usize,
+    pub addition_budget: Option<usize>,
+    pub maximum_addition_budget: Option<usize>,
+    pub path_progress: Option<FixedGapPathProgress>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -225,6 +240,7 @@ struct GlobalPlanRequest<'a> {
     album_window: usize,
     track_window: usize,
     addition_policy: AdditionPolicy,
+    maximum_addition_budget: Option<usize>,
 }
 
 fn state_order(left: &GlobalState, right: &GlobalState) -> std::cmp::Ordering {
@@ -501,11 +517,11 @@ where
 pub fn plan_fixed_gap_count_with_progress<S, F>(
     request: FixedGapPlanRequest<'_>,
     scorer: S,
-    mut progress: F,
+    progress: F,
 ) -> Result<FixedGapPlan, FixedGapPlanError>
 where
     S: AnchoredPathScorer,
-    F: FnMut(FixedGapProgressEvent),
+    F: Fn(FixedGapProgressEvent) + Sync,
 {
     validate_request(&request)?;
     plan_global_with_progress(
@@ -523,9 +539,10 @@ where
             album_window: request.config.album_window,
             track_window: request.config.track_window,
             addition_policy: AdditionPolicy::ExactPerGap(request.config.tracks_per_gap),
+            maximum_addition_budget: None,
         },
         scorer,
-        &mut progress,
+        &progress,
         |state| final_route_valid(&request, state),
         "no retained route passed the final global proof",
     )
@@ -544,46 +561,76 @@ where
 pub fn plan_repeat_window_repair_with_progress<S, F>(
     request: RepeatWindowRepairRequest<'_>,
     scorer: S,
-    mut progress: F,
+    progress: F,
 ) -> Result<FixedGapPlan, FixedGapPlanError>
 where
     S: AnchoredPathScorer,
-    F: FnMut(FixedGapProgressEvent),
+    F: Fn(FixedGapProgressEvent) + Sync,
 {
     validate_repair_request(&request)?;
-    plan_global_with_progress(
-        GlobalPlanRequest {
-            source_route: request.source_route,
-            immutable_history: request.immutable_history,
-            gaps: request.gaps,
-            tracks: request.tracks,
-            candidate_limit: request.config.candidate_limit,
-            beam_width: request.config.beam_width,
-            alternatives_per_gap: request.config.alternatives_per_gap,
-            variation_percent: request.config.variation_percent,
-            generation_seed: request.config.generation_seed,
-            artist_window: request.config.artist_window,
-            album_window: request.config.album_window,
-            track_window: request.config.track_window,
-            addition_policy: AdditionPolicy::MinimumTotal(request.config.max_added_tracks),
-        },
-        scorer,
-        &mut progress,
-        |state| repair_final_route_valid(&request, state),
-        "no retained repeat-window repair passed the final global proof",
-    )
+    let minimum_budget = minimum_repeat_spacing_additions(
+        request.source_route,
+        request.tracks,
+        request.config.artist_window,
+        request.config.album_window,
+        request.config.track_window,
+    )?;
+    if minimum_budget > request.config.max_added_tracks {
+        return Err(FixedGapPlanError::NoCompleteRoute {
+            blocking_gap: 0,
+            evaluated_states: 0,
+            retained_states: 0,
+        });
+    }
+
+    for addition_budget in minimum_budget..=request.config.max_added_tracks {
+        let result = plan_global_with_progress(
+            GlobalPlanRequest {
+                source_route: request.source_route,
+                immutable_history: request.immutable_history,
+                gaps: request.gaps,
+                tracks: request.tracks,
+                candidate_limit: request.config.candidate_limit,
+                beam_width: request.config.beam_width,
+                alternatives_per_gap: request.config.alternatives_per_gap,
+                variation_percent: request.config.variation_percent,
+                generation_seed: request.config.generation_seed,
+                artist_window: request.config.artist_window,
+                album_window: request.config.album_window,
+                track_window: request.config.track_window,
+                addition_policy: AdditionPolicy::MinimumTotal(addition_budget),
+                maximum_addition_budget: Some(request.config.max_added_tracks),
+            },
+            &scorer,
+            &progress,
+            |state| repair_final_route_valid(&request, state),
+            "no retained repeat-window repair passed the final global proof",
+        );
+        match result {
+            Ok(plan) => return Ok(plan),
+            Err(FixedGapPlanError::NoCompleteRoute { .. })
+            | Err(FixedGapPlanError::FinalRouteInvalid(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(FixedGapPlanError::NoCompleteRoute {
+        blocking_gap: request.gaps.len().saturating_sub(1),
+        evaluated_states: 0,
+        retained_states: 0,
+    })
 }
 
 fn plan_global_with_progress<S, F, V>(
     request: GlobalPlanRequest<'_>,
     scorer: S,
-    progress: &mut F,
+    progress: &F,
     final_route_valid: V,
     final_invalid_message: &'static str,
 ) -> Result<FixedGapPlan, FixedGapPlanError>
 where
     S: AnchoredPathScorer,
-    F: FnMut(FixedGapProgressEvent),
+    F: Fn(FixedGapProgressEvent) + Sync,
     V: Fn(&GlobalState) -> bool,
 {
     let source_unavailable = request.source_route.to_vec();
@@ -602,6 +649,10 @@ where
     }];
 
     for (gap_index, gap) in request.gaps.iter().enumerate() {
+        let (addition_budget, maximum_addition_budget) = match request.addition_policy {
+            AdditionPolicy::ExactPerGap(_) => (None, None),
+            AdditionPolicy::MinimumTotal(budget) => (Some(budget), request.maximum_addition_budget),
+        };
         progress(FixedGapProgressEvent {
             phase: FixedGapProgressPhase::Searching,
             gap: gap_index + 1,
@@ -609,19 +660,34 @@ where
             completed_gaps: gap_index,
             evaluated_states: states.len(),
             retained_states: states.len(),
+            addition_budget,
+            maximum_addition_budget,
+            path_progress: None,
         });
+        let minimum_after_gap = match request.addition_policy {
+            AdditionPolicy::ExactPerGap(_) => 0,
+            AdditionPolicy::MinimumTotal(_) => minimum_repeat_spacing_additions(
+                &request.source_route[gap_index + 1..],
+                request.tracks,
+                request.artist_window,
+                request.album_window,
+                request.track_window,
+            )?,
+        };
+        let total_route_states = states.len();
         let batches = states
             .par_iter()
-            .map(|state| {
+            .enumerate()
+            .map(|(state_index, state)| {
                 let max_intermediates = match request.addition_policy {
                     AdditionPolicy::ExactPerGap(count) => count,
-                    AdditionPolicy::MinimumTotal(maximum) => {
-                        maximum.saturating_sub(state.added_track_count)
-                    }
+                    AdditionPolicy::MinimumTotal(maximum) => maximum
+                        .saturating_sub(state.added_track_count)
+                        .saturating_sub(minimum_after_gap),
                 };
                 let mut unavailable = source_unavailable.clone();
                 unavailable.extend(state.route.iter().copied());
-                let options = search_anchored_paths(
+                let options = search_anchored_paths_with_progress(
                     AnchoredPathRequest {
                         route_prefix: &state.route,
                         immutable_history: request.immutable_history,
@@ -643,6 +709,28 @@ where
                         },
                     },
                     &scorer,
+                    |path| {
+                        progress(FixedGapProgressEvent {
+                            phase: FixedGapProgressPhase::Searching,
+                            gap: gap_index + 1,
+                            total_gaps: request.gaps.len(),
+                            completed_gaps: gap_index,
+                            evaluated_states: states.len(),
+                            retained_states: states.len(),
+                            addition_budget,
+                            maximum_addition_budget,
+                            path_progress: Some(FixedGapPathProgress {
+                                route_state: state_index + 1,
+                                total_route_states,
+                                requested_intermediates: path.requested_intermediates,
+                                max_intermediates: path.max_intermediates,
+                                completed_layers: path.completed_layers,
+                                total_layers: path.total_layers,
+                                evaluated_states: path.evaluated_states,
+                                retained_states: path.retained_states,
+                            }),
+                        });
+                    },
                 )
                 .map_err(FixedGapPlanError::Path)?;
                 Ok(options
@@ -728,6 +816,9 @@ where
             completed_gaps: gap_index + 1,
             evaluated_states: evaluated,
             retained_states: retained,
+            addition_budget,
+            maximum_addition_budget,
+            path_progress: None,
         });
     }
 

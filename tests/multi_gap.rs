@@ -1,11 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
-use bliss_playlist_optimizer::anchored_path::{AnchoredPathCandidate, FixedAdjacentScorer};
+use bliss_playlist_optimizer::anchored_path::{
+    search_anchored_paths_with_progress, AnchoredPathCandidate, AnchoredPathRequest,
+    AnchoredPathSearchConfig, FixedAdjacentScorer,
+};
 use bliss_playlist_optimizer::multi_gap::{
     minimum_repeat_spacing_additions, plan_fixed_gap_count, plan_fixed_gap_count_with_progress,
-    plan_repeat_window_repair, FixedGap, FixedGapPlanConfig, FixedGapPlanError,
-    FixedGapPlanRequest, FixedGapProgressPhase, RepeatWindowRepairConfig,
-    RepeatWindowRepairRequest,
+    plan_repeat_window_repair, plan_repeat_window_repair_with_progress, FixedGap,
+    FixedGapPlanConfig, FixedGapPlanError, FixedGapPlanRequest, FixedGapProgressPhase,
+    RepeatWindowRepairConfig, RepeatWindowRepairRequest,
 };
 use bliss_playlist_optimizer::route::RouteTrack;
 
@@ -66,6 +70,125 @@ fn repeat_spacing_lower_bound_accounts_for_overlapping_source_constraints() {
         minimum_repeat_spacing_additions(&[0, 1, 2, 3], &tracks, 2, 0, 0).unwrap(),
         3
     );
+}
+
+#[test]
+fn anchored_search_reports_layers_and_caps_counts_at_available_candidates() {
+    let tracks = vec![
+        track(0.0, "source-a", "source-a"),
+        track(1.0, "bridge-one", "bridge-one"),
+        track(2.0, "bridge-two", "bridge-two"),
+        track(3.0, "source-b", "source-b"),
+    ];
+    let candidates = [candidate(1), candidate(2)];
+    let events = Mutex::new(Vec::new());
+
+    let options = search_anchored_paths_with_progress(
+        AnchoredPathRequest {
+            route_prefix: &[0],
+            immutable_history: &[],
+            unavailable_tracks: &[0, 3],
+            left_anchor: 0,
+            right_anchor: 3,
+            candidates: &candidates,
+            tracks: &tracks,
+            config: AnchoredPathSearchConfig {
+                max_intermediates: 20,
+                candidate_limit: 16,
+                beam_width: 64,
+                alternatives_per_count: 8,
+                variation_percent: 0,
+                generation_seed: 42,
+                artist_window: 0,
+                album_window: 0,
+                track_window: 100,
+            },
+        },
+        FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
+        |event| events.lock().unwrap().push(event),
+    )
+    .unwrap();
+
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option.intermediates.len())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1, 2])
+    );
+    let events = events.into_inner().unwrap();
+    assert!(!events.is_empty());
+    assert!(events.iter().all(|event| event.max_intermediates == 2));
+    assert!(events.iter().any(|event| {
+        event.requested_intermediates == 2 && event.completed_layers == 1 && event.total_layers == 2
+    }));
+    assert!(events.iter().any(|event| {
+        event.requested_intermediates == 2 && event.completed_layers == 2 && event.total_layers == 2
+    }));
+}
+
+#[test]
+fn repair_starts_at_the_source_lower_bound_and_reserves_later_gaps() {
+    let tracks = vec![
+        track(0.0, "repeated", "source-a"),
+        track(1.0, "bridge-one", "bridge-one"),
+        track(2.0, "bridge-two", "bridge-two"),
+        track(3.0, "repeated", "source-b"),
+        track(4.0, "bridge-three", "bridge-three"),
+        track(5.0, "bridge-four", "bridge-four"),
+        track(6.0, "repeated", "source-c"),
+    ];
+    let gaps = [
+        FixedGap {
+            left: 0,
+            right: 3,
+            candidates: &[candidate(1), candidate(2)],
+        },
+        FixedGap {
+            left: 3,
+            right: 6,
+            candidates: &[candidate(4), candidate(5)],
+        },
+    ];
+    let mut repair = repair_config(20);
+    repair.artist_window = 2;
+    let events = Mutex::new(Vec::new());
+
+    let plan = plan_repeat_window_repair_with_progress(
+        RepeatWindowRepairRequest {
+            source_route: &[0, 3, 6],
+            immutable_history: &[],
+            gaps: &gaps,
+            tracks: &tracks,
+            config: repair,
+        },
+        FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
+        |event| events.lock().unwrap().push(event),
+    )
+    .unwrap();
+
+    assert_eq!(plan.final_route, vec![0, 1, 2, 3, 4, 5, 6]);
+    let events = events.into_inner().unwrap();
+    assert!(events.iter().all(|event| event.addition_budget == Some(4)));
+    assert!(events
+        .iter()
+        .all(|event| event.maximum_addition_budget == Some(20)));
+    assert!(events
+        .iter()
+        .filter_map(|event| event.path_progress)
+        .all(|path| path.max_intermediates <= 2));
+    assert!(events
+        .iter()
+        .filter_map(|event| event.path_progress)
+        .all(|path| path.requested_intermediates == 2));
+    assert!(events
+        .iter()
+        .filter_map(|event| event.path_progress)
+        .any(|path| {
+            path.requested_intermediates == 2
+                && path.completed_layers == 2
+                && path.total_layers == 2
+        }));
 }
 
 #[test]
@@ -377,7 +500,7 @@ fn reports_start_and_completion_for_every_gap() {
             candidates: &[candidate(4), candidate(5)],
         },
     ];
-    let mut events = Vec::new();
+    let events = Mutex::new(Vec::new());
 
     plan_fixed_gap_count_with_progress(
         FixedGapPlanRequest {
@@ -388,13 +511,18 @@ fn reports_start_and_completion_for_every_gap() {
             config: config(1),
         },
         FixedAdjacentScorer::new(|left: usize, right: usize| left.abs_diff(right) as f64),
-        |event| events.push(event),
+        |event| events.lock().unwrap().push(event),
     )
     .unwrap();
 
-    assert_eq!(events.len(), 4);
+    let events = events.into_inner().unwrap();
+    let outer_events = events
+        .iter()
+        .filter(|event| event.path_progress.is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(outer_events.len(), 4);
     assert_eq!(
-        events
+        outer_events
             .iter()
             .map(|event| (
                 event.phase,
@@ -410,7 +538,7 @@ fn reports_start_and_completion_for_every_gap() {
             (FixedGapProgressPhase::Completed, 2, 2, 2),
         ]
     );
-    assert!(events
+    assert!(outer_events
         .iter()
         .filter(|event| event.phase == FixedGapProgressPhase::Completed)
         .all(|event| event.evaluated_states > 0 && event.retained_states > 0));

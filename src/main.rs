@@ -1811,15 +1811,54 @@ struct FixedGapProgressSnapshot {
     completed_gaps: usize,
     evaluated_states: usize,
     retained_states: usize,
+    addition_budget: Option<usize>,
+    maximum_addition_budget: Option<usize>,
+    path_progress: Option<multi_gap::FixedGapPathProgress>,
 }
 
 impl FixedGapProgressSnapshot {
     fn update(self) -> ProgressHeartbeatUpdate {
         let message = match self.phase {
-            multi_gap::FixedGapProgressPhase::Searching => format!(
-                "Searching source gap {} of {}; {} completed; {} global route states retained",
-                self.gap, self.total_gaps, self.completed_gaps, self.retained_states
-            ),
+            multi_gap::FixedGapProgressPhase::Searching => {
+                if let Some(path) = self.path_progress {
+                    let budget = match (self.addition_budget, self.maximum_addition_budget) {
+                        (Some(current), Some(maximum)) => {
+                            format!("; addition budget {current}/{maximum}")
+                        }
+                        _ => String::new(),
+                    };
+                    format!(
+                        "Searching source gap {} of {}{}; route state {}/{}; testing {} intermediates ({}/{}), layer {}/{}; {} path states evaluated, {} retained",
+                        self.gap,
+                        self.total_gaps,
+                        budget,
+                        path.route_state,
+                        path.total_route_states,
+                        path.requested_intermediates,
+                        path.requested_intermediates,
+                        path.max_intermediates,
+                        path.completed_layers,
+                        path.total_layers,
+                        path.evaluated_states,
+                        path.retained_states,
+                    )
+                } else {
+                    let budget = match (self.addition_budget, self.maximum_addition_budget) {
+                        (Some(current), Some(maximum)) => {
+                            format!("; addition budget {current}/{maximum}")
+                        }
+                        _ => String::new(),
+                    };
+                    format!(
+                        "Searching source gap {} of {}{}; {} completed; {} global route states retained",
+                        self.gap,
+                        self.total_gaps,
+                        budget,
+                        self.completed_gaps,
+                        self.retained_states
+                    )
+                }
+            }
             multi_gap::FixedGapProgressPhase::Completed => format!(
                 "Completed source gap {} of {}; evaluated {} and retained {} global route states",
                 self.gap, self.total_gaps, self.evaluated_states, self.retained_states
@@ -5428,6 +5467,9 @@ fn analyze_bridge_validated(
                 completed_gaps: 0,
                 evaluated_states: 0,
                 retained_states: 1,
+                addition_budget: None,
+                maximum_addition_budget: None,
+                path_progress: None,
             }));
             let heartbeat_progress = Arc::clone(&fixed_gap_progress);
             let heartbeat = progress.dynamic_counted_heartbeat(
@@ -5471,6 +5513,9 @@ fn analyze_bridge_validated(
                             completed_gaps: event.completed_gaps,
                             evaluated_states: event.evaluated_states,
                             retained_states: event.retained_states,
+                            addition_budget: event.addition_budget,
+                            maximum_addition_budget: event.maximum_addition_budget,
+                            path_progress: event.path_progress,
                         };
                     }
                 },
@@ -5694,6 +5739,9 @@ fn analyze_bridge_validated(
                 completed_gaps: 0,
                 evaluated_states: 0,
                 retained_states: 1,
+                addition_budget: Some(minimum_required),
+                maximum_addition_budget: Some(max_added_tracks),
+                path_progress: None,
             }));
             let heartbeat_progress = Arc::clone(&repair_progress);
             let heartbeat = progress.dynamic_counted_heartbeat(
@@ -5738,6 +5786,9 @@ fn analyze_bridge_validated(
                             completed_gaps: event.completed_gaps,
                             evaluated_states: event.evaluated_states,
                             retained_states: event.retained_states,
+                            addition_budget: event.addition_budget,
+                            maximum_addition_budget: event.maximum_addition_budget,
+                            path_progress: event.path_progress,
                         };
                     }
                 },
@@ -7851,6 +7902,39 @@ mod tests {
         assert_eq!(progress["percent"], 100.0 / 7.0);
         let _ = fs::remove_file(progress_path);
     }
+
+    #[test]
+    fn fixed_gap_progress_describes_the_active_inner_path_search() {
+        let update = FixedGapProgressSnapshot {
+            phase: multi_gap::FixedGapProgressPhase::Searching,
+            gap: 1,
+            total_gaps: 7,
+            completed_gaps: 0,
+            evaluated_states: 1,
+            retained_states: 1,
+            addition_budget: Some(45),
+            maximum_addition_budget: Some(65),
+            path_progress: Some(multi_gap::FixedGapPathProgress {
+                route_state: 1,
+                total_route_states: 1,
+                requested_intermediates: 6,
+                max_intermediates: 10,
+                completed_layers: 3,
+                total_layers: 6,
+                evaluated_states: 123,
+                retained_states: 17,
+            }),
+        }
+        .update();
+
+        assert_eq!(
+            update.message,
+            "Searching source gap 1 of 7; addition budget 45/65; route state 1/1; testing 6 intermediates (6/10), layer 3/6; 123 path states evaluated, 17 retained"
+        );
+        assert_eq!(update.current, Some(0));
+        assert_eq!(update.total, Some(7));
+    }
+
     #[test]
     fn fixed_matrix_index_matches_core_pairwise_distance() {
         let tracks = (0..4)
