@@ -287,6 +287,7 @@ where
             reference,
         },
         &exact_config,
+        EvolvingAcceptance::FullBridge,
         Some(original_route),
     )?;
     Ok(ExactSelection {
@@ -435,6 +436,7 @@ where
             reference,
         },
         &decision_config,
+        EvolvingAcceptance::PathLegs,
         Some(original_route),
     )?;
     Ok(RepeatWindowRepairSelection {
@@ -473,6 +475,7 @@ struct VariationConfig {
 enum EvolvingAcceptance {
     FullBridge,
     ReachableFromLeft,
+    PathLegs,
 }
 
 impl EvolvingAcceptance {
@@ -481,6 +484,9 @@ impl EvolvingAcceptance {
             Self::FullBridge => evaluation.accepted,
             Self::ReachableFromLeft => {
                 evaluation.repeat_safe && evaluation.left_percentile <= config.max_leg_percentile
+            }
+            Self::PathLegs => {
+                evaluation.repeat_safe && evaluation.max_percentile <= config.max_leg_percentile
             }
         }
     }
@@ -1093,6 +1099,7 @@ fn final_exact_decisions(
     gap_selections: &[Vec<usize>],
     scoring: ExactScoringContext<'_>,
     selection_config: &ExactSelectionConfig,
+    acceptance: EvolvingAcceptance,
     frozen_source_route: Option<&[usize]>,
 ) -> Result<Vec<GapDecision>, PreviewError> {
     let ExactScoringContext {
@@ -1167,14 +1174,14 @@ fn final_exact_decisions(
                     frozen_matrix: frozen_matrix.as_ref(),
                 },
                 variation: selection_config.variation(),
-                acceptance: EvolvingAcceptance::FullBridge,
+                acceptance,
             })?
             .into_iter()
             .next()
             .ok_or(PreviewError::FinalRouteInvalid(
                 "selected bridge has no final contextual evaluation",
             ))?;
-            if !evaluation.accepted {
+            if !acceptance.accepts(&evaluation, config) {
                 return Err(PreviewError::FinalRouteInvalid(
                     "selected bridge fails final contextual validation",
                 ));
@@ -1375,6 +1382,7 @@ fn select_exact_count_multi_gap_bridges(
                 reference,
             },
             selection_config,
+            EvolvingAcceptance::FullBridge,
             None,
         )?;
         (Some(state.route), decisions)
@@ -1496,6 +1504,7 @@ where
             std::slice::from_ref(&anchored.intermediates),
             scoring,
             selection_config,
+            EvolvingAcceptance::FullBridge,
             None,
         )?;
         options.push(DestinationRouteOption {
@@ -1616,6 +1625,7 @@ where
                         &[outward_bridges],
                         scoring,
                         selection_config,
+                        EvolvingAcceptance::FullBridge,
                         None,
                     )?;
                     return Ok(vec![DestinationRouteOption {
@@ -1697,6 +1707,7 @@ where
                         &[outward_bridges, return_bridges],
                         scoring,
                         selection_config,
+                        EvolvingAcceptance::FullBridge,
                         None,
                     )?;
                     let boundary_edges = final_route[route_start..=destination_first_position]
@@ -2067,6 +2078,7 @@ pub fn select_exact_count_bridges_with_endpoints(
                         &gap_selections,
                         scoring,
                         selection_config,
+                        EvolvingAcceptance::FullBridge,
                         None,
                     ) {
                         Ok(decisions) => decisions,
@@ -2443,6 +2455,66 @@ mod tests {
             guidance_adjustments: BTreeMap::new(),
             guidance_target_weights: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn repeat_window_repair_accepts_a_globally_valid_multi_leg_path() {
+        let tracks = vec![
+            track(0.0, "repeated"),
+            track(2.0, "middle"),
+            track(4.0, "repeated"),
+            track(1.0, "spacer"),
+        ];
+        let route = [0, 1, 2];
+        let matrix = Array2::eye(23);
+        let config = BridgeConfig {
+            seed_limit: 1,
+            learned_percent: 20,
+            artist_window: 2,
+            album_window: 0,
+            max_leg_percentile: 1.0,
+            // Each adjacent leg is allowed, but treating the spacer as one
+            // isolated A-to-B bridge would reject its combined detour.
+            max_detour_percentile: 0.5,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
+        };
+        let reference = FrozenReference::from_distances(vec![0.0, 0.01, 0.02, 10_000.0]).unwrap();
+        let gaps = [gap(1, 0, 1, 3), gap(2, 1, 2, 3)];
+
+        let selection = select_repeat_window_repair_with_progress(
+            &route,
+            &gaps,
+            &RepeatWindowRepairConfig {
+                max_added_tracks: 1,
+                candidate_limit: 1,
+                beam_width: 16,
+                alternatives_per_gap: 4,
+                variation_percent: 0,
+                generation_seed: 20_261_021,
+                track_window: 100,
+            },
+            FixedGapScoringContext {
+                tracks: &tracks,
+                learned_matrix: &matrix,
+                config: &config,
+                reference: &reference,
+            },
+            |_| {},
+        )
+        .expect("a repeat-safe path with individually acceptable legs must be retained");
+
+        assert_eq!(selection.added_track_count, 1);
+        assert_eq!(selection.final_route, vec![0, 3, 1, 2]);
+        assert!(selection
+            .decisions
+            .iter()
+            .filter_map(|decision| decision.selected.as_ref())
+            .all(|selected| selected.evaluation.max_percentile <= config.max_leg_percentile));
+        assert!(selection
+            .decisions
+            .iter()
+            .filter_map(|decision| decision.selected.as_ref())
+            .any(|selected| !selected.evaluation.accepted));
     }
 
     #[test]
