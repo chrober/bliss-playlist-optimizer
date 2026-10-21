@@ -27,7 +27,7 @@ human-readable messages may improve without a schema-version change.
 | `REPEAT_WINDOW_REPAIR_NOT_NEEDED` | The frozen source route already satisfies the selected repeat windows and therefore needs no spacing additions. |
 | `REPEAT_WINDOW_REPAIR_BUDGET_INSUFFICIENT` | The exact source-only spacing lower bound exceeds the configured global addition budget. |
 | `REPEAT_WINDOW_REPAIR_INSUFFICIENT_CANDIDATES` | The frozen eligible inventory cannot supply the minimum number of unique additions required by the source repeats. |
-| `REPEAT_WINDOW_REPAIR_NOT_FOUND` | The bounded global planner found no complete minimum-total repair inside the budget, or the completed route failed its independent proof. |
+| `REPEAT_WINDOW_REPAIR_NOT_FOUND` | The bounded global planner found no complete minimum-total repair inside the budget, or the completed route failed its independent leg/repeat proof. Raising the addition budget or relaxing repeat windows may make a route feasible; `restart_count` does not widen this global repair search. |
 | `BRIDGE_SHORTLIST_FAILED` | Deterministic bridge-candidate shortlisting could not be completed. |
 | `SEMANTIC_EVIDENCE_REDUCED` | Optional semantic evidence is partial, stale, or unavailable. |
 | `CANCELLED` | The caller requested cancellation before atomic completion. |

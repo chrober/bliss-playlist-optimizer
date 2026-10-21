@@ -521,8 +521,10 @@ beams are kept for every cumulative addition count so that a cheap early route
 cannot discard a larger partial route needed by a later repeated source
 anchor. With `optimize_order`, the source-only order is first optimized without
 requiring that incomplete route to satisfy the final repeat windows, then
-frozen; the global repair owns enforcement of those windows. With
-`preserve_order`, the input source order is frozen directly.
+frozen; `restart_count` affects only this preliminary source-only routing step.
+The global repair uses its own fixed bounded beam and does not reinterpret that
+setting. With `preserve_order`, the input source order is frozen directly and
+route restarts are unused.
 `extension.max_added_tracks` is a global ceiling rather than a target.
 The final objective first minimizes total additions, then worst transition,
 transition sum, guidance adjustment, and seeded Variation inside the
@@ -530,7 +532,12 @@ minimum-count quality band. A source-only lower bound rejects an insufficient
 budget or unique-candidate inventory before the global search. Successful
 artifacts prove the chosen per-gap counts, source subsequence, unique
 membership, absent endpoint additions, and complete-route repeat validity.
-Failure is atomic and never returns a partial repaired route.
+Final candidate decisions use the multi-leg path acceptance rule: every
+adjacent leg must pass the configured maximum-leg percentile and the complete
+route must satisfy the hard repeat proof. The isolated single-bridge detour
+threshold remains authoritative for local bridge workflows, but is not
+reapplied to one member of an otherwise valid multi-leg spacing path. Failure
+is atomic and never returns a partial repaired route.
 
 This remains analysis-only by design. Better Call Bliss applies accepted
 previews and writes Lyrion playlists from the returned opaque track identities.
