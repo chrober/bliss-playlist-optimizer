@@ -102,6 +102,7 @@
     "selection_preview": {
       "oneOf": [
         { "$ref": "#/$defs/automatic_selection_preview" },
+        { "$ref": "#/$defs/automatic_improvement_selection_preview" },
         { "$ref": "#/$defs/fixed_gap_count_selection_preview" },
         { "$ref": "#/$defs/repeat_window_repair_selection_preview" },
         { "$ref": "#/$defs/exact_selection_preview" },
@@ -320,6 +321,43 @@
           "minItems": 1,
           "items": { "$ref": "#/$defs/preview_decision" }
         }
+      }
+    },
+    "automatic_improvement_selection_preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode", "processing_order", "max_added_tracks", "added_track_count",
+        "spacing_additions", "smoothing_additions", "original_subsequence_preserved",
+        "unique_membership", "repeat_windows_satisfied", "minimum_spacing_selected", "addition_reasons", "final_sequence", "decisions"
+      ],
+      "properties": {
+        "mode": { "const": "automatic_improvement" },
+        "processing_order": { "const": "spacing-then-smoothing" },
+        "max_added_tracks": { "type": "integer", "minimum": 0 },
+        "added_track_count": { "type": "integer", "minimum": 0 },
+        "spacing_additions": { "type": "integer", "minimum": 0 },
+        "smoothing_additions": { "type": "integer", "minimum": 0 },
+        "original_subsequence_preserved": { "const": true },
+        "unique_membership": { "const": true },
+        "repeat_windows_satisfied": { "const": true },
+        "minimum_spacing_selected": { "const": true },
+        "addition_reasons": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["candidate_id", "reason"],
+            "properties": {
+              "candidate_id": { "type": "string", "minLength": 1 },
+              "reason": { "enum": ["spacing", "smoothing"] }
+            }
+          }
+        },
+        "final_sequence": {
+          "type": "array", "minItems": 2,
+          "items": { "$ref": "#/$defs/preview_sequence_entry" }
+        },
+        "decisions": { "type": "array", "items": { "$ref": "#/$defs/preview_decision" } }
       }
     },
     "fixed_source_extension_selection_preview": {

@@ -268,6 +268,8 @@ struct RepeatWindows {
 #[derive(Debug, Deserialize)]
 struct ExtensionSettings {
     mode: String,
+    satisfy_repeat_windows: Option<bool>,
+    smooth_transitions: Option<bool>,
     destination_mode: Option<String>,
     search_effort: Option<String>,
     additional_track_count: Option<usize>,
@@ -1160,9 +1162,33 @@ struct AutomaticSelectionArtifact {
 }
 
 #[derive(Debug, Serialize)]
+struct AutomaticImprovementSelectionArtifact {
+    mode: &'static str,
+    processing_order: &'static str,
+    max_added_tracks: usize,
+    added_track_count: usize,
+    spacing_additions: usize,
+    smoothing_additions: usize,
+    original_subsequence_preserved: bool,
+    unique_membership: bool,
+    repeat_windows_satisfied: bool,
+    minimum_spacing_selected: bool,
+    addition_reasons: Vec<AutomaticImprovementAdditionReason>,
+    final_sequence: Vec<PreviewSequenceEntryArtifact>,
+    decisions: Vec<PreviewDecisionArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct AutomaticImprovementAdditionReason {
+    candidate_id: String,
+    reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum SelectionPreviewArtifact {
     Automatic(AutomaticSelectionArtifact),
+    AutomaticImprovement(AutomaticImprovementSelectionArtifact),
     Exact(Box<ExactSelectionArtifact>),
     FixedGapCount(Box<FixedGapCountSelectionArtifact>),
     RepeatWindowRepair(Box<RepeatWindowRepairSelectionArtifact>),
@@ -2021,7 +2047,7 @@ fn usage() -> &'static str {
 
 fn version_metadata_json() -> String {
     format!(
-        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"guidance_spi_v2\":true,\"fixed_gap_count_v1\":true,\"repeat_window_repair_v1\":true}}"
+        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"guidance_spi_v2\":true,\"fixed_gap_count_v1\":true,\"repeat_window_repair_v1\":true,\"automatic_improvement_v1\":true}}"
     )
 }
 
@@ -2485,6 +2511,56 @@ fn validate_repeat_window_repair_fields(request: &Request) -> Result<(), Command
     Ok(())
 }
 
+fn validate_automatic_improvement_fields(request: &Request) -> Result<(), CommandFailure> {
+    let extension = &request.extension;
+    let invalid = |message: &str| CommandFailure::new("AUTOMATIC_IMPROVEMENT_INVALID", message);
+    if extension.mode != "automatic_improvement" {
+        if extension.satisfy_repeat_windows.is_some() || extension.smooth_transitions.is_some() {
+            return Err(invalid(
+                "automatic improvement goals require automatic_improvement mode",
+            ));
+        }
+        return Ok(());
+    }
+    let spacing = extension
+        .satisfy_repeat_windows
+        .ok_or_else(|| invalid("missing spacing goal"))?;
+    let smoothing = extension
+        .smooth_transitions
+        .ok_or_else(|| invalid("missing smoothing goal"))?;
+    if !spacing && !smoothing {
+        return Err(invalid("at least one improvement goal must be enabled"));
+    }
+    if extension.max_added_tracks.is_none() {
+        return Err(invalid("missing maximum additions budget"));
+    }
+    if smoothing && extension.trigger_percentile.is_none() {
+        return Err(invalid("smoothing requires a trigger percentile"));
+    }
+    if extension
+        .trigger_percentile
+        .is_some_and(|value| !(0.0..=1.0).contains(&value))
+    {
+        return Err(invalid("trigger percentile must be between 0 and 1"));
+    }
+    if extension.additional_track_count.is_some()
+        || extension.target_track_count.is_some()
+        || extension.max_tracks_per_gap.is_some()
+        || extension.tracks_per_gap.is_some()
+        || extension.allow_opening_track.is_some()
+        || extension.allow_closing_track.is_some()
+        || extension.destination_mode.is_some()
+        || extension.min_added_tracks.is_some()
+        || extension.direct_transition_caution.is_some()
+        || extension.search_effort.is_some()
+    {
+        return Err(invalid(
+            "automatic improvement received incompatible extension fields",
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_runtime_request(
     path: &Path,
     options: &RuntimeOptions,
@@ -2500,6 +2576,7 @@ fn prepare_runtime_request(
     let started = Instant::now();
     let (request, request_sha256) = decode_request_once(path, options.validate_contracts)?;
     validate_repeat_window_repair_fields(&request)?;
+    validate_automatic_improvement_fields(&request)?;
     timings.record("request_decode", started.elapsed());
 
     progress.update(
@@ -3416,6 +3493,35 @@ fn candidate_semantic_identity(
     }
 }
 
+fn inserted_anchor_semantic_identity(
+    library_index: usize,
+    library: &Library,
+    identities: &HashMap<usize, CandidateIdentity>,
+) -> semantic::TrackIdentity {
+    let mut track = candidate_semantic_identity(library_index, library).track;
+    if let Some(identity) = identities.get(&library_index) {
+        track.recording_mbid = identity.recording_mbid.clone();
+        if let Some(title) = identity.title.as_deref().filter(|value| !value.is_empty()) {
+            track.title_name = semantic::normalize_identity(title);
+        }
+        if let Some(artist) = identity.artist.as_deref().filter(|value| !value.is_empty()) {
+            track.artist_name = semantic::normalize_identity(artist);
+        }
+        track
+            .artist_ids
+            .extend(identity.artist_mbids.iter().cloned());
+        track
+            .artist_ids
+            .extend(identity.artist_mbid.iter().cloned());
+        track
+            .artist_ids
+            .push(semantic::canonical_artist_id(&track.artist_name));
+        track.artist_ids.sort();
+        track.artist_ids.dedup();
+    }
+    track
+}
+
 fn bridge_candidate_artifact(
     evaluation: &bridge::BridgeCandidateEvaluation,
     semantics: &semantic::CandidateSemantics,
@@ -4328,19 +4434,25 @@ fn analyze_bridge_validated(
         .unwrap_or(EXACT_COUNT_BEAM_WIDTH);
     let (max_added_tracks, trigger_percentile, requested_exact_count) =
         match request.extension.mode.as_str() {
-            "automatic" => (
+            "automatic" | "automatic_improvement" => (
                 Some(request.extension.max_added_tracks.ok_or_else(|| {
                     CommandFailure::new(
                         "AUTOMATIC_BRIDGE_BUDGET_REQUIRED",
                         "automatic extension requires extension.max_added_tracks",
                     )
                 })?),
-                Some(request.extension.trigger_percentile.ok_or_else(|| {
-                    CommandFailure::new(
-                        "AUTOMATIC_TRIGGER_REQUIRED",
-                        "automatic extension requires extension.trigger_percentile",
-                    )
-                })?),
+                if request.extension.mode == "automatic_improvement"
+                    && request.extension.smooth_transitions == Some(false)
+                {
+                    None
+                } else {
+                    Some(request.extension.trigger_percentile.ok_or_else(|| {
+                        CommandFailure::new(
+                            "AUTOMATIC_TRIGGER_REQUIRED",
+                            "automatic extension requires extension.trigger_percentile",
+                        )
+                    })?)
+                },
                 None,
             ),
             "exact_count" => (
@@ -4505,7 +4617,9 @@ fn analyze_bridge_validated(
     let base_route_config = if matches!(
         request.extension.mode.as_str(),
         "fixed_source_extension" | "repeat_window_repair"
-    ) {
+    ) || (request.extension.mode == "automatic_improvement"
+        && request.extension.satisfy_repeat_windows == Some(true))
+    {
         route::SearchConfig {
             artist_window: 0,
             album_window: 0,
@@ -4592,6 +4706,8 @@ fn analyze_bridge_validated(
                     request.extension.mode.as_str(),
                     "fixed_gap_count" | "repeat_window_repair"
                 )
+                && !(request.extension.mode == "automatic_improvement"
+                    && request.extension.satisfy_repeat_windows == Some(true))
             {
                 return Err(CommandFailure::new(
                     "PRESERVED_ANCHOR_REPEAT_CONFLICT",
@@ -5319,8 +5435,28 @@ fn analyze_bridge_validated(
             .collect::<Vec<_>>()
     };
     let started = Instant::now();
+    let no_spacing_needed_for_smoothing = if request.extension.mode == "automatic_improvement"
+        && request.extension.satisfy_repeat_windows == Some(true)
+        && request.extension.smooth_transitions == Some(true)
+    {
+        multi_gap::minimum_repeat_spacing_additions(
+            &selected_library_route,
+            bridge_tracks,
+            request.repeat_windows.artist,
+            request.repeat_windows.album,
+            request.repeat_windows.track,
+        )
+        .map_err(|error| CommandFailure::new("REPEAT_WINDOW_REPAIR_NOT_FOUND", error.to_string()))?
+            == 0
+    } else {
+        false
+    };
     let selection_preview = match request.extension.mode.as_str() {
-        "automatic" => {
+        "automatic" | "automatic_improvement"
+            if request.extension.mode == "automatic"
+                || request.extension.satisfy_repeat_windows != Some(true)
+                || no_spacing_needed_for_smoothing =>
+        {
             progress.update(
                 "bridge_selection",
                 format!(
@@ -5381,20 +5517,60 @@ fn analyze_bridge_validated(
             let added_track_count = selection.final_route.len() - selected_library_route.len();
             let unique_membership = selection.final_route.iter().collect::<HashSet<_>>().len()
                 == selection.final_route.len();
-            SelectionPreviewArtifact::Automatic(AutomaticSelectionArtifact {
-                mode: "automatic",
-                processing_order: "left-to-right-original-gaps",
-                max_added_tracks,
-                added_track_count,
-                original_subsequence_preserved: selection
-                    .final_route
-                    .iter()
-                    .filter(|index| original_ids_by_library.contains_key(index))
-                    .eq(selected_library_route.iter()),
-                unique_membership,
-                final_sequence: sequence_artifact(&selection.final_route),
-                decisions: preview_decisions,
-            })
+            let original_subsequence_preserved = selection
+                .final_route
+                .iter()
+                .filter(|index| original_ids_by_library.contains_key(index))
+                .eq(selected_library_route.iter());
+            if request.extension.mode == "automatic_improvement" {
+                let repeat_windows_satisfied =
+                    route::repeat_violations(&selection.final_route, bridge_tracks, &route_config)
+                        .is_empty();
+                if !repeat_windows_satisfied {
+                    return Err(CommandFailure::new(
+                        "AUTOMATIC_IMPROVEMENT_REPEAT_CONFLICT",
+                        "the final route does not satisfy the configured repeat windows",
+                    ));
+                }
+                SelectionPreviewArtifact::AutomaticImprovement(
+                    AutomaticImprovementSelectionArtifact {
+                        mode: "automatic_improvement",
+                        processing_order: "spacing-then-smoothing",
+                        max_added_tracks,
+                        added_track_count,
+                        spacing_additions: 0,
+                        smoothing_additions: added_track_count,
+                        original_subsequence_preserved,
+                        unique_membership,
+                        repeat_windows_satisfied,
+                        minimum_spacing_selected: true,
+                        addition_reasons: preview_decisions
+                            .iter()
+                            .filter_map(|decision| {
+                                decision.selected_bridge.as_ref().map(|bridge| {
+                                    AutomaticImprovementAdditionReason {
+                                        candidate_id: bridge.candidate_id.clone(),
+                                        reason: "smoothing",
+                                    }
+                                })
+                            })
+                            .collect(),
+                        final_sequence: sequence_artifact(&selection.final_route),
+                        decisions: preview_decisions,
+                    },
+                )
+            } else {
+                SelectionPreviewArtifact::Automatic(AutomaticSelectionArtifact {
+                    mode: "automatic",
+                    processing_order: "left-to-right-original-gaps",
+                    max_added_tracks,
+                    added_track_count,
+                    original_subsequence_preserved,
+                    unique_membership,
+                    final_sequence: sequence_artifact(&selection.final_route),
+                    decisions: preview_decisions,
+                })
+            }
         }
         "fixed_gap_count" => {
             let tracks_per_gap = request.extension.tracks_per_gap.ok_or_else(|| {
@@ -5651,14 +5827,14 @@ fn analyze_bridge_validated(
                 },
             }))
         }
-        "repeat_window_repair" => {
+        "repeat_window_repair" | "automatic_improvement" => 'spacing: {
             let max_added_tracks = request.extension.max_added_tracks.ok_or_else(|| {
                 CommandFailure::new(
                     "REPEAT_WINDOW_REPAIR_BUDGET_REQUIRED",
                     "repeat_window_repair requires extension.max_added_tracks",
                 )
             })?;
-            if max_added_tracks == 0 {
+            if max_added_tracks == 0 && request.extension.mode != "automatic_improvement" {
                 return Err(CommandFailure::new(
                     "REPEAT_WINDOW_REPAIR_BUDGET_INVALID",
                     "repeat-window repair requires a positive addition budget",
@@ -5693,6 +5869,25 @@ fn analyze_bridge_validated(
                 CommandFailure::new("REPEAT_WINDOW_REPAIR_NOT_FOUND", error.to_string())
             })?;
             if minimum_required == 0 {
+                if request.extension.mode == "automatic_improvement" {
+                    break 'spacing SelectionPreviewArtifact::AutomaticImprovement(
+                        AutomaticImprovementSelectionArtifact {
+                            mode: "automatic_improvement",
+                            processing_order: "spacing-then-smoothing",
+                            max_added_tracks,
+                            added_track_count: 0,
+                            spacing_additions: 0,
+                            smoothing_additions: 0,
+                            original_subsequence_preserved: true,
+                            unique_membership: true,
+                            repeat_windows_satisfied: true,
+                            minimum_spacing_selected: true,
+                            addition_reasons: Vec::new(),
+                            final_sequence: sequence_artifact(&selected_library_route),
+                            decisions: Vec::new(),
+                        },
+                    );
+                }
                 return Err(CommandFailure::new(
                     "REPEAT_WINDOW_REPAIR_NOT_NEEDED",
                     "the source route already satisfies the configured repeat windows",
@@ -5794,7 +5989,7 @@ fn analyze_bridge_validated(
                 },
             );
             drop(heartbeat);
-            let selection = selection.map_err(|error| {
+            let mut selection = selection.map_err(|error| {
                 CommandFailure::new("REPEAT_WINDOW_REPAIR_NOT_FOUND", error.to_string())
             })?;
             if selection.added_track_count == 0 {
@@ -5802,6 +5997,193 @@ fn analyze_bridge_validated(
                     "REPEAT_WINDOW_REPAIR_NOT_NEEDED",
                     "the source route already satisfies the configured repeat windows",
                 ));
+            }
+            let spacing_additions = selection.added_track_count;
+            let mut smoothing_decisions = Vec::new();
+            if request.extension.mode == "automatic_improvement"
+                && request.extension.smooth_transitions == Some(true)
+                && spacing_additions < max_added_tracks
+            {
+                let spacing_route = selection.final_route.clone();
+                let mut smoothing_gaps = Vec::new();
+                let mut smoothing_contributions = HashMap::new();
+                let used_tracks = spacing_route.iter().copied().collect::<HashSet<_>>();
+                let available = eligible_candidates
+                    .iter()
+                    .copied()
+                    .filter(|candidate| !used_tracks.contains(candidate))
+                    .collect::<Vec<_>>();
+                for position in 1..spacing_route.len() {
+                    let left = spacing_route[position - 1];
+                    let right = spacing_route[position];
+                    let anchor_identity = |index: usize| {
+                        selected_library_route
+                            .iter()
+                            .position(|source| *source == index)
+                            .map(|source_position| {
+                                source_semantic_identities[selected_local_route[source_position]]
+                                    .clone()
+                            })
+                            .unwrap_or_else(|| {
+                                inserted_anchor_semantic_identity(
+                                    index,
+                                    &library,
+                                    &candidate_identities,
+                                )
+                            })
+                    };
+                    let gap = bridge::evaluate_gap(
+                        &spacing_route,
+                        position,
+                        bridge_tracks,
+                        &learned_matrix,
+                        &bridge_config,
+                        &reference,
+                    )
+                    .map_err(|error| {
+                        CommandFailure::new("BRIDGE_SCORING_FAILED", error.to_string())
+                    })?;
+                    let base_limit = available.len().min(shortlist_limit);
+                    let acoustic_limit = if guidance_weights.has_target_shares() {
+                        base_limit.max(retained_candidate_limit.saturating_mul(10))
+                    } else {
+                        base_limit
+                    }
+                    .min(available.len());
+                    let acoustic = bridge::shortlist_candidates(
+                        &spacing_route,
+                        position,
+                        &available,
+                        acoustic_limit,
+                        bridge::ShortlistScoringContext {
+                            tracks: bridge_tracks,
+                            learned_matrix: &learned_matrix,
+                            config: &bridge_config,
+                            reference: &reference,
+                        },
+                    )
+                    .map_err(|error| {
+                        CommandFailure::new("BRIDGE_SHORTLIST_FAILED", error.to_string())
+                    })?;
+                    let mut semantics = semantic::select_gap_candidate_matches(
+                        &semantic_bundle,
+                        &anchor_identity(left),
+                        &anchor_identity(right),
+                        &all_semantic_identities,
+                        &semantic_candidate_lookup,
+                    );
+                    semantic_assisted |= semantics.pool != semantic::SemanticPool::BlissOnly;
+                    let allowed = acoustic.iter().copied().collect::<HashSet<_>>();
+                    semantics
+                        .candidates
+                        .retain(|candidate| allowed.contains(&candidate.candidate));
+                    let supported = semantics
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.candidate)
+                        .collect::<HashSet<_>>();
+                    for candidate in &acoustic {
+                        if !supported.contains(candidate) {
+                            semantics.candidates.push(semantic::CandidateSemantics {
+                                candidate: *candidate,
+                                tier: semantic::SemanticTier::BlissOnly,
+                                evidence: Vec::new(),
+                            });
+                        }
+                    }
+                    let track_id = |index: usize| {
+                        original_ids_by_library
+                            .get(&index)
+                            .cloned()
+                            .unwrap_or_else(|| bridge_candidate_id(library.metadata(index).row_id))
+                    };
+                    let guidance = score_guidance_for_gap(
+                        &mut GuidanceRuntime {
+                            host: guidance_host,
+                            library: &library,
+                            candidate_identities: &candidate_identities,
+                            weights: &guidance_weights,
+                        },
+                        &request.job_id,
+                        &track_id(left),
+                        &track_id(right),
+                        &acoustic,
+                    );
+                    guidance_signal_count += guidance.observed as usize;
+                    let target_weights = guidance_weights
+                        .target_share_weights(&acoustic, &guidance.contributions_by_candidate);
+                    smoothing_contributions.insert(position, guidance.contributions_by_candidate);
+                    smoothing_gaps.push(preview::AutomaticGap {
+                        original_position: position,
+                        left,
+                        right,
+                        direct_distance: gap.direct_distance,
+                        direct_percentile: gap.direct_percentile,
+                        semantics,
+                        guidance_adjustments: guidance.adjustment_by_candidate,
+                        guidance_target_weights: target_weights,
+                    });
+                    progress.update(
+                        "bridge_selection",
+                        format!(
+                            "Preparing transition smoothing {}/{}",
+                            position,
+                            spacing_route.len() - 1
+                        ),
+                        Some(position),
+                        Some(spacing_route.len() - 1),
+                    );
+                }
+                let smoothing = preview::select_automatic_bridges(
+                    &spacing_route,
+                    &smoothing_gaps,
+                    &preview::AutomaticSelectionConfig {
+                        max_added_tracks: max_added_tracks - spacing_additions,
+                        trigger_percentile: trigger_percentile
+                            .expect("smoothing requires a threshold"),
+                        variation_percent: request.selection.variation_percent,
+                        generation_seed: request.selection.generation_seed,
+                    },
+                    bridge_tracks,
+                    &learned_matrix,
+                    &bridge_config,
+                    &reference,
+                )
+                .map_err(|error| CommandFailure::new("BRIDGE_PREVIEW_FAILED", error.to_string()))?;
+                for decision in smoothing.decisions {
+                    let track_id = |index: usize| {
+                        original_ids_by_library
+                            .get(&index)
+                            .cloned()
+                            .unwrap_or_else(|| bridge_candidate_id(library.metadata(index).row_id))
+                    };
+                    smoothing_decisions.push(PreviewDecisionArtifact {
+                        original_position: decision.original_position,
+                        route_position: decision.route_position,
+                        left_track_id: track_id(decision.left),
+                        right_track_id: track_id(decision.right),
+                        direct_distance: decision.direct_distance,
+                        direct_percentile: decision.direct_percentile,
+                        triggering: decision.direct_percentile > trigger_percentile.unwrap_or(1.0),
+                        semantic_pool: decision.semantic_pool,
+                        reason: decision.reason,
+                        selected_bridge: decision.selected.as_ref().map(|selected| {
+                            bridge_candidate_artifact(
+                                &selected.evaluation,
+                                &selected.semantics,
+                                smoothing_contributions
+                                    .get(&decision.original_position)
+                                    .and_then(|candidates| {
+                                        candidates.get(&selected.evaluation.candidate)
+                                    })
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                &library,
+                            )
+                        }),
+                    });
+                }
+                selection.final_route = smoothing.final_route;
             }
             let final_route = &selection.final_route;
             selected_route_objective = route::evaluate_adaptive_sequence(
@@ -5889,34 +6271,90 @@ fn analyze_bridge_validated(
                 Some(gap_count),
                 Some(gap_count),
             );
-            SelectionPreviewArtifact::RepeatWindowRepair(Box::new(
-                RepeatWindowRepairSelectionArtifact {
-                    mode: "repeat_window_repair",
-                    processing_order: "global-minimum-repeat-window-repair",
-                    source_track_count: selected_library_route.len(),
-                    source_gap_count: gap_count,
-                    max_added_tracks: selection.max_added_tracks,
-                    feasible: true,
-                    added_track_count: selection.added_track_count,
-                    no_endpoint_tracks,
-                    original_subsequence_preserved,
-                    unique_membership,
-                    repeat_windows_satisfied,
-                    minimum_total_selected: true,
-                    final_sequence: sequence_artifact(final_route),
-                    decisions,
-                    search: ExactSearchArtifact {
-                        beam_width: EXACT_COUNT_BEAM_WIDTH,
-                        search_effort: None,
-                        candidate_limit: retained_candidate_limit,
-                        max_tracks_per_gap: selection.stats.max_tracks_per_gap,
-                        evaluated_states: selection.stats.evaluated_states,
-                        retained_states: selection.stats.retained_states,
-                        maximum_additions_found: selection.added_track_count,
-                        structural_upper_bound: max_added_tracks,
+            if request.extension.mode == "automatic_improvement" {
+                SelectionPreviewArtifact::AutomaticImprovement(
+                    AutomaticImprovementSelectionArtifact {
+                        mode: "automatic_improvement",
+                        processing_order: "spacing-then-smoothing",
+                        max_added_tracks,
+                        added_track_count: final_route.len() - selected_library_route.len(),
+                        spacing_additions,
+                        smoothing_additions: final_route.len()
+                            - selected_library_route.len()
+                            - spacing_additions,
+                        original_subsequence_preserved,
+                        unique_membership,
+                        repeat_windows_satisfied,
+                        minimum_spacing_selected: true,
+                        addition_reasons: decisions
+                            .iter()
+                            .filter_map(|decision| {
+                                decision.selected_bridge.as_ref().map(|bridge| {
+                                    AutomaticImprovementAdditionReason {
+                                        candidate_id: bridge.candidate_id.clone(),
+                                        reason: "spacing",
+                                    }
+                                })
+                            })
+                            .chain(smoothing_decisions.iter().filter_map(|decision| {
+                                decision.selected_bridge.as_ref().map(|bridge| {
+                                    AutomaticImprovementAdditionReason {
+                                        candidate_id: bridge.candidate_id.clone(),
+                                        reason: "smoothing",
+                                    }
+                                })
+                            }))
+                            .collect(),
+                        final_sequence: sequence_artifact(final_route),
+                        decisions: decisions
+                            .into_iter()
+                            .filter(|decision| decision.reason == preview::DecisionReason::Selected)
+                            .map(|decision| PreviewDecisionArtifact {
+                                original_position: decision.original_position,
+                                route_position: decision.route_position,
+                                left_track_id: decision.left_track_id,
+                                right_track_id: decision.right_track_id,
+                                direct_distance: decision.direct_distance,
+                                direct_percentile: decision.direct_percentile,
+                                triggering: true,
+                                semantic_pool: decision.semantic_pool,
+                                reason: decision.reason,
+                                selected_bridge: decision.selected_bridge,
+                            })
+                            .chain(smoothing_decisions)
+                            .collect(),
                     },
-                },
-            ))
+                )
+            } else {
+                SelectionPreviewArtifact::RepeatWindowRepair(Box::new(
+                    RepeatWindowRepairSelectionArtifact {
+                        mode: "repeat_window_repair",
+                        processing_order: "global-minimum-repeat-window-repair",
+                        source_track_count: selected_library_route.len(),
+                        source_gap_count: gap_count,
+                        max_added_tracks: selection.max_added_tracks,
+                        feasible: true,
+                        added_track_count: selection.added_track_count,
+                        no_endpoint_tracks,
+                        original_subsequence_preserved,
+                        unique_membership,
+                        repeat_windows_satisfied,
+                        minimum_total_selected: true,
+                        final_sequence: sequence_artifact(final_route),
+                        decisions,
+                        search: ExactSearchArtifact {
+                            beam_width: EXACT_COUNT_BEAM_WIDTH,
+                            search_effort: None,
+                            candidate_limit: retained_candidate_limit,
+                            max_tracks_per_gap: selection.stats.max_tracks_per_gap,
+                            evaluated_states: selection.stats.evaluated_states,
+                            retained_states: selection.stats.retained_states,
+                            maximum_additions_found: selection.added_track_count,
+                            structural_upper_bound: max_added_tracks,
+                        },
+                    },
+                ))
+            }
         }
         "exact_count" | "destination_route" => {
             let destination_route = request.extension.mode == "destination_route";
@@ -6742,8 +7180,10 @@ fn analyze_bridge_validated(
         None,
     );
 
-    let gap_context_mode = if matches!(request.extension.mode.as_str(), "automatic" | "exact_count")
-        && request.scoring.algorithm == "adaptive"
+    let gap_context_mode = if matches!(
+        request.extension.mode.as_str(),
+        "automatic" | "automatic_improvement" | "exact_count"
+    ) && request.scoring.algorithm == "adaptive"
     {
         Some(match request.extension.gap_context_mode.as_deref() {
             Some("frozen") => "frozen",
@@ -6762,11 +7202,15 @@ fn analyze_bridge_validated(
             "fixed-source-relevance-then-rolling-route-context",
             "complete immutable source set for relevance; preceding selected tracks for routing",
         ),
-        "automatic" | "exact_count" if gap_context_mode == Some("frozen") => (
-            "frozen-per-source-gap-context",
-            "preceding route context ending at each original gap's left anchor",
-        ),
-        "automatic" | "exact_count" => (
+        "automatic" | "automatic_improvement" | "exact_count"
+            if gap_context_mode == Some("frozen") =>
+        {
+            (
+                "frozen-per-source-gap-context",
+                "preceding route context ending at each original gap's left anchor",
+            )
+        }
+        "automatic" | "automatic_improvement" | "exact_count" => (
             "rolling-evolving-gap-context",
             "up-to-seed-limit preceding tracks, including additions already placed",
         ),
@@ -7092,6 +7536,7 @@ fn analyze_bridge_request_with_options(
     if !matches!(
         request.extension.mode.as_str(),
         "automatic"
+            | "automatic_improvement"
             | "exact_count"
             | "fixed_gap_count"
             | "repeat_window_repair"
@@ -7115,7 +7560,11 @@ fn analyze_bridge_request_with_options(
         }
         if !matches!(
             request.extension.mode.as_str(),
-            "automatic" | "exact_count" | "fixed_gap_count" | "repeat_window_repair"
+            "automatic"
+                | "automatic_improvement"
+                | "exact_count"
+                | "fixed_gap_count"
+                | "repeat_window_repair"
         ) {
             return Err(CommandFailure::new(
                 "GAP_CONTEXT_MODE_UNSUPPORTED",
@@ -7840,6 +8289,363 @@ mod tests {
         assert!(version_metadata_json().contains("\"guidance_spi_v2\":true"));
         assert!(version_metadata_json().contains("\"fixed_gap_count_v1\":true"));
         assert!(version_metadata_json().contains("\"repeat_window_repair_v1\":true"));
+        assert!(version_metadata_json().contains("\"automatic_improvement_v1\":true"));
+    }
+
+    #[test]
+    fn automatic_improvement_contract_accepts_independent_goals() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = repository.join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        for (spacing, smoothing) in [(true, false), (false, true), (true, true)] {
+            request["extension"] = serde_json::json!({
+                "mode": "automatic_improvement",
+                "satisfy_repeat_windows": spacing,
+                "smooth_transitions": smoothing,
+                "max_added_tracks": 4,
+                "trigger_percentile": 0.7
+            });
+            assert!(validate_json(&request, REQUEST_SCHEMA, "request").is_ok());
+            assert!(serde_json::from_value::<Request>(request.clone()).is_ok());
+        }
+    }
+
+    #[test]
+    fn automatic_improvement_contract_rejects_no_goals() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "automatic_improvement",
+            "satisfy_repeat_windows": true,
+            "smooth_transitions": false,
+            "max_added_tracks": 4,
+            "trigger_percentile": 0.7
+        });
+        assert!(validate_json(&request, REQUEST_SCHEMA, "request").is_ok());
+        request["extension"]["satisfy_repeat_windows"] = Value::Bool(false);
+        assert!(validate_json(&request, REQUEST_SCHEMA, "request").is_err());
+    }
+
+    #[test]
+    fn automatic_improvement_contract_rejects_unrelated_extension_fields() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "automatic_improvement", "satisfy_repeat_windows": true,
+            "smooth_transitions": false, "max_added_tracks": 3, "tracks_per_gap": 1
+        });
+        assert!(validate_json(&request, REQUEST_SCHEMA, "request").is_err());
+    }
+
+    #[test]
+    fn trusted_automatic_improvement_rejects_disabled_goals_before_loading_data() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "automatic_improvement", "satisfy_repeat_windows": false,
+            "smooth_transitions": false, "max_added_tracks": 0, "trigger_percentile": 0.7
+        });
+        request["artifacts"]["database"]["path"] = Value::from("does-not-exist.db");
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-automatic-improvement-trusted-invalid-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec(&request).unwrap()).unwrap();
+        let error = analyze_bridge_request_with_options(
+            &temporary,
+            &RuntimeOptions {
+                timings: false,
+                cache_dir: None,
+                progress_path: None,
+                validate_contracts: false,
+            },
+        )
+        .unwrap_err();
+        let _ = fs::remove_file(temporary);
+        assert_eq!(error.code, "AUTOMATIC_IMPROVEMENT_INVALID");
+    }
+
+    #[test]
+    fn automatic_improvement_smoothing_only_accepts_a_valid_source() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/preserve-automatic-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "automatic_improvement",
+            "satisfy_repeat_windows": false,
+            "smooth_transitions": true,
+            "max_added_tracks": 1,
+            "trigger_percentile": 0.7,
+            "gap_context_mode": "frozen"
+        });
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-automatic-improvement-smoothing-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec(&request).unwrap()).unwrap();
+        let result = analyze_bridge_request(&temporary);
+        let _ = fs::remove_file(temporary);
+        let artifact = serde_json::to_value(result.unwrap()).unwrap();
+        assert_eq!(
+            artifact["selection_preview"]["mode"],
+            "automatic_improvement"
+        );
+        assert_eq!(artifact["selection_preview"]["spacing_additions"], 0);
+        assert_eq!(artifact["scoring_provenance"]["gap_context_mode"], "frozen");
+        assert!(artifact["selection_preview"]["repeat_windows_satisfied"]
+            .as_bool()
+            .unwrap());
+    }
+
+    #[test]
+    fn automatic_improvement_spacing_only_repairs_repeats() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "automatic_improvement",
+            "satisfy_repeat_windows": true,
+            "smooth_transitions": false,
+            "max_added_tracks": 2,
+            "candidate_limit": 16,
+            "shortlist_limit": 256
+        });
+        request["repeat_windows"]["artist"] = Value::from(2);
+        request["source_tracks"][1]["artist"] = request["source_tracks"][0]["artist"].clone();
+        for position in [0, 1] {
+            request["source_tracks"][position]["artist_identity_keys"] =
+                serde_json::json!(["artist-mbid:repeat-conflict"]);
+            request["source_tracks"][position]["primary_artist_identity_key"] =
+                Value::from("artist-mbid:repeat-conflict");
+        }
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-automatic-improvement-spacing-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec(&request).unwrap()).unwrap();
+        let result = analyze_bridge_request(&temporary);
+        let _ = fs::remove_file(temporary);
+        let artifact = serde_json::to_value(result.unwrap()).unwrap();
+        assert_eq!(artifact["selection_preview"]["spacing_additions"], 2);
+        assert_eq!(artifact["selection_preview"]["smoothing_additions"], 0);
+        assert_eq!(artifact["selection_preview"]["added_track_count"], 2);
+        assert!(artifact["selection_preview"]["repeat_windows_satisfied"]
+            .as_bool()
+            .unwrap());
+    }
+
+    #[test]
+    fn automatic_improvement_spacing_only_accepts_an_already_valid_source() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "automatic_improvement",
+            "satisfy_repeat_windows": true,
+            "smooth_transitions": false,
+            "max_added_tracks": 2
+        });
+        request["repeat_windows"]["artist"] = Value::from(0);
+        request["repeat_windows"]["album"] = Value::from(0);
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-automatic-improvement-valid-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec(&request).unwrap()).unwrap();
+        let result = analyze_bridge_request(&temporary);
+        let _ = fs::remove_file(temporary);
+        let artifact = serde_json::to_value(result.unwrap()).unwrap();
+        assert_eq!(artifact["selection_preview"]["added_track_count"], 0);
+        assert!(artifact["selection_preview"]["repeat_windows_satisfied"]
+            .as_bool()
+            .unwrap());
+    }
+
+    #[test]
+    fn automatic_improvement_combines_spacing_and_smoothing_with_one_budget() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "automatic_improvement",
+            "satisfy_repeat_windows": true,
+            "smooth_transitions": true,
+            "max_added_tracks": 3,
+            "trigger_percentile": 0.0,
+            "candidate_limit": 16,
+            "shortlist_limit": 256
+        });
+        request["repeat_windows"]["artist"] = Value::from(2);
+        request["source_tracks"][1]["artist"] = request["source_tracks"][0]["artist"].clone();
+        for position in [0, 1] {
+            request["source_tracks"][position]["artist_identity_keys"] =
+                serde_json::json!(["artist-mbid:repeat-conflict"]);
+            request["source_tracks"][position]["primary_artist_identity_key"] =
+                Value::from("artist-mbid:repeat-conflict");
+        }
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-automatic-improvement-both-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec(&request).unwrap()).unwrap();
+        let result = analyze_bridge_request(&temporary);
+        let _ = fs::remove_file(temporary);
+        let artifact = serde_json::to_value(result.unwrap()).unwrap();
+        let preview = &artifact["selection_preview"];
+        assert_eq!(preview["spacing_additions"], 2);
+        assert_eq!(preview["minimum_spacing_selected"], true);
+        validate_json(
+            &artifact,
+            include_str!("../schemas/bridge-analysis-artifact-v1.schema.json"),
+            "bridge artifact",
+        )
+        .expect("the complete combined result must satisfy the published schema");
+        assert_eq!(
+            preview["addition_reasons"].as_array().unwrap().len(),
+            preview["added_track_count"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            preview["addition_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["reason"] == "spacing")
+                .count(),
+            2
+        );
+        assert_eq!(
+            preview["addition_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["reason"] == "smoothing")
+                .count(),
+            1
+        );
+        assert!(
+            preview["smoothing_additions"].as_u64().unwrap() > 0,
+            "the fixture must exercise smoothing after a spacing insertion"
+        );
+        let selected = preview["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|decision| decision["reason"] == "selected")
+            .collect::<Vec<_>>();
+        let spacing_ids = selected
+            .iter()
+            .take(2)
+            .map(|decision| {
+                decision["selected_bridge"]["candidate_id"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            selected.iter().skip(2).any(|decision| {
+                spacing_ids.contains(&decision["left_track_id"].as_str().unwrap())
+                    || spacing_ids.contains(&decision["right_track_id"].as_str().unwrap())
+            }),
+            "a smoothing decision must use a newly inserted spacing track as an anchor"
+        );
+        assert!(preview["added_track_count"].as_u64().unwrap() <= 3);
+        assert_eq!(
+            preview["added_track_count"].as_u64().unwrap(),
+            preview["spacing_additions"].as_u64().unwrap()
+                + preview["smoothing_additions"].as_u64().unwrap()
+        );
+        assert!(preview["repeat_windows_satisfied"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn automatic_improvement_reserves_the_full_budget_for_required_spacing() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "automatic_improvement", "satisfy_repeat_windows": true,
+            "smooth_transitions": true, "max_added_tracks": 2,
+            "trigger_percentile": 0.0, "candidate_limit": 16, "shortlist_limit": 256
+        });
+        request["repeat_windows"]["artist"] = Value::from(2);
+        request["source_tracks"][1]["artist"] = request["source_tracks"][0]["artist"].clone();
+        for position in [0, 1] {
+            request["source_tracks"][position]["artist_identity_keys"] =
+                serde_json::json!(["artist-mbid:repeat-conflict"]);
+            request["source_tracks"][position]["primary_artist_identity_key"] =
+                Value::from("artist-mbid:repeat-conflict");
+        }
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-automatic-improvement-budget-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec(&request).unwrap()).unwrap();
+        let result = analyze_bridge_request(&temporary);
+        let _ = fs::remove_file(temporary);
+        let artifact = serde_json::to_value(result.unwrap()).unwrap();
+        assert_eq!(artifact["selection_preview"]["spacing_additions"], 2);
+        assert_eq!(artifact["selection_preview"]["smoothing_additions"], 0);
+        assert_eq!(artifact["selection_preview"]["added_track_count"], 2);
+    }
+
+    #[test]
+    fn automatic_improvement_fails_without_partial_result_when_spacing_exceeds_budget() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "automatic_improvement", "satisfy_repeat_windows": true,
+            "smooth_transitions": true, "max_added_tracks": 1,
+            "trigger_percentile": 0.0, "candidate_limit": 16, "shortlist_limit": 256
+        });
+        request["repeat_windows"]["artist"] = Value::from(2);
+        request["source_tracks"][1]["artist"] = request["source_tracks"][0]["artist"].clone();
+        for position in [0, 1] {
+            request["source_tracks"][position]["artist_identity_keys"] =
+                serde_json::json!(["artist-mbid:repeat-conflict"]);
+            request["source_tracks"][position]["primary_artist_identity_key"] =
+                Value::from("artist-mbid:repeat-conflict");
+        }
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-automatic-improvement-insufficient-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec(&request).unwrap()).unwrap();
+        let result = analyze_bridge_request(&temporary);
+        let _ = fs::remove_file(temporary);
+        let failure = result.expect_err("a partial repair must not be returned");
+        assert_eq!(failure.code, "REPEAT_WINDOW_REPAIR_BUDGET_INSUFFICIENT");
+    }
+
+    #[test]
+    fn automatic_improvement_smooths_even_when_spacing_is_unnecessary() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/preserve-automatic-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["extension"] = serde_json::json!({
+            "mode": "automatic_improvement",
+            "satisfy_repeat_windows": true,
+            "smooth_transitions": true,
+            "max_added_tracks": 1,
+            "trigger_percentile": 0.0
+        });
+        request["repeat_windows"]["artist"] = Value::from(0);
+        request["repeat_windows"]["album"] = Value::from(0);
+        let temporary = std::env::temp_dir().join(format!(
+            "bliss-automatic-improvement-no-spacing-{}.json",
+            std::process::id()
+        ));
+        fs::write(&temporary, serde_json::to_vec(&request).unwrap()).unwrap();
+        let result = analyze_bridge_request(&temporary);
+        let _ = fs::remove_file(temporary);
+        let artifact = serde_json::to_value(result.unwrap()).unwrap();
+        let preview = &artifact["selection_preview"];
+        assert_eq!(preview["spacing_additions"], 0);
+        assert_eq!(preview["smoothing_additions"], 1);
+        assert!(preview["repeat_windows_satisfied"].as_bool().unwrap());
     }
 
     #[test]
@@ -8808,6 +9614,22 @@ mod tests {
         )
         .unwrap();
         let provider_candidate = provider_candidate(0, &library, &identities);
+        let anchor = inserted_anchor_semantic_identity(0, &library, &identities);
+        assert_eq!(
+            anchor.recording_mbid.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert!(anchor
+            .artist_ids
+            .contains(&"22222222-2222-2222-2222-222222222222".to_owned()));
+        assert_eq!(
+            anchor.title_name,
+            semantic::normalize_identity("Candidate title")
+        );
+        assert_eq!(
+            anchor.artist_name,
+            semantic::normalize_identity("Candidate artist")
+        );
         assert_eq!(provider_candidate.lms_urlmd5.as_deref(), Some("url-0"));
         assert_eq!(provider_candidate.title.as_deref(), Some("Candidate title"));
         assert_eq!(
