@@ -95,3 +95,9 @@ cargo test --all-features
 
 See [CONTRIBUTING.md](CONTRIBUTING.md), [error codes](docs/ERROR_CODES.md), and
 the [synthetic fixtures](fixtures/synthetic/README.md) for contributor detail.
+
+The release workflow builds a source snapshot from its exact Git commit and
+vendors the locked Cargo dependencies. After unpacking, run
+`cargo build --locked --offline` from `source/` with the required Rust and platform build
+tools installed. `SOURCE_MANIFEST.json` lists dependency metadata and available
+notice files; it is not a legal review. Existing releases may predate this step.

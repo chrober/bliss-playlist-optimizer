@@ -34,6 +34,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+      - run: python tests/test_source_archive.py
 
   build:
     name: Build ${{ matrix.asset }}
@@ -123,9 +124,28 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  source:
+    name: Build vendored source snapshot
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Capture the same source commit and locked dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p source-assets
+          python scripts/build_source_archive.py --repo . --commit "$GITHUB_SHA" --output source-assets/bliss-playlist-optimizer-source.tar.gz
+          (cd source-assets && sha256sum bliss-playlist-optimizer-source.tar.gz > bliss-playlist-optimizer-source.tar.gz.sha256)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bliss-playlist-optimizer-source
+          path: source-assets/*
+          if-no-files-found: error
+
   release:
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, source]
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != 'true' }}
     steps:
       - uses: actions/checkout@v4
@@ -180,6 +200,11 @@ jobs:
             prerelease_flag=(--prerelease)
           fi
 
+          remote_tag="$(git ls-remote --tags origin "refs/tags/$TAG")"
+          if [ -n "$remote_tag" ]; then
+            git fetch --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+            test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$GITHUB_SHA" || { echo 'Release tag points to a different source commit' >&2; exit 1; }
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release-assets/* --clobber
           else
