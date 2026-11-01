@@ -136,7 +136,9 @@ jobs:
           set -euo pipefail
           mkdir -p source-assets
           python scripts/build_source_archive.py --repo . --commit "$GITHUB_SHA" --output source-assets/bliss-playlist-optimizer-source.tar.gz
+          cp third-party-licenses/nugine-simd-0.8.0-LICENSE source-assets/bliss-playlist-optimizer-third-party-nugine-LICENSE
           (cd source-assets && sha256sum bliss-playlist-optimizer-source.tar.gz > bliss-playlist-optimizer-source.tar.gz.sha256)
+          (cd source-assets && sha256sum bliss-playlist-optimizer-third-party-nugine-LICENSE > bliss-playlist-optimizer-third-party-nugine-LICENSE.sha256)
       - uses: actions/upload-artifact@v4
         with:
           name: bliss-playlist-optimizer-source
