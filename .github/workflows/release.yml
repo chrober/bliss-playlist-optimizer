@@ -35,6 +35,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
       - run: python tests/test_source_archive.py
+      - run: python tests/test_license_bundle.py
 
   build:
     name: Build ${{ matrix.asset }}
@@ -136,8 +137,10 @@ jobs:
           set -euo pipefail
           mkdir -p source-assets
           python scripts/build_source_archive.py --repo . --commit "$GITHUB_SHA" --output source-assets/bliss-playlist-optimizer-source.tar.gz
+          python scripts/build_license_bundle.py source-assets/bliss-playlist-optimizer-source.tar.gz source-assets/bliss-playlist-optimizer-third-party-licenses.zip
           cp third-party-licenses/nugine-simd-0.8.0-LICENSE source-assets/bliss-playlist-optimizer-third-party-nugine-LICENSE
           (cd source-assets && sha256sum bliss-playlist-optimizer-source.tar.gz > bliss-playlist-optimizer-source.tar.gz.sha256)
+          (cd source-assets && sha256sum bliss-playlist-optimizer-third-party-licenses.zip > bliss-playlist-optimizer-third-party-licenses.zip.sha256)
           (cd source-assets && sha256sum bliss-playlist-optimizer-third-party-nugine-LICENSE > bliss-playlist-optimizer-third-party-nugine-LICENSE.sha256)
       - uses: actions/upload-artifact@v4
         with:
