@@ -42,7 +42,7 @@
       ]
     },
     "selected_strategy": {
-      "enum": ["adaptive", "adaptive-arc", "preserve-order"]
+      "enum": ["adaptive", "adaptive-arc", "preserve-order", "fixed-source-extension-preserve-order"]
     },
     "source_track_ids": { "$ref": "#/$defs/track_ids" },
     "selected_track_ids": { "$ref": "#/$defs/track_ids" },
@@ -96,7 +96,6 @@
     "performance": { "$ref": "#/$defs/performance" },
     "gaps": {
       "type": "array",
-      "minItems": 1,
       "items": { "$ref": "#/$defs/gap" }
     },
     "selection_preview": {
@@ -129,6 +128,10 @@
       }
     }
   },
+  "allOf": [{
+    "if": { "properties": { "selection_preview": { "properties": { "mode": { "const": "fixed_source_extension" } }, "required": ["mode"] } } },
+    "else": { "properties": { "gaps": { "minItems": 1 } } }
+  }],
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "track_ids": {
@@ -338,10 +341,20 @@
         "processing_order": {
           "const": "full-source-relevance-then-complete-membership-route"
         },
-        "target_track_count": { "type": "integer", "minimum": 3 },
-        "requested_added_tracks": { "type": "integer", "minimum": 1 },
+        "target_track_count": { "type": "integer", "minimum": 2 },
+        "requested_added_tracks": { "type": "integer", "minimum": 0 },
         "feasible": { "const": true },
-        "added_track_count": { "type": "integer", "minimum": 1 },
+        "added_track_count": { "type": "integer", "minimum": 0 },
+        "duration_result": {
+          "type": "object", "additionalProperties": false,
+          "required": ["source_ms", "minimum_ms", "maximum_ms", "actual_ms"],
+          "properties": {
+            "source_ms": { "type": "integer", "minimum": 1 },
+            "minimum_ms": { "type": "integer", "minimum": 0 },
+            "maximum_ms": { "type": "integer", "minimum": 1 },
+            "actual_ms": { "type": "integer", "minimum": 1 }
+          }
+        },
         "original_subsequence_preserved": { "type": "boolean" },
         "unique_membership": { "const": true },
         "relevance_reference_track_count": { "type": "integer", "minimum": 2 },
@@ -363,7 +376,7 @@
             "arc_error"
           ],
           "properties": {
-            "strategy": { "enum": ["adaptive", "adaptive-arc"] },
+            "strategy": { "enum": ["adaptive", "adaptive-arc", "fixed-source-extension-preserve-order"] },
             "transition_sum": { "type": "number", "minimum": 0 },
             "worst_transition": { "type": "number", "minimum": 0 },
             "objective": { "type": "number", "minimum": 0 },
@@ -391,12 +404,12 @@
         },
         "final_sequence": {
           "type": "array",
-          "minItems": 3,
+          "minItems": 2,
           "items": { "$ref": "#/$defs/preview_sequence_entry" }
         },
         "selected_additions": {
           "type": "array",
-          "minItems": 1,
+          "minItems": 0,
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -427,7 +440,17 @@
             }
           }
         }
-      }
+      },
+      "allOf": [{
+        "if": { "not": { "required": ["duration_result"] } },
+        "then": { "properties": {
+          "target_track_count": { "minimum": 3 },
+          "requested_added_tracks": { "minimum": 1 },
+          "added_track_count": { "minimum": 1 },
+          "final_sequence": { "minItems": 3 },
+          "selected_additions": { "minItems": 1 }
+        } }
+      }]
     },
     "fixed_gap_count_selection_preview": {
       "type": "object",

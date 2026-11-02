@@ -55,6 +55,50 @@ fn assert_valid(schema_path: &str, example_path: &str) {
 }
 
 #[test]
+fn fixed_source_duration_request_has_typed_inclusive_bounds() {
+    let schema = read_json(&repository_path("schemas/optimizer-request-v1.schema.json"));
+    let mut request = read_json(&repository_path(
+        "fixtures/synthetic/automatic-bridge-request.json",
+    ));
+    request["extension"] = serde_json::json!({
+        "mode": "fixed_source_extension", "target_track_count": 3,
+        "duration_target": {"source_ms": 200000, "minimum_ms": 300000, "maximum_ms": 330000}
+    });
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&request));
+    request["extension"]["duration_target"]["minimum_ms"] = serde_json::json!(-1);
+    assert!(!validator.is_valid(&request));
+    request["extension"]["duration_target"]["minimum_ms"] = serde_json::json!(300000);
+    request["extension"]["mode"] = serde_json::json!("none");
+    assert!(!validator.is_valid(&request));
+}
+
+#[test]
+fn fixed_source_duration_result_accepts_zero_additions_only_with_duration_proof() {
+    let root = read_json(&repository_path(
+        "schemas/bridge-analysis-artifact-v1.schema.json",
+    ));
+    let schema = serde_json::json!({"$schema": root["$schema"], "$defs": root["$defs"],
+        "$ref": "#/$defs/fixed_source_extension_selection_preview"});
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut preview = serde_json::json!({
+        "mode":"fixed_source_extension", "processing_order":"full-source-relevance-then-complete-membership-route",
+        "target_track_count":2,"requested_added_tracks":0,"feasible":true,"added_track_count":0,
+        "original_subsequence_preserved":true,"unique_membership":true,"relevance_reference_track_count":2,
+        "relevance_summary":{"minimum_distance":0,"mean_distance":0,"maximum_distance":0},
+        "route_summary":{"strategy":"adaptive","transition_sum":0,"worst_transition":0,"objective":0,"arc_error":0},
+        "acceptance_proofs":{"exact_target_satisfied":true,"all_source_tracks_retained_once":true,
+            "all_additions_from_local_inventory":true,"unique_membership":true,"artist_repeat_window_satisfied":true,
+            "album_repeat_window_satisfied":true,"track_repeat_window_satisfied_by_unique_membership":true},
+        "final_sequence":[{"position":0,"kind":"original","track_id":"a"},{"position":1,"kind":"original","track_id":"b"}],
+        "selected_additions":[], "duration_result":{"source_ms":120000,"minimum_ms":100000,"maximum_ms":130000,"actual_ms":120000}
+    });
+    assert!(validator.is_valid(&preview));
+    preview.as_object_mut().unwrap().remove("duration_result");
+    assert!(!validator.is_valid(&preview));
+}
+
+#[test]
 fn published_examples_satisfy_their_v1_contracts() {
     for (schema, example) in [
         (

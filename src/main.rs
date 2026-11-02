@@ -178,6 +178,8 @@ struct CandidateIdentity {
     candidate_id: String,
     row_id: u64,
     #[serde(default)]
+    duration_ms: Option<u64>,
+    #[serde(default)]
     lms_urlmd5: Option<String>,
     #[serde(default)]
     title: Option<String>,
@@ -272,6 +274,7 @@ struct ExtensionSettings {
     search_effort: Option<String>,
     additional_track_count: Option<usize>,
     target_track_count: Option<usize>,
+    duration_target: Option<DurationTargetRequest>,
     allow_opening_track: Option<bool>,
     allow_closing_track: Option<bool>,
     candidate_limit: Option<usize>,
@@ -283,6 +286,13 @@ struct ExtensionSettings {
     trigger_percentile: Option<f64>,
     direct_transition_caution: Option<String>,
     shortlist_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DurationTargetRequest {
+    source_ms: u64,
+    minimum_ms: u64,
+    maximum_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1216,6 +1226,8 @@ struct FixedSourceExtensionSelectionArtifact {
     requested_added_tracks: usize,
     feasible: bool,
     added_track_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_result: Option<DurationResultArtifact>,
     original_subsequence_preserved: bool,
     unique_membership: bool,
     relevance_reference_track_count: usize,
@@ -1226,6 +1238,46 @@ struct FixedSourceExtensionSelectionArtifact {
     acceptance_proofs: FixedSourceExtensionAcceptanceProofsArtifact,
     final_sequence: Vec<PreviewSequenceEntryArtifact>,
     selected_additions: Vec<FixedSourceExtensionAdditionArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct DurationResultArtifact {
+    source_ms: u64,
+    minimum_ms: u64,
+    maximum_ms: u64,
+    actual_ms: u64,
+}
+
+fn checked_duration_result(
+    target: &DurationTargetRequest,
+    additions: &[usize],
+    durations: &HashMap<usize, u64>,
+) -> Result<DurationResultArtifact, CommandFailure> {
+    let mut actual_ms = target.source_ms;
+    for candidate in additions {
+        let duration = durations
+            .get(candidate)
+            .copied()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                CommandFailure::new("DURATION_MISSING", "an addition has no valid duration")
+            })?;
+        actual_ms = actual_ms.checked_add(duration).ok_or_else(|| {
+            CommandFailure::new("DURATION_OVERFLOW", "playlist duration overflowed")
+        })?;
+    }
+    if actual_ms < target.minimum_ms || actual_ms > target.maximum_ms {
+        return Err(CommandFailure::new(
+            "DURATION_OUTSIDE_RANGE",
+            "the result is outside the requested duration range",
+        ));
+    }
+    Ok(DurationResultArtifact {
+        source_ms: target.source_ms,
+        minimum_ms: target.minimum_ms,
+        maximum_ms: target.maximum_ms,
+        actual_ms,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -1383,7 +1435,14 @@ struct FixedSourceExtensionContext<'a> {
     selection: SelectionSettings,
     shortlist_limit: usize,
     guidance: Option<FixedSourceGuidance<'a>>,
+    duration_goal: Option<DurationGoal<'a>>,
     progress: &'a mut ProgressReporter,
+}
+
+struct DurationGoal<'a> {
+    minimum_added_ms: u64,
+    maximum_added_ms: u64,
+    candidate_durations: &'a HashMap<usize, u64>,
 }
 
 struct FixedSourceGuidance<'a> {
@@ -2021,7 +2080,7 @@ fn usage() -> &'static str {
 
 fn version_metadata_json() -> String {
     format!(
-        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"guidance_spi_v2\":true,\"fixed_gap_count_v1\":true,\"repeat_window_repair_v1\":true}}"
+        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{VERSION}\",\"core_api\":\"0.1\",\"progress_sidecar\":true,\"trusted_request\":true,\"genre_policy\":true,\"candidate_library_scope\":true,\"destination_blocks\":true,\"guidance_spi_v2\":true,\"fixed_gap_count_v1\":true,\"repeat_window_repair_v1\":true,\"duration_extension_v1\":true}}"
     )
 }
 
@@ -3465,9 +3524,12 @@ fn select_fixed_source_extension(
         selection,
         shortlist_limit,
         mut guidance,
+        duration_goal,
         progress,
     } = context;
-    if target_track_count <= source_library_indices.len() {
+    if target_track_count < source_library_indices.len()
+        || (target_track_count == source_library_indices.len() && duration_goal.is_none())
+    {
         return Err(CommandFailure::new(
             "FIXED_SOURCE_EXTENSION_TARGET_INVALID",
             format!(
@@ -3768,7 +3830,82 @@ fn select_fixed_source_extension(
         "FIXED_SOURCE_EXTENSION_INFEASIBLE",
         "no fixed-source extension target was evaluated",
     );
-    for candidate_target_track_count in target_track_count..=maximum_target_track_count {
+    let plans = if let Some(goal) = &duration_goal {
+        let candidates = selection_order
+            .iter()
+            .filter_map(|(index, _)| {
+                goal.candidate_durations
+                    .get(index)
+                    .copied()
+                    .map(
+                        |duration_ms| bliss_playlist_optimizer::duration_membership::Candidate {
+                            id: *index,
+                            duration_ms,
+                        },
+                    )
+            })
+            .collect::<Vec<_>>();
+        progress.update(
+            "extension_membership_selection",
+            format!(
+                "Searching duration-compatible combinations among {} candidates",
+                candidates.len()
+            ),
+            None,
+            None,
+        );
+        let search = bliss_playlist_optimizer::duration_membership::find_memberships_with_filter(
+            &candidates,
+            goal.minimum_added_ms,
+            goal.maximum_added_ms,
+            maximum_requested,
+            100_000,
+            128,
+            |additions| {
+                let total = source_library_indices.len() + additions.len();
+                let artist_capacity = if route_config.artist_window == 0 {
+                    usize::MAX
+                } else {
+                    total.div_ceil(route_config.artist_window + 1)
+                };
+                let album_capacity = if route_config.album_window == 0 {
+                    usize::MAX
+                } else {
+                    total.div_ceil(route_config.album_window + 1)
+                };
+                let mut artists = HashMap::<&str, usize>::new();
+                let mut albums = HashMap::<&str, usize>::new();
+                for index in source_library_indices.iter().chain(additions.iter()) {
+                    for artist in route::artist_repeat_capacity_keys(&tracks[*index]) {
+                        *artists.entry(artist).or_default() += 1;
+                    }
+                    *albums.entry(&tracks[*index].album_key).or_default() += 1;
+                }
+                artists.values().all(|count| *count <= artist_capacity)
+                    && albums.values().all(|count| *count <= album_capacity)
+            },
+        );
+        if search.memberships.is_empty() {
+            return Err(CommandFailure::new(
+                "DURATION_TARGET_NOT_FOUND",
+                if search.search_limited {
+                    "the bounded search did not find an eligible combination within the duration range"
+                } else {
+                    "no eligible combination was found within the duration range"
+                },
+            ));
+        }
+        search
+            .memberships
+            .into_iter()
+            .map(|members| (source_library_indices.len() + members.len(), Some(members)))
+            .collect::<Vec<_>>()
+    } else {
+        (target_track_count..=maximum_target_track_count)
+            .map(|count| (count, None))
+            .collect::<Vec<_>>()
+    };
+    for (candidate_target_track_count, duration_members) in plans {
         let requested = candidate_target_track_count - source_library_indices.len();
         // Membership selection follows relevance order while applying the
         // necessary per-key capacity implied by each repeat window. Routing then
@@ -3776,7 +3913,7 @@ fn select_fixed_source_extension(
         // repeated-artist or repeated-album seed set feasible.
         progress.update(
             "extension_membership_selection",
-            if dynamic_target {
+            if dynamic_target && duration_goal.is_none() {
                 format!(
                     "Trying repeat-safe target {candidate_target_track_count}/{maximum_target_track_count}: selecting {requested} additions from {} ordered candidates",
                     selection_order.len()
@@ -3823,7 +3960,18 @@ fn select_fixed_source_extension(
         let mut membership = selected_library_route.to_vec();
         let mut additions = Vec::with_capacity(requested);
         let mut considered = 0usize;
+        let duration_members =
+            duration_members.map(|members| members.into_iter().collect::<HashSet<_>>());
         for (candidate, distance) in selection_order.iter().copied() {
+            if requested == 0 {
+                break;
+            }
+            if duration_members
+                .as_ref()
+                .is_some_and(|members| !members.contains(&candidate))
+            {
+                continue;
+            }
             considered += 1;
             let artists = route::artist_repeat_capacity_keys(&tracks[candidate]);
             let album = tracks[candidate].album_key.as_str();
@@ -3994,7 +4142,10 @@ fn select_fixed_source_extension(
             );
             continue;
         }
-        if dynamic_target && candidate_target_track_count > target_track_count {
+        if dynamic_target
+            && duration_goal.is_none()
+            && candidate_target_track_count > target_track_count
+        {
             progress.update(
                 "extension_route_search",
                 format!(
@@ -6567,27 +6718,84 @@ fn analyze_bridge_validated(
             }))
         }
         "fixed_source_extension" => {
-            let target_track_count = request.extension.target_track_count.ok_or_else(|| {
-                CommandFailure::new(
-                    "FIXED_SOURCE_EXTENSION_TARGET_REQUIRED",
-                    "fixed_source_extension extension requires extension.target_track_count",
-                )
-            })?;
+            let configured_target_count =
+                request.extension.target_track_count.ok_or_else(|| {
+                    CommandFailure::new(
+                        "FIXED_SOURCE_EXTENSION_TARGET_REQUIRED",
+                        "fixed_source_extension extension requires extension.target_track_count",
+                    )
+                })?;
+            let duration_target = request.extension.duration_target.as_ref();
+            if let Some(target) = duration_target {
+                if target.minimum_ms > target.maximum_ms || target.source_ms > target.maximum_ms {
+                    return Err(CommandFailure::new(
+                        "DURATION_TARGET_INVALID",
+                        "the source duration or target interval is invalid",
+                    ));
+                }
+                if request.artifacts.candidate_identities.is_none() {
+                    return Err(CommandFailure::new(
+                        "DURATION_CANDIDATES_REQUIRED",
+                        "duration extension requires a local candidate identity inventory",
+                    ));
+                }
+            }
+            let source_count = source_library_indices.len();
+            let source_already_satisfies = duration_target.is_some_and(|target| {
+                target.source_ms >= target.minimum_ms && target.source_ms <= target.maximum_ms
+            });
+            let target_track_count = if duration_target.is_some() {
+                source_count + usize::from(!source_already_satisfies)
+            } else {
+                configured_target_count
+            };
+            let duration_candidates = candidate_identities
+                .iter()
+                .filter_map(|(index, identity)| {
+                    identity
+                        .duration_ms
+                        .filter(|duration| *duration > 0)
+                        .map(|duration| (*index, duration))
+                })
+                .collect::<HashMap<_, _>>();
+            if duration_target.is_some()
+                && !source_already_satisfies
+                && !eligible_candidates
+                    .iter()
+                    .any(|candidate| duration_candidates.contains_key(candidate))
+            {
+                return Err(CommandFailure::new("DURATION_CANDIDATES_MISSING",
+                    "none of the eligible candidates has a valid Lyrion track duration; update the library and retry"));
+            }
+            let duration_goal = duration_target.map(|target| DurationGoal {
+                minimum_added_ms: target.minimum_ms.saturating_sub(target.source_ms),
+                maximum_added_ms: target.maximum_ms - target.source_ms,
+                candidate_durations: &duration_candidates,
+            });
             progress.update(
                 "bridge_selection",
-                format!(
-                    "Selecting additions to reach {target_track_count} total tracks from {} sources",
-                    source_library_indices.len()
-                ),
-                Some(source_library_indices.len()),
-                Some(target_track_count),
+                if duration_target.is_some() {
+                    format!("Selecting additions within the requested duration range from {} source tracks", source_count)
+                } else {
+                    format!("Selecting additions to reach {target_track_count} total tracks from {} sources", source_count)
+                },
+                if duration_target.is_some() { None } else { Some(source_count) },
+                if duration_target.is_some() { None } else { Some(target_track_count) },
             );
             let extension_result = select_fixed_source_extension(
                 target_track_count,
-                request
-                    .extension
-                    .max_added_tracks
-                    .map(|maximum| source_library_indices.len() + maximum),
+                if duration_target.is_some() {
+                    Some(if source_already_satisfies {
+                        source_count
+                    } else {
+                        500
+                    })
+                } else {
+                    request
+                        .extension
+                        .max_added_tracks
+                        .map(|maximum| source_count + maximum)
+                },
                 &source_library_indices,
                 &selected_library_route,
                 &eligible_candidates,
@@ -6598,6 +6806,7 @@ fn analyze_bridge_validated(
                     route_config: &route_config,
                     selection: request.selection,
                     shortlist_limit,
+                    duration_goal,
                     guidance: Some(FixedSourceGuidance {
                         host: guidance_host,
                         job_id: &request.job_id,
@@ -6615,7 +6824,25 @@ fn analyze_bridge_validated(
             )?;
             selected_strategy = extension_result.selected_strategy;
             selected_route_objective = extension_result.route_metrics.objective;
+            let target_track_count = if duration_target.is_some() {
+                extension_result.final_route.len()
+            } else {
+                target_track_count
+            };
             let requested_added_tracks = target_track_count - source_library_indices.len();
+            let duration_result = duration_target
+                .map(|target| {
+                    checked_duration_result(
+                        target,
+                        &extension_result
+                            .additions
+                            .iter()
+                            .map(|addition| addition.candidate)
+                            .collect::<Vec<_>>(),
+                        &duration_candidates,
+                    )
+                })
+                .transpose()?;
             let original_subsequence_preserved = extension_result
                 .final_route
                 .iter()
@@ -6681,6 +6908,7 @@ fn analyze_bridge_validated(
                 requested_added_tracks,
                 feasible: true,
                 added_track_count: extension_result.additions.len(),
+                duration_result,
                 original_subsequence_preserved,
                 unique_membership,
                 relevance_reference_track_count: source_library_indices.len(),
@@ -7840,6 +8068,7 @@ mod tests {
         assert!(version_metadata_json().contains("\"guidance_spi_v2\":true"));
         assert!(version_metadata_json().contains("\"fixed_gap_count_v1\":true"));
         assert!(version_metadata_json().contains("\"repeat_window_repair_v1\":true"));
+        assert!(version_metadata_json().contains("\"duration_extension_v1\":true"));
     }
 
     #[test]
@@ -8464,6 +8693,351 @@ mod tests {
     }
 
     #[test]
+    fn duration_request_selects_candidates_from_a_hash_bound_inventory() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = root.join("fixtures/synthetic/automatic-bridge-request.json");
+        let mut request: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        request["source_tracks"].as_array_mut().unwrap().truncate(2);
+        request["route"]["ordering_policy"] = Value::from("preserve_order");
+        request["route"]["search"]["restart_count"] = Value::from(0);
+        request["repeat_windows"] = serde_json::json!({"artist":0,"album":0,"track":0});
+        request["extension"] = serde_json::json!({"mode":"fixed_source_extension",
+            "target_track_count":3, "duration_target":{"source_ms":120000,
+            "minimum_ms":240000,"maximum_ms":240000}});
+        request["artifacts"]["database"]["cache_identity"] = Value::from("duration-test");
+        let db = BlissDatabase::open_read_only(
+            request["artifacts"]["database"]["path"].as_str().unwrap(),
+        )
+        .unwrap();
+        let library = load_usable_library(&db).unwrap();
+        let rows = library
+            .metadata
+            .iter()
+            .map(|entry| entry.row_id)
+            .collect::<Vec<_>>();
+        let identities = rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({"candidate_id": format!("bliss-row-{row}"),
+            "row_id":row, "lms_urlmd5":format!("fixture-{row}"), "duration_ms":120000})
+            })
+            .collect::<Vec<_>>();
+        let directory =
+            std::env::temp_dir().join(format!("bcb-duration-request-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let inventory = serde_json::json!({"schema_version":1,"schema_identity":"lms-local-candidate-inventory-v1",
+            "generated_at":0,"database_cache_identity":"duration-test","lms_scan_time":0,
+            "lms_local_track_count":rows.len(),"usable_bliss_row_count":rows.len(),"allowed_row_ids":rows});
+        let identity = serde_json::json!({"schema_identity":"eligible-candidate-identities-v1",
+            "database_cache_identity":"duration-test","candidates":identities});
+        for (key, name, kind, value) in [
+            (
+                "local_candidate_inventory",
+                "inventory.json",
+                "lms-local-candidate-inventory-v1",
+                inventory,
+            ),
+            (
+                "candidate_identities",
+                "identities.json",
+                "eligible-candidate-identities-v1",
+                identity,
+            ),
+        ] {
+            let path = directory.join(name);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            request["artifacts"][key] = serde_json::json!({"path":path.to_string_lossy(),
+                "sha256":format!("{:x}", Sha256::digest(&bytes)),"schema_identity":kind});
+        }
+        let request_path = directory.join("request.json");
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let artifact = analyze_bridge_request(&request_path).unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../schemas/bridge-analysis-artifact-v1.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let value = serde_json::to_value(&artifact).unwrap();
+        let errors = validator
+            .iter_errors(&value)
+            .map(|error| format!("{}: {}", error.instance_path, error))
+            .collect::<Vec<_>>();
+        assert!(errors.is_empty(), "invalid duration preview: {errors:?}");
+        let SelectionPreviewArtifact::FixedSourceExtension(preview) = artifact.selection_preview
+        else {
+            panic!("expected fixed-source duration preview");
+        };
+        assert_eq!(preview.added_track_count, 1);
+        assert_eq!(preview.duration_result.unwrap().actual_ms, 240000);
+        request["route"]["ordering_policy"] = Value::from("optimize_order");
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let optimized = analyze_bridge_request(&request_path).unwrap();
+        let SelectionPreviewArtifact::FixedSourceExtension(optimized_preview) =
+            optimized.selection_preview
+        else {
+            panic!("expected optimized fixed-source duration preview");
+        };
+        assert_eq!(optimized_preview.added_track_count, 1);
+        assert_eq!(optimized_preview.duration_result.unwrap().actual_ms, 240000);
+        request["route"]["ordering_policy"] = Value::from("preserve_order");
+        let identity_path = directory.join("identities.json");
+        let mut missing: Value =
+            serde_json::from_slice(&fs::read(&identity_path).unwrap()).unwrap();
+        for identity in missing["candidates"].as_array_mut().unwrap() {
+            identity.as_object_mut().unwrap().remove("duration_ms");
+        }
+        let missing_bytes = serde_json::to_vec(&missing).unwrap();
+        fs::write(&identity_path, &missing_bytes).unwrap();
+        request["artifacts"]["candidate_identities"]["sha256"] =
+            Value::from(format!("{:x}", Sha256::digest(&missing_bytes)));
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let missing_error = analyze_bridge_request(&request_path).unwrap_err();
+        assert_eq!(missing_error.code, "DURATION_CANDIDATES_MISSING");
+        request["extension"]["target_track_count"] = Value::from(2);
+        request["extension"]["duration_target"] = serde_json::json!({
+            "source_ms":120000,"minimum_ms":110000,"maximum_ms":130000
+        });
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let within = analyze_bridge_request(&request_path).unwrap();
+        let within_value = serde_json::to_value(&within).unwrap();
+        let errors = validator
+            .iter_errors(&within_value)
+            .map(|error| format!("{}: {}", error.instance_path, error))
+            .collect::<Vec<_>>();
+        assert!(
+            errors.is_empty(),
+            "invalid no-addition duration preview: {errors:?}"
+        );
+        let SelectionPreviewArtifact::FixedSourceExtension(preview) = within.selection_preview
+        else {
+            panic!("expected fixed-source duration preview");
+        };
+        assert_eq!(preview.added_track_count, 0);
+        assert_eq!(preview.duration_result.unwrap().actual_ms, 120000);
+        request["extension"]["duration_target"]["source_ms"] = Value::from(140000);
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let too_long = analyze_bridge_request(&request_path).unwrap_err();
+        assert_eq!(too_long.code, "DURATION_TARGET_INVALID");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn duration_result_enforces_bounds_even_if_selection_is_wrong() {
+        let target = DurationTargetRequest {
+            source_ms: 200_000,
+            minimum_ms: 300_000,
+            maximum_ms: 330_000,
+        };
+        let durations = HashMap::from([(3, 60_000), (4, 40_000), (5, 31_000)]);
+        let outcome = checked_duration_result(&target, &[3, 4], &durations).unwrap();
+        assert_eq!(outcome.actual_ms, 300_000);
+        assert!(checked_duration_result(&target, &[3], &durations).is_err());
+        assert!(checked_duration_result(&target, &[3, 4, 5], &durations).is_err());
+        assert!(checked_duration_result(&target, &[99], &durations).is_err());
+    }
+
+    #[test]
+    fn fixed_source_extension_uses_duration_feasible_membership() {
+        let tracks = (0..5)
+            .map(|index| route::RouteTrack {
+                features: [index as f32 / 100.0; 23],
+                artist_key: format!("artist-{index}"),
+                artist_repeat_keys: Vec::new(),
+                album_key: format!("album-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let config = route::SearchConfig {
+            seed_limit: 2,
+            learned_percent: 0,
+            deterministic_seed: 1,
+            restart_count: 0,
+            artist_window: 0,
+            album_window: 0,
+        };
+        let durations = HashMap::from([(2, 110_000), (3, 60_000), (4, 40_000)]);
+        let mut progress = ProgressReporter::disabled();
+        let result = select_fixed_source_extension(
+            3,
+            Some(5),
+            &[0, 1],
+            &[0, 1],
+            &[2, 3, 4],
+            true,
+            FixedSourceExtensionContext {
+                tracks: &tracks,
+                learned_matrix: &Array2::eye(23),
+                route_config: &config,
+                selection: SelectionSettings::default(),
+                shortlist_limit: 256,
+                guidance: None,
+                duration_goal: Some(DurationGoal {
+                    minimum_added_ms: 100_000,
+                    maximum_added_ms: 100_000,
+                    candidate_durations: &durations,
+                }),
+                progress: &mut progress,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .additions
+                .iter()
+                .map(|addition| addition.candidate)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(route::repeat_violations(&result.final_route, &tracks, &config).is_empty());
+    }
+
+    #[test]
+    fn duration_extension_tries_another_membership_after_repeat_conflict() {
+        let tracks = ["a", "a", "a", "b"]
+            .iter()
+            .enumerate()
+            .map(|(index, artist)| route::RouteTrack {
+                features: [index as f32 / 100.0; 23],
+                artist_key: (*artist).to_owned(),
+                artist_repeat_keys: Vec::new(),
+                album_key: format!("album-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let config = route::SearchConfig {
+            seed_limit: 2,
+            learned_percent: 0,
+            deterministic_seed: 1,
+            restart_count: 0,
+            artist_window: 1,
+            album_window: 0,
+        };
+        let durations = HashMap::from([(2, 60_000), (3, 60_000)]);
+        let mut progress = ProgressReporter::disabled();
+        let result = select_fixed_source_extension(
+            3,
+            Some(4),
+            &[0, 1],
+            &[0, 1],
+            &[2, 3],
+            true,
+            FixedSourceExtensionContext {
+                tracks: &tracks,
+                learned_matrix: &Array2::eye(23),
+                route_config: &config,
+                selection: SelectionSettings::default(),
+                shortlist_limit: 256,
+                guidance: None,
+                duration_goal: Some(DurationGoal {
+                    minimum_added_ms: 60_000,
+                    maximum_added_ms: 60_000,
+                    candidate_durations: &durations,
+                }),
+                progress: &mut progress,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.additions[0].candidate, 3);
+        assert!(route::repeat_violations(&result.final_route, &tracks, &config).is_empty());
+    }
+
+    #[test]
+    fn duration_extension_does_not_spend_its_membership_budget_on_impossible_repeats() {
+        let tracks = (0..133)
+            .map(|index| route::RouteTrack {
+                features: [index as f32 / 10000.0; 23],
+                artist_key: if index == 132 { "b" } else { "a" }.to_owned(),
+                artist_repeat_keys: Vec::new(),
+                album_key: format!("album-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let config = route::SearchConfig {
+            seed_limit: 2,
+            learned_percent: 0,
+            deterministic_seed: 1,
+            restart_count: 0,
+            artist_window: 1,
+            album_window: 0,
+        };
+        let candidates = (2..133).collect::<Vec<_>>();
+        let durations = candidates
+            .iter()
+            .map(|id| (*id, 60_000))
+            .collect::<HashMap<_, _>>();
+        let mut progress = ProgressReporter::disabled();
+        let result = select_fixed_source_extension(
+            3,
+            Some(3),
+            &[0, 1],
+            &[0, 1],
+            &candidates,
+            true,
+            FixedSourceExtensionContext {
+                tracks: &tracks,
+                learned_matrix: &Array2::eye(23),
+                route_config: &config,
+                selection: SelectionSettings::default(),
+                shortlist_limit: 256,
+                guidance: None,
+                duration_goal: Some(DurationGoal {
+                    minimum_added_ms: 60_000,
+                    maximum_added_ms: 60_000,
+                    candidate_durations: &durations,
+                }),
+                progress: &mut progress,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.additions[0].candidate, 132);
+    }
+
+    #[test]
+    fn duration_extension_can_keep_the_source_without_additions() {
+        let tracks = (0..2)
+            .map(|index| route::RouteTrack {
+                features: [index as f32 / 100.0; 23],
+                artist_key: format!("artist-{index}"),
+                artist_repeat_keys: Vec::new(),
+                album_key: format!("album-{index}"),
+            })
+            .collect::<Vec<_>>();
+        let config = route::SearchConfig {
+            seed_limit: 2,
+            learned_percent: 0,
+            deterministic_seed: 1,
+            restart_count: 0,
+            artist_window: 0,
+            album_window: 0,
+        };
+        let durations = HashMap::new();
+        let mut progress = ProgressReporter::disabled();
+        let result = select_fixed_source_extension(
+            2,
+            Some(2),
+            &[0, 1],
+            &[0, 1],
+            &[],
+            true,
+            FixedSourceExtensionContext {
+                tracks: &tracks,
+                learned_matrix: &Array2::eye(23),
+                route_config: &config,
+                selection: SelectionSettings::default(),
+                shortlist_limit: 256,
+                guidance: None,
+                duration_goal: Some(DurationGoal {
+                    minimum_added_ms: 0,
+                    maximum_added_ms: 60_000,
+                    candidate_durations: &durations,
+                }),
+                progress: &mut progress,
+            },
+        )
+        .unwrap();
+        assert!(result.additions.is_empty());
+        assert_eq!(result.final_route, vec![0, 1]);
+    }
+
+    #[test]
     fn fixed_source_extension_reaches_exact_target_without_relevance_drift() {
         let tracks = (0..32)
             .map(|index| route::RouteTrack {
@@ -8499,6 +9073,7 @@ mod tests {
                 selection: SelectionSettings::default(),
                 shortlist_limit: 256,
                 guidance: None,
+                duration_goal: None,
                 progress: &mut progress,
             },
         )
@@ -8541,6 +9116,7 @@ mod tests {
                 selection: SelectionSettings::default(),
                 shortlist_limit: 256,
                 guidance: None,
+                duration_goal: None,
                 progress: &mut progress,
             },
         )
@@ -8579,6 +9155,7 @@ mod tests {
                         generation_seed: seed,
                     },
                     guidance: None,
+                    duration_goal: None,
                     shortlist_limit: 256,
                     progress: &mut progress,
                 },
@@ -8786,6 +9363,7 @@ mod tests {
                 "lms_urlmd5": "url-0",
                 "title": "Candidate title",
                 "artist": "Candidate artist",
+                "duration_ms": 234567,
                 "album": "Candidate album",
                 "recording_mbid": "11111111-1111-1111-1111-111111111111",
                 "artist_mbid": "22222222-2222-2222-2222-222222222222"
@@ -8807,6 +9385,7 @@ mod tests {
             &allowed_rows,
         )
         .unwrap();
+        assert_eq!(identities.get(&0).unwrap().duration_ms, Some(234567));
         let provider_candidate = provider_candidate(0, &library, &identities);
         assert_eq!(provider_candidate.lms_urlmd5.as_deref(), Some("url-0"));
         assert_eq!(provider_candidate.title.as_deref(), Some("Candidate title"));

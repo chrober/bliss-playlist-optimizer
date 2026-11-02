@@ -189,6 +189,16 @@
         "allow_opening_track": { "type": "boolean" },
         "allow_closing_track": { "type": "boolean" },
         "target_track_count": { "type": "integer", "minimum": 2 },
+        "duration_target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_ms", "minimum_ms", "maximum_ms"],
+          "properties": {
+            "source_ms": { "type": "integer", "minimum": 1 },
+            "minimum_ms": { "type": "integer", "minimum": 0 },
+            "maximum_ms": { "type": "integer", "minimum": 1 }
+          }
+        },
         "candidate_limit": { "type": "integer", "minimum": 1 },
         "max_tracks_per_gap": { "type": "integer", "minimum": 1, "maximum": 8 },
         "tracks_per_gap": { "type": "integer", "minimum": 1, "maximum": 8 },
@@ -200,6 +210,10 @@
         "shortlist_limit": { "type": "integer", "minimum": 1, "maximum": 10000 }
       },
       "allOf": [
+        {
+          "if": { "required": ["duration_target"] },
+          "then": { "properties": { "mode": { "const": "fixed_source_extension" } } }
+        },
         {
           "if": {
             "properties": { "mode": { "const": "automatic" } }

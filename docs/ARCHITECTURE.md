@@ -183,6 +183,16 @@ identifies the context/seed policy, configured and effective learned shares,
 learned-matrix availability, base matrix hash, and fallback contract so callers
 do not have to infer the actual scoring setup from request fields alone.
 
+For duration-targeted fixed-source extension, the host supplies inclusive final
+duration bounds and the frozen source duration in milliseconds. Eligible
+candidate identities may carry `duration_ms`; candidates without a positive
+duration are not selected. The optimizer explores bounded combinations in the
+existing Bliss-first order, filters necessary repeat capacities, and tests the
+resulting routes. A bounded search failure does not prove that no possible route
+exists. A successful artifact includes the checked source, lower, upper and
+actual durations; the host independently verifies its resolved tracks. When the
+source already falls within the bounds, no candidates are added.
+
 Requests may include the strategy-neutral `selection` block with
 `variation_percent`, `generation_seed`, `recording_guidance_percent`, and
 `artist_guidance_percent`, plus signed `playcount_influence` from -100 to 100.
