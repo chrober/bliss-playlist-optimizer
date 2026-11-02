@@ -61,7 +61,7 @@ jobs:
             binary: bliss-playlist-optimizer
             cross: true
           - asset: bliss-playlist-optimizer-mac
-            runner: macos-latest
+            runner: macos-15-intel
             target: x86_64-apple-darwin
             binary: bliss-playlist-optimizer
             cross: false
