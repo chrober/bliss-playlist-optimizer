@@ -181,8 +181,10 @@
       "required": ["mode"],
       "properties": {
         "mode": {
-          "enum": ["none", "automatic", "exact_count", "fixed_gap_count", "repeat_window_repair", "fixed_source_extension", "destination_route", "one_per_transition", "target_length"]
+          "enum": ["none", "automatic", "automatic_improvement", "exact_count", "fixed_gap_count", "repeat_window_repair", "fixed_source_extension", "destination_route", "one_per_transition", "target_length"]
         },
+        "satisfy_repeat_windows": { "type": "boolean" },
+        "smooth_transitions": { "type": "boolean" },
         "additional_track_count": { "type": "integer", "minimum": 0 },
         "search_effort": { "enum": ["fast", "balanced", "thorough"] },
         "destination_mode": { "enum": ["automatic", "exact"] },
@@ -213,6 +215,22 @@
         {
           "if": { "required": ["duration_target"] },
           "then": { "properties": { "mode": { "const": "fixed_source_extension" } } }
+        },
+        {
+          "if": { "properties": { "mode": { "const": "automatic_improvement" } } },
+          "then": {
+            "required": ["max_added_tracks", "satisfy_repeat_windows", "smooth_transitions"],
+            "anyOf": [
+              { "properties": { "satisfy_repeat_windows": { "const": true } } },
+              { "properties": { "smooth_transitions": { "const": true } } }
+            ],
+            "allOf": [
+              {
+                "if": { "properties": { "smooth_transitions": { "const": true } } },
+                "then": { "required": ["trigger_percentile"] }
+              }
+            ]
+          }
         },
         {
           "if": {

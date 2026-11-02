@@ -20,6 +20,10 @@ for the same Bliss feature-distance behavior used by the mixer ecosystem.
   test.
 - Builds one-way and round-trip routes to a selected track or album.
 - Finds and evaluates bridges for difficult playlist transitions.
+- Combines optional repeat-window spacing and transition smoothing in one
+  capability-gated request. Spacing runs first; smoothing evaluates the
+  resulting adjacent tracks with the remaining shared additions budget.
+  The result records each addition's purpose and route-validation proofs.
 - Inserts an exact bridge count into every internal source gap through one
   global plan, rather than committing locally optimal gaps one at a time.
 - Applies repeat, genre, virtual-library, membership, and route constraints,
