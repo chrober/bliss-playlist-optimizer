@@ -198,6 +198,8 @@ jobs:
             echo "Native binaries for Better Call Bliss and other playlist-optimization consumers."
             echo
             echo "Built from commit $GITHUB_SHA after fmt, clippy, and test gates."
+            echo
+            echo "[Source archive](https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/bliss-playlist-optimizer-source.tar.gz) (see \`SOURCE_ARCHIVE_README.txt\` inside) · [Third-party licenses](https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/bliss-playlist-optimizer-third-party-licenses.zip). SHA-256 files are available with the assets."
           } > "$notes"
 
           prerelease_flag=()
@@ -211,7 +213,7 @@ jobs:
             test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$GITHUB_SHA" || { echo 'Release tag points to a different source commit' >&2; exit 1; }
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release-assets/* --clobber
+            echo "Release already exists: $TAG; refusing to overwrite assets" >&2; exit 1
           else
             gh release create "$TAG" release-assets/* \
               --target "$GITHUB_SHA" \
