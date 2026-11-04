@@ -408,10 +408,7 @@ fn destination_repeat_requirement(
 }
 
 fn preflight_destination_repeat_budget(request: &Request) -> Result<(), CommandFailure> {
-    if request.extension.mode != "destination_route"
-        || request.route.rejoin_track_id.is_some()
-        || request.route.destination_track_ids.len() > 1
-    {
+    if request.extension.mode != "destination_route" {
         return Ok(());
     }
     let Some(start_id) = request.route.start_track_id.as_deref() else {
@@ -434,11 +431,46 @@ fn preflight_destination_repeat_budget(request: &Request) -> Result<(), CommandF
     else {
         return Ok(());
     };
-    if start_position + 1 != destination_position
-        || destination_position + 1 != request.source_tracks.len()
-    {
+    if start_position + 1 != destination_position {
         return Ok(());
     }
+
+    let rejoin_requirement = if let Some(rejoin_id) = request.route.rejoin_track_id.as_deref() {
+        let Some(rejoin_position) = request
+            .source_tracks
+            .iter()
+            .position(|track| track.id == rejoin_id)
+        else {
+            return Ok(());
+        };
+        let destination_count = request.route.destination_track_ids.len().max(1);
+        if rejoin_position != destination_position + destination_count
+            || rejoin_position + 1 != request.source_tracks.len()
+            || (!request.route.destination_track_ids.is_empty()
+                && !request
+                    .route
+                    .destination_track_ids
+                    .iter()
+                    .zip(&request.source_tracks[destination_position..rejoin_position])
+                    .all(|(id, track)| id == &track.id))
+        {
+            return Ok(());
+        }
+        destination_repeat_requirement(
+            &[],
+            &request.source_tracks[rejoin_position - 1..rejoin_position],
+            &request.source_tracks[rejoin_position],
+            &request.repeat_windows,
+        )
+        .minimum()
+    } else {
+        if request.route.destination_track_ids.len() > 1
+            || destination_position + 1 != request.source_tracks.len()
+        {
+            return Ok(());
+        }
+        0
+    };
 
     let requirement = destination_repeat_requirement(
         &request.history_tracks,
@@ -458,13 +490,25 @@ fn preflight_destination_repeat_budget(request: &Request) -> Result<(), CommandF
                 "configured maximum",
             )
         };
-    if requirement.minimum() > available {
+    let minimum = requirement.minimum().saturating_add(rejoin_requirement);
+    if minimum > available {
+        let outward = requirement.explanation(&request.repeat_windows);
+        let explanation = if rejoin_requirement > 0 && outward.is_empty() {
+            format!("return boundary requires {rejoin_requirement}")
+        } else if rejoin_requirement > 0 {
+            format!(
+                "outward: {}; return boundary requires {}",
+                outward, rejoin_requirement
+            )
+        } else {
+            outward
+        };
         return Err(CommandFailure::new(
             "DESTINATION_ROUTE_BUDGET_UNSATISFIABLE",
             format!(
                 "destination repeat constraints require at least {} intermediate tracks ({}); {budget_label} is {available}",
-                requirement.minimum(),
-                requirement.explanation(&request.repeat_windows),
+                minimum,
+                explanation,
             ),
         ));
     }
@@ -8218,6 +8262,58 @@ mod tests {
 
         assert_eq!(requirement.track, 99);
         assert_eq!(requirement.minimum(), 99);
+    }
+
+    #[test]
+    fn round_trip_preflight_accounts_for_both_repeat_boundaries() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = repository.join("fixtures/synthetic/automatic-bridge-request.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        value["source_tracks"] = serde_json::json!([
+            {"id":"start", "artist":"A", "album":"Album"},
+            {"id":"destination", "artist":"A", "album":"Album"},
+            {"id":"rejoin", "artist":"A", "album":"Album"}
+        ]);
+        value["history_tracks"] = serde_json::json!([]);
+        value["route"]["start_track_id"] = serde_json::json!("start");
+        value["route"]["destination_track_id"] = serde_json::json!("destination");
+        value["route"]["destination_track_ids"] = serde_json::json!([]);
+        value["route"]["rejoin_track_id"] = serde_json::json!("rejoin");
+        value["repeat_windows"] = serde_json::json!({"artist":5,"album":10,"track":0});
+        value["extension"]["mode"] = serde_json::json!("destination_route");
+        value["extension"]["destination_mode"] = serde_json::json!("automatic");
+        value["extension"]["max_added_tracks"] = serde_json::json!(4);
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        let failure = preflight_destination_repeat_budget(&request).unwrap_err();
+        assert_eq!(failure.code, "DESTINATION_ROUTE_BUDGET_UNSATISFIABLE");
+        assert!(failure.message.contains("at least 20 intermediate tracks"));
+        value["extension"]["max_added_tracks"] = serde_json::json!(20);
+        let feasible: Request = serde_json::from_value(value.clone()).unwrap();
+        assert!(preflight_destination_repeat_budget(&feasible).is_ok());
+
+        value["extension"]["destination_mode"] = serde_json::json!("exact");
+        value["extension"]["additional_track_count"] = serde_json::json!(19);
+        let exact_short: Request = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            preflight_destination_repeat_budget(&exact_short)
+                .unwrap_err()
+                .code,
+            "DESTINATION_ROUTE_BUDGET_UNSATISFIABLE"
+        );
+        value["extension"]["additional_track_count"] = serde_json::json!(20);
+        let exact_feasible: Request = serde_json::from_value(value.clone()).unwrap();
+        assert!(preflight_destination_repeat_budget(&exact_feasible).is_ok());
+
+        value["source_tracks"] = serde_json::json!([
+            {"id":"start", "artist":"A", "album":"Album"},
+            {"id":"destination", "artist":"A", "album":"Album"},
+            {"id":"album-last", "artist":"B", "album":"Other"},
+            {"id":"rejoin", "artist":"C", "album":"Third"}
+        ]);
+        value["route"]["destination_track_ids"] = serde_json::json!(["destination", "album-last"]);
+        value["extension"]["additional_track_count"] = serde_json::json!(10);
+        let block_feasible: Request = serde_json::from_value(value).unwrap();
+        assert!(preflight_destination_repeat_budget(&block_feasible).is_ok());
     }
 
     #[test]
