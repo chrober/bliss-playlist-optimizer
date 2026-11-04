@@ -8,8 +8,8 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::anchored_path::{
-    search_anchored_paths, AnchoredPathCandidate, AnchoredPathError, AnchoredPathRequest,
-    AnchoredPathScorer, AnchoredPathSearchConfig, FixedAdjacentScorer,
+    search_anchored_paths_with_exempt_prefix, AnchoredPathCandidate, AnchoredPathError,
+    AnchoredPathRequest, AnchoredPathScorer, AnchoredPathSearchConfig, FixedAdjacentScorer,
 };
 use crate::bridge::{
     gap_context_matrix, rank_candidates_in_context, rank_endpoint_candidates,
@@ -1430,6 +1430,30 @@ pub fn select_destination_bridge_routes<F>(
 where
     F: Fn(usize, usize) -> f64 + Sync + Copy,
 {
+    select_destination_bridge_routes_with_exempt_prefix(
+        original_route,
+        gap,
+        max_added_tracks,
+        selection_config,
+        (repeat, 0),
+        scoring,
+        adjacent_distance,
+    )
+}
+
+fn select_destination_bridge_routes_with_exempt_prefix<F>(
+    original_route: &[usize],
+    gap: &AutomaticGap,
+    max_added_tracks: usize,
+    selection_config: &ExactSelectionConfig,
+    repeat_policy: (DestinationRepeatContext<'_>, usize),
+    scoring: ExactScoringContext<'_>,
+    adjacent_distance: F,
+) -> Result<Vec<DestinationRouteOption>, PreviewError>
+where
+    F: Fn(usize, usize) -> f64 + Sync + Copy,
+{
+    let (repeat, ignored_prefix_len) = repeat_policy;
     if original_route.len() < 2
         || original_route[original_route.len() - 2] != gap.left
         || original_route.last().copied() != Some(gap.right)
@@ -1470,7 +1494,7 @@ where
                     .ln(),
         })
         .collect::<Vec<_>>();
-    let anchored_options = search_anchored_paths(
+    let anchored_options = search_anchored_paths_with_exempt_prefix(
         AnchoredPathRequest {
             route_prefix: prefix,
             immutable_history: repeat.history_route,
@@ -1492,6 +1516,8 @@ where
             },
         },
         FixedAdjacentScorer::new(adjacent_distance),
+        ignored_prefix_len,
+        |_| {},
     )
     .map_err(anchored_path_error)?;
 
@@ -1533,6 +1559,32 @@ where
 /// optionally, back to a locked queue-rejoin anchor. Only the boundary before
 /// the block and the optional boundary after it may receive generated tracks.
 /// The bridge budget is shared across those boundaries.
+fn destination_generated_repeat_safe(
+    route: &[usize],
+    anchors: &[usize],
+    history: &[usize],
+    tracks: &[RouteTrack],
+    config: &BridgeConfig,
+    track_window: usize,
+) -> bool {
+    let mut full = history.to_vec();
+    full.extend_from_slice(route);
+    (history.len()..full.len())
+        .filter(|&pos| !anchors.contains(&full[pos]))
+        .all(|pos| {
+            crate::bridge::repeat_windows_safe_at(
+                &full,
+                tracks,
+                pos,
+                config.artist_window,
+                config.album_window,
+            ) && (track_window == 0
+                || full.iter().enumerate().all(|(other, track)| {
+                    other == pos || other.abs_diff(pos) > track_window || *track != full[pos]
+                }))
+        })
+}
+
 pub fn select_destination_block_routes<F>(
     original_route: &[usize],
     gaps: &[AutomaticGap],
@@ -1609,6 +1661,16 @@ where
                                 [destination_first_position + 1..=destination_last_position],
                         );
                     }
+                    if !destination_generated_repeat_safe(
+                        &final_route,
+                        original_route,
+                        repeat.history_route,
+                        scoring.tracks,
+                        scoring.config,
+                        repeat.track_window,
+                    ) {
+                        return Ok(Vec::new());
+                    }
                     let destination_first_position = final_route
                         .iter()
                         .position(|track| *track == destination_first)
@@ -1658,16 +1720,19 @@ where
                     .filter(|track| !return_unavailable.contains(track))
                     .collect::<Vec<_>>();
                 return_unavailable.extend(outward_unavailable);
-                let return_options = select_destination_bridge_routes(
+                let return_options = select_destination_bridge_routes_with_exempt_prefix(
                     &return_source,
                     &gaps[1],
                     remaining,
                     selection_config,
-                    DestinationRepeatContext {
-                        history_route: repeat.history_route,
-                        unavailable_tracks: &return_unavailable,
-                        track_window: repeat.track_window,
-                    },
+                    (
+                        DestinationRepeatContext {
+                            history_route: repeat.history_route,
+                            unavailable_tracks: &return_unavailable,
+                            track_window: repeat.track_window,
+                        },
+                        repeat.history_route.len() + start_position + 1,
+                    ),
                     scoring,
                     adjacent_distance,
                 )?;
@@ -1681,6 +1746,16 @@ where
                         .as_ref()
                         .expect("destination options always contain a route")
                         .clone();
+                    if !destination_generated_repeat_safe(
+                        &final_route,
+                        original_route,
+                        repeat.history_route,
+                        scoring.tracks,
+                        scoring.config,
+                        repeat.track_window,
+                    ) {
+                        continue;
+                    }
                     let destination_first_position = final_route
                         .iter()
                         .position(|track| *track == destination_first)
@@ -2908,6 +2983,102 @@ mod tests {
         .unwrap();
         assert_eq!(two_bridges.final_route, Some(vec![0, 1, 2, 3]));
         assert_eq!(two_bridges.stats.maximum_additions_found, 2);
+    }
+
+    #[test]
+    fn destination_bridge_tracks_must_respect_all_album_anchors() {
+        let tracks = vec![
+            track(0.0, "queue"),
+            track(1.0, "album"),
+            track(2.0, "album"),
+            track(3.0, "album"),
+        ];
+        let config = BridgeConfig {
+            seed_limit: 2,
+            learned_percent: 20,
+            artist_window: 0,
+            album_window: 2,
+            max_leg_percentile: 1.0,
+            max_detour_percentile: 2.0,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
+        };
+        // Track 1 is a generated bridge; tracks 2 and 3 form the chosen album.
+        assert!(!destination_generated_repeat_safe(
+            &[0, 1, 2, 3],
+            &[0, 2, 3],
+            &[],
+            &tracks,
+            &config,
+            0
+        ));
+        // The two album tracks themselves are not rejected as an anchor pair.
+        assert!(destination_generated_repeat_safe(
+            &[0, 2, 3],
+            &[0, 2, 3],
+            &[],
+            &tracks,
+            &config,
+            0
+        ));
+    }
+
+    #[test]
+    fn round_trip_keeps_existing_queue_anchors_even_when_album_repeats() {
+        let tracks = vec![
+            track(0.0, "same-artist"),
+            track(0.8, "bridge-one"),
+            track(1.6, "destination"),
+            track(2.4, "bridge-two"),
+            track(3.2, "same-artist"),
+        ];
+        let route = [0, 2, 4];
+        let matrix = Array2::eye(23);
+        let config = BridgeConfig {
+            seed_limit: 2,
+            learned_percent: 20,
+            artist_window: 5,
+            album_window: 10,
+            max_leg_percentile: 1.0,
+            max_detour_percentile: 2.0,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
+        };
+        let reference =
+            build_frozen_reference(&route, &[0, 1, 2, 3, 4], &tracks, &matrix, &config).unwrap();
+        let gaps = [gap(1, 0, 2, 1), gap(2, 2, 4, 3)];
+        let selection = ExactSelectionConfig {
+            requested_added_tracks: 2,
+            candidate_limit: 2,
+            beam_width: 16,
+            max_tracks_per_gap: 2,
+            variation_percent: 0,
+            generation_seed: 1,
+        };
+        let options = select_destination_block_routes(
+            &route,
+            &gaps,
+            DestinationBlockPlan {
+                track_count: 1,
+                rejoins_queue: true,
+                max_added_tracks: 2,
+            },
+            &selection,
+            DestinationRepeatContext {
+                history_route: &[],
+                unavailable_tracks: &route,
+                track_window: 100,
+            },
+            ExactScoringContext {
+                tracks: &tracks,
+                learned_matrix: &matrix,
+                config: &config,
+                reference: &reference,
+            },
+            |left, right| (left as f64 - right as f64).abs(),
+        )
+        .unwrap();
+        assert!(options
+            .iter()
+            .any(|option| option.selection.final_route == Some(vec![0, 1, 2, 3, 4])));
     }
 
     #[test]

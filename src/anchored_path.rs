@@ -231,16 +231,30 @@ fn position_repeat_safe(
         }))
 }
 
+// Exempt only already-existing queue context when testing a rejoin anchor.
+// Generated positions are still checked against the entire route.
+fn right_anchor_repeat_safe(
+    route: &[usize],
+    tracks: &[RouteTrack],
+    config: AnchoredPathSearchConfig,
+    ignored_prefix_len: usize,
+) -> bool {
+    let suffix = &route[ignored_prefix_len.min(route.len() - 1)..];
+    position_repeat_safe(suffix, suffix.len() - 1, tracks, config)
+}
+
 fn minimum_destination_intermediates(
     repeat_prefix: &[usize],
     right_anchor: usize,
     tracks: &[RouteTrack],
     config: AnchoredPathSearchConfig,
+    ignored_prefix_len: usize,
 ) -> usize {
     let destination = &tracks[right_anchor];
     repeat_prefix
         .iter()
         .enumerate()
+        .filter(|(position, _)| *position >= ignored_prefix_len)
         .map(|(position, track)| {
             let previous = &tracks[*track];
             let mut window = 0;
@@ -340,6 +354,19 @@ where
 pub fn search_anchored_paths_with_progress<S, F>(
     request: AnchoredPathRequest<'_>,
     scorer: S,
+    progress: F,
+) -> Result<Vec<AnchoredPathOption>, AnchoredPathError>
+where
+    S: AnchoredPathScorer,
+    F: FnMut(AnchoredPathProgressEvent),
+{
+    search_anchored_paths_with_exempt_prefix(request, scorer, 0, progress)
+}
+
+pub(crate) fn search_anchored_paths_with_exempt_prefix<S, F>(
+    request: AnchoredPathRequest<'_>,
+    scorer: S,
+    ignored_prefix_len: usize,
     mut progress: F,
 ) -> Result<Vec<AnchoredPathOption>, AnchoredPathError>
 where
@@ -369,17 +396,18 @@ where
         request.right_anchor,
         request.tracks,
         request.config,
+        ignored_prefix_len,
     );
     let direct = scorer.score_leg(request.route_prefix, request.right_anchor);
     let mut direct_repeat_route = repeat_prefix.clone();
     direct_repeat_route.push(request.right_anchor);
     let mut options = Vec::new();
     if direct.is_finite()
-        && position_repeat_safe(
+        && right_anchor_repeat_safe(
             &direct_repeat_route,
-            direct_repeat_route.len() - 1,
             request.tracks,
             request.config,
+            ignored_prefix_len,
         )
     {
         let mut direct_route = request.route_prefix.to_vec();
@@ -522,7 +550,12 @@ where
                 ) {
                     return None;
                 }
-                if !position_repeat_safe(&route, route.len() - 1, request.tracks, request.config) {
+                if !right_anchor_repeat_safe(
+                    &route,
+                    request.tracks,
+                    request.config,
+                    ignored_prefix_len,
+                ) {
                     return None;
                 }
                 let mut scoring_prefix = request.route_prefix.to_vec();
