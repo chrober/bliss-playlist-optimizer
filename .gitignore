@@ -1,4 +1,6 @@
 /target/
+__pycache__/
+*.pyc
 /.worktrees/
 /.work/
 /.tmp-test-output.txt
