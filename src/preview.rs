@@ -1585,6 +1585,36 @@ fn destination_generated_repeat_safe(
         })
 }
 
+fn destination_block_context_safe(
+    route: &[usize],
+    history: &[usize],
+    block: &[usize],
+    tracks: &[RouteTrack],
+    config: &BridgeConfig,
+    track_window: usize,
+) -> bool {
+    let Some(first) = route.iter().position(|track| *track == block[0]) else {
+        return false;
+    };
+    let mut prefix = history.to_vec();
+    prefix.extend_from_slice(&route[..first]);
+    block.iter().enumerate().all(|(index, track)| {
+        prefix.iter().enumerate().all(|(position, previous)| {
+            let distance = prefix.len() - position + index;
+            let left = &tracks[*previous];
+            let right = &tracks[*track];
+            !(config.artist_window > 0
+                && distance <= config.artist_window
+                && route::artists_repeat(left, right))
+                && !(config.album_window > 0
+                    && distance <= config.album_window
+                    && !left.album_key.is_empty()
+                    && left.album_key == right.album_key)
+                && !(track_window > 0 && distance <= track_window && previous == track)
+        })
+    })
+}
+
 pub fn select_destination_block_routes<F>(
     original_route: &[usize],
     gaps: &[AutomaticGap],
@@ -1671,6 +1701,16 @@ where
                     ) {
                         return Ok(Vec::new());
                     }
+                    if !destination_block_context_safe(
+                        &final_route,
+                        repeat.history_route,
+                        &original_route[destination_first_position..=destination_last_position],
+                        scoring.tracks,
+                        scoring.config,
+                        repeat.track_window,
+                    ) {
+                        return Ok(Vec::new());
+                    }
                     let destination_first_position = final_route
                         .iter()
                         .position(|track| *track == destination_first)
@@ -1750,6 +1790,16 @@ where
                         &final_route,
                         original_route,
                         repeat.history_route,
+                        scoring.tracks,
+                        scoring.config,
+                        repeat.track_window,
+                    ) {
+                        continue;
+                    }
+                    if !destination_block_context_safe(
+                        &final_route,
+                        repeat.history_route,
+                        &original_route[destination_first_position..=destination_last_position],
                         scoring.tracks,
                         scoring.config,
                         repeat.track_window,
@@ -2983,6 +3033,41 @@ mod tests {
         .unwrap();
         assert_eq!(two_bridges.final_route, Some(vec![0, 1, 2, 3]));
         assert_eq!(two_bridges.stats.maximum_additions_found, 2);
+    }
+
+    #[test]
+    fn destination_album_checks_later_tracks_against_preexisting_context_but_not_each_other() {
+        let tracks = vec![
+            track(0.0, "A"),
+            track(1.0, "B"),
+            track(2.0, "A"),
+            track(3.0, "A"),
+        ];
+        let config = BridgeConfig {
+            seed_limit: 2,
+            learned_percent: 20,
+            artist_window: 0,
+            album_window: 2,
+            max_leg_percentile: 1.0,
+            max_detour_percentile: 2.0,
+            gap_context_mode: crate::bridge::GapContextMode::Rolling,
+        };
+        assert!(!destination_block_context_safe(
+            &[0, 1, 2, 3],
+            &[],
+            &[1, 2, 3],
+            &tracks,
+            &config,
+            0
+        ));
+        assert!(destination_block_context_safe(
+            &[1, 2, 3],
+            &[],
+            &[1, 2, 3],
+            &tracks,
+            &config,
+            0
+        ));
     }
 
     #[test]

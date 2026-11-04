@@ -371,7 +371,10 @@ fn destination_repeat_requirement(
         .as_deref()
         .map(repeat_key)
         .unwrap_or_default();
-    let destination_file = destination.database_file.as_deref();
+    let destination_file = destination
+        .database_file
+        .as_deref()
+        .filter(|file| !file.is_empty());
 
     let mut requirement = DestinationRepeatRequirement::default();
     for (position, previous) in history.iter().chain(route_prefix).enumerate() {
@@ -397,7 +400,7 @@ fn destination_repeat_requirement(
             requirement.album = requirement.album.max(required(windows.album));
         }
         if windows.track > 0
-            && (previous.id == destination.id
+            && ((!destination.id.is_empty() && previous.id == destination.id)
                 || destination_file
                     .is_some_and(|file| previous.database_file.as_deref() == Some(file)))
         {
@@ -435,6 +438,20 @@ fn preflight_destination_repeat_budget(request: &Request) -> Result<(), CommandF
         return Ok(());
     }
 
+    let destination_count = request.route.destination_track_ids.len().max(1);
+    let destination_end = destination_position.saturating_add(destination_count);
+    if destination_end > request.source_tracks.len()
+        || (!request.route.destination_track_ids.is_empty()
+            && !request
+                .route
+                .destination_track_ids
+                .iter()
+                .zip(&request.source_tracks[destination_position..destination_end])
+                .all(|(id, track)| id == &track.id))
+    {
+        return Ok(());
+    }
+    let destination_block = &request.source_tracks[destination_position..destination_end];
     let rejoin_requirement = if let Some(rejoin_id) = request.route.rejoin_track_id.as_deref() {
         let Some(rejoin_position) = request
             .source_tracks
@@ -443,8 +460,7 @@ fn preflight_destination_repeat_budget(request: &Request) -> Result<(), CommandF
         else {
             return Ok(());
         };
-        let destination_count = request.route.destination_track_ids.len().max(1);
-        if rejoin_position != destination_position + destination_count
+        if rejoin_position != destination_end
             || rejoin_position + 1 != request.source_tracks.len()
             || (!request.route.destination_track_ids.is_empty()
                 && !request
@@ -456,28 +472,47 @@ fn preflight_destination_repeat_budget(request: &Request) -> Result<(), CommandF
         {
             return Ok(());
         }
-        destination_repeat_requirement(
-            &[],
-            &request.source_tracks[rejoin_position - 1..rejoin_position],
-            &request.source_tracks[rejoin_position],
-            &request.repeat_windows,
-        )
-        .minimum()
+        destination_block
+            .iter()
+            .enumerate()
+            .map(|(i, track)| {
+                destination_repeat_requirement(
+                    &[],
+                    std::slice::from_ref(track),
+                    &request.source_tracks[rejoin_position],
+                    &request.repeat_windows,
+                )
+                .minimum()
+                .saturating_sub(destination_count - 1 - i)
+            })
+            .max()
+            .unwrap_or(0)
     } else {
-        if request.route.destination_track_ids.len() > 1
-            || destination_position + 1 != request.source_tracks.len()
-        {
+        if destination_end != request.source_tracks.len() {
             return Ok(());
         }
         0
     };
 
-    let requirement = destination_repeat_requirement(
-        &request.history_tracks,
-        &request.source_tracks[..destination_position],
-        &request.source_tracks[destination_position],
-        &request.repeat_windows,
-    );
+    let (requirement, outward_minimum) = destination_block
+        .iter()
+        .enumerate()
+        .map(|(i, track)| {
+            let requirement = destination_repeat_requirement(
+                &request.history_tracks,
+                &request.source_tracks[..destination_position],
+                track,
+                &request.repeat_windows,
+            );
+            let adjusted = DestinationRepeatRequirement {
+                artist: requirement.artist.saturating_sub(i),
+                album: requirement.album.saturating_sub(i),
+                track: requirement.track.saturating_sub(i),
+            };
+            (adjusted, adjusted.minimum())
+        })
+        .max_by_key(|(_, minimum)| *minimum)
+        .expect("destination block is non-empty");
     let (available, budget_label) =
         if request.extension.destination_mode.as_deref() == Some("exact") {
             (
@@ -490,7 +525,7 @@ fn preflight_destination_repeat_budget(request: &Request) -> Result<(), CommandF
                 "configured maximum",
             )
         };
-    let minimum = requirement.minimum().saturating_add(rejoin_requirement);
+    let minimum = outward_minimum.saturating_add(rejoin_requirement);
     if minimum > available {
         let outward = requirement.explanation(&request.repeat_windows);
         let explanation = if rejoin_requirement > 0 && outward.is_empty() {
@@ -516,11 +551,16 @@ fn preflight_destination_repeat_budget(request: &Request) -> Result<(), CommandF
 }
 
 fn preflight_fixed_gap_repeat_budget(request: &Request) -> Result<(), CommandFailure> {
-    if request.extension.mode != "fixed_gap_count" {
+    if request.route.ordering_policy != "preserve_order" {
         return Ok(());
     }
-    let Some(tracks_per_gap) = request.extension.tracks_per_gap else {
-        return Ok(());
+    let (tracks_per_gap, fixed_gap) = match request.extension.mode.as_str() {
+        "fixed_gap_count" => match request.extension.tracks_per_gap {
+            Some(n) => (n, true),
+            None => return Ok(()),
+        },
+        "exact_count" => (request.extension.max_tracks_per_gap.unwrap_or(1), false),
+        _ => return Ok(()),
     };
     if !(1..=preview::MAX_EXACT_TRACKS_PER_GAP).contains(&tracks_per_gap) {
         return Ok(());
@@ -558,12 +598,24 @@ fn preflight_fixed_gap_repeat_budget(request: &Request) -> Result<(), CommandFai
                 && projected_distance <= request.repeat_windows.album
                 && !right_album.is_empty()
                 && left_album == right_album;
-            if artist_conflict || album_conflict {
-                let kind = if artist_conflict { "artist" } else { "album" };
+            let track_conflict = request.repeat_windows.track > 0
+                && projected_distance <= request.repeat_windows.track
+                && ((!left_track.id.is_empty() && left_track.id == right_track.id)
+                    || left_track.database_file.as_ref().is_some_and(|file| {
+                        !file.is_empty() && right_track.database_file.as_ref() == Some(file)
+                    }));
+            if artist_conflict || album_conflict || track_conflict {
+                let kind = if artist_conflict {
+                    "artist"
+                } else if album_conflict {
+                    "album"
+                } else {
+                    "track"
+                };
                 return Err(CommandFailure::new(
-                    "FIXED_GAP_SOURCE_REPEAT_CONFLICT",
+                    if fixed_gap { "FIXED_GAP_SOURCE_REPEAT_CONFLICT" } else { "EXACT_COUNT_SOURCE_REPEAT_CONFLICT" },
                     format!(
-                        "source tracks {} and {} retain a {kind} repeat at projected distance {projected_distance}; the configured {kind} window cannot be satisfied with {tracks_per_gap} bridges per gap",
+                        "source tracks {} and {} retain a {kind} repeat at maximum projected distance {projected_distance}; the configured {kind} window cannot be satisfied with at most {tracks_per_gap} bridges per gap",
                         left + 1,
                         right + 1,
                     ),
@@ -4809,7 +4861,21 @@ fn analyze_bridge_validated(
         artist_window: request.repeat_windows.artist,
         album_window: request.repeat_windows.album,
     };
-    let base_route_config = if matches!(
+    let base_route_config = if request.extension.mode == "fixed_gap_count" {
+        // Each source-to-source step will contain this many bridge tracks.
+        // Compare anchors at their projected final positions, not at their
+        // positions in the source-only route.
+        let projected_step = request
+            .extension
+            .tracks_per_gap
+            .unwrap_or(0)
+            .saturating_add(1);
+        route::SearchConfig {
+            artist_window: route_config.artist_window / projected_step,
+            album_window: route_config.album_window / projected_step,
+            ..route_config.clone()
+        }
+    } else if matches!(
         request.extension.mode.as_str(),
         "fixed_source_extension" | "repeat_window_repair"
     ) || (request.extension.mode == "automatic_improvement"
@@ -8265,6 +8331,107 @@ mod tests {
     }
 
     #[test]
+    fn destination_album_preflight_accounts_for_all_immutable_tracks() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/automatic-bridge-request.json");
+        let mut v: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        v["source_tracks"] = serde_json::json!([
+            {"id":"start","artist":"A","album":"X"},
+            {"id":"first","artist":"B","album":"Y"},
+            {"id":"second","artist":"A","album":"X"}
+        ]);
+        v["history_tracks"] = serde_json::json!([]);
+        v["route"]["start_track_id"] = serde_json::json!("start");
+        v["route"]["destination_track_id"] = serde_json::json!("first");
+        v["route"]["destination_track_ids"] = serde_json::json!(["first", "second"]);
+        v["route"]["rejoin_track_id"] = Value::Null;
+        v["repeat_windows"] = serde_json::json!({"artist":0,"album":5,"track":0});
+        v["extension"]["mode"] = serde_json::json!("destination_route");
+        v["extension"]["destination_mode"] = serde_json::json!("automatic");
+        v["extension"]["max_added_tracks"] = serde_json::json!(3);
+        let short: Request = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(
+            preflight_destination_repeat_budget(&short)
+                .unwrap_err()
+                .code,
+            "DESTINATION_ROUTE_BUDGET_UNSATISFIABLE"
+        );
+        v["extension"]["max_added_tracks"] = serde_json::json!(4);
+        let enough: Request = serde_json::from_value(v.clone()).unwrap();
+        assert!(preflight_destination_repeat_budget(&enough).is_ok());
+
+        v["source_tracks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"id":"rejoin","artist":"B","album":"Y"}));
+        v["route"]["rejoin_track_id"] = serde_json::json!("rejoin");
+        // Four tracks are required before the block and four after it.
+        v["extension"]["max_added_tracks"] = serde_json::json!(7);
+        let short_roundtrip: Request = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(
+            preflight_destination_repeat_budget(&short_roundtrip)
+                .unwrap_err()
+                .code,
+            "DESTINATION_ROUTE_BUDGET_UNSATISFIABLE"
+        );
+        v["extension"]["max_added_tracks"] = serde_json::json!(8);
+        let enough_roundtrip: Request = serde_json::from_value(v).unwrap();
+        assert!(preflight_destination_repeat_budget(&enough_roundtrip).is_ok());
+    }
+
+    #[test]
+    fn fixed_gap_preflight_respects_reordering_and_checks_track_repeats() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut v: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        v["route"]["ordering_policy"] = serde_json::json!("preserve_order");
+        v["source_tracks"][0]["database_file"] = serde_json::json!("same.flac");
+        v["source_tracks"][1]["database_file"] = serde_json::json!("same.flac");
+        v["repeat_windows"] = serde_json::json!({"artist":0,"album":0,"track":100});
+        let preserve: Request = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(
+            preflight_fixed_gap_repeat_budget(&preserve)
+                .unwrap_err()
+                .code,
+            "FIXED_GAP_SOURCE_REPEAT_CONFLICT"
+        );
+        v["route"]["ordering_policy"] = serde_json::json!("optimize_order");
+        let optimize: Request = serde_json::from_value(v.clone()).unwrap();
+        assert!(preflight_fixed_gap_repeat_budget(&optimize).is_ok());
+        v["route"]["ordering_policy"] = serde_json::json!("preserve_order");
+        v["source_tracks"][0]["database_file"] = serde_json::json!("");
+        v["source_tracks"][1]["database_file"] = serde_json::json!("");
+        let empty_files: Request = serde_json::from_value(v).unwrap();
+        assert!(preflight_fixed_gap_repeat_budget(&empty_files).is_ok());
+    }
+
+    #[test]
+    fn legacy_exact_count_preflight_uses_the_maximum_per_gap() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut v: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        v["source_tracks"].as_array_mut().unwrap().truncate(2);
+        v["source_tracks"][0]["database_file"] = serde_json::json!("same.flac");
+        v["source_tracks"][1]["database_file"] = serde_json::json!("same.flac");
+        v["repeat_windows"] = serde_json::json!({"artist":0,"album":0,"track":2});
+        v["extension"] = serde_json::json!({"mode":"exact_count", "max_tracks_per_gap":1, "additional_track_count":1});
+        let impossible: Request = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(
+            preflight_fixed_gap_repeat_budget(&impossible)
+                .unwrap_err()
+                .code,
+            "EXACT_COUNT_SOURCE_REPEAT_CONFLICT"
+        );
+        v["repeat_windows"]["track"] = serde_json::json!(1);
+        let possible: Request = serde_json::from_value(v.clone()).unwrap();
+        assert!(preflight_fixed_gap_repeat_budget(&possible).is_ok());
+        v["route"]["ordering_policy"] = serde_json::json!("optimize_order");
+        v["repeat_windows"]["track"] = serde_json::json!(2);
+        let optimized: Request = serde_json::from_value(v).unwrap();
+        assert!(preflight_fixed_gap_repeat_budget(&optimized).is_ok());
+    }
+
+    #[test]
     fn round_trip_preflight_accounts_for_both_repeat_boundaries() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
         let path = repository.join("fixtures/synthetic/automatic-bridge-request.json");
@@ -11107,6 +11274,39 @@ mod tests {
                 fixed.tracks_per_gap
             );
         }
+    }
+
+    #[test]
+    fn optimized_fixed_gap_can_separate_original_repeat_with_a_bridge() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repository).unwrap();
+        let source = repository.join("fixtures/synthetic/fixed-gap-count-request.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        value["source_tracks"].as_array_mut().unwrap().truncate(2);
+        for i in 0..2 {
+            value["source_tracks"][i]["artist_identity_keys"] =
+                serde_json::json!(["artist-mbid:same"]);
+            value["source_tracks"][i]["primary_artist_identity_key"] =
+                serde_json::json!("artist-mbid:same");
+        }
+        value["route"]["ordering_policy"] = serde_json::json!("optimize_order");
+        value["route"]["search"]["restart_count"] = serde_json::json!(1);
+        value["repeat_windows"] = serde_json::json!({"artist":1,"album":0,"track":0});
+        value["extension"]["tracks_per_gap"] = serde_json::json!(1);
+        let path = std::env::temp_dir().join(format!(
+            "bcb-optimized-fixed-gap-{}.json",
+            std::process::id()
+        ));
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let result = analyze_bridge_request(&path);
+        let _ = fs::remove_file(path);
+        std::env::set_current_dir(original).unwrap();
+        assert!(
+            result.is_ok(),
+            "a bridge can separate same-artist source anchors: {:?}",
+            result.err().map(|error| error.message)
+        );
     }
 
     #[test]
